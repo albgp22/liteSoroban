@@ -7,6 +7,7 @@ Every snippet below is executed by `test/guide.test.ts`, so it cannot rot.
 - [Accounts and XLM](#accounts-and-xlm)
 - [Contracts](#contracts)
 - [Tokens](#tokens)
+- [Tokens you do not issue](#tokens-you-do-not-issue)
 - [Custom accounts and passkeys](#custom-accounts-and-passkeys)
 - [Deploying through a factory](#deploying-through-a-factory)
 - [Test isolation](#test-isolation)
@@ -104,6 +105,55 @@ xlm.balanceOf(alice);                             // reads the AccountEntry
 Holding a credit asset requires a trustline. `mint` and `transfer` create one
 for a wallet recipient automatically; `usdc.trust(w)` does it explicitly, and
 `svm.trust(w, asset, { authorized: false })` sets up an authorization failure.
+
+## Tokens you do not issue
+
+Your app touches real USDC. A test needs a wallet holding some. You have Circle's
+issuer address and no secret key — on a network that is the end of it.
+
+It is not the end of it here, because minting through a SAC is authorized by the
+**issuer as transaction source**: source-account credentials, which carry no
+signature. Owning the account entry is enough; owning the key is not.
+
+```ts
+const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+svm.adoptAccount(USDC_ISSUER);                                 // write the entry
+const usdc = svm.deployTokenFor(new Asset('USDC', USDC_ISSUER));
+
+usdc.mint(alice, 250_000_0000000n);                            // 250k USDC
+usdc.balanceOf(alice);
+```
+
+The contract id is derived from `(asset, network passphrase)`, so with the
+mainnet passphrase you get **the same `C...` address your app has hardcoded**:
+
+```ts
+const svm = new LiteStellar({ networkPassphrase: Networks.PUBLIC });
+svm.adoptAccount(USDC_ISSUER);
+svm.deployTokenFor(new Asset('USDC', USDC_ISSUER)).contractId
+// === new Asset('USDC', USDC_ISSUER).contractId(Networks.PUBLIC)
+```
+
+`adoptAccount` does not fabricate a keypair it cannot have — the returned
+wallet's `keypair.canSign()` is `false`, so anything genuinely needing an
+envelope signature from that account still fails, correctly.
+
+**Faster route: skip the token entirely and write the balance.** If the test only
+needs the wallet to *have* the asset, poke the trustline in — no issuer account,
+no contract, no execution. Measured at **0.21 ms vs 0.70 ms** for deploy+mint:
+
+```ts
+import { establishTrustline } from '../src/fixtures.js';
+
+establishTrustline(svm.ledger, alice, new Asset('USDC', USDC_ISSUER), {
+  balance: 1_000_0000000n,
+});
+```
+
+A SAC deployed for that asset afterwards agrees with the balance you wrote. And
+`{ authorized: false }` gives you a trustline that exists but is not authorized,
+for testing the failure path.
 
 ## Custom accounts and passkeys
 

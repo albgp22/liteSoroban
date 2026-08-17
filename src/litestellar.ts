@@ -44,6 +44,8 @@ import {
   preFundedWallet,
   wrapWallet,
   deployToken as deployTokenFixture,
+  deployTokenForAsset,
+  adoptAccount,
   nativeToken as nativeTokenFixture,
   establishTrustline,
   XLM,
@@ -464,6 +466,26 @@ export class LiteStellar {
 
   deployToken(opts: { code?: string; issuer?: Wallet } = {}): Token & { issuer: Wallet } {
     return deployTokenFixture(this.ledger, opts);
+  }
+
+  /**
+   * Deploy the SAC for an asset whose issuer you do NOT control — real USDC,
+   * say. The issuer account must exist first; `adoptAccount` creates it.
+   */
+  deployTokenFor(asset: Asset, issuer?: Wallet): Token & { issuer: Wallet } {
+    return deployTokenForAsset(this.ledger, asset, issuer);
+  }
+
+  /**
+   * Create an account for an address whose secret key you do not have.
+   *
+   * An AccountEntry is just data here. The returned wallet cannot sign, but it
+   * can be a transaction source — and since SAC minting is authorized by the
+   * issuer as transaction source (no signature involved), that is enough to
+   * mint a token you do not own.
+   */
+  adoptAccount(publicKey: string, opts: { xlm?: bigint } = {}): Wallet {
+    return adoptAccount(this.ledger, publicKey, opts);
   }
 
   nativeToken(deployer: Wallet = this.payer): Omit<Token, 'mint'> {

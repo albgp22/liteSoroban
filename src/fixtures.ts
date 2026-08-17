@@ -57,6 +57,32 @@ export function preFundedWallet(ledger: Ledger, opts: WalletOptions = {}): Walle
   return wrapWallet(ledger, keypair);
 }
 
+/**
+ * Create an account for an address whose secret key you do NOT have.
+ *
+ * The point: a test that needs real USDC only has Circle's issuer address. On a
+ * network that is the end of it. Here an AccountEntry is just data, so you write
+ * one — and because SAC minting is authorized by the issuer as TRANSACTION
+ * SOURCE (source-account credentials, which carry no signature), owning the
+ * entry is enough to mint. Owning the key is not.
+ *
+ * The returned wallet's keypair cannot sign; anything needing a real envelope
+ * signature from this account will still fail, correctly.
+ */
+export function adoptAccount(
+  ledger: Ledger,
+  publicKey: string,
+  opts: WalletOptions = {},
+): Wallet {
+  ledger.fund(publicKey, {
+    balance: opts.xlm ?? 10_000n * XLM,
+    seqNum: opts.seqNum,
+    thresholds: opts.thresholds,
+    signers: opts.signers,
+  });
+  return wrapWallet(ledger, Keypair.fromPublicKey(publicKey));
+}
+
 /** Wrap an existing keypair that is already funded in this ledger. */
 export function wrapWallet(ledger: Ledger, keypair: Keypair): Wallet {
   const publicKey = keypair.publicKey();
@@ -250,8 +276,24 @@ export interface TokenOptions {
  */
 export function deployToken(ledger: Ledger, opts: TokenOptions = {}): Token & { issuer: Wallet } {
   const issuer = opts.issuer ?? preFundedWallet(ledger);
-  const asset = new Asset(opts.code ?? 'TEST', issuer.publicKey);
+  return deployTokenForAsset(ledger, new Asset(opts.code ?? 'TEST', issuer.publicKey), issuer);
+}
 
+/**
+ * Deploy the SAC for an arbitrary asset, including one issued by an address you
+ * do not control. The issuer account must already exist — use `adoptAccount`
+ * for a foreign one.
+ */
+export function deployTokenForAsset(
+  ledger: Ledger,
+  asset: Asset,
+  issuer?: Wallet,
+): Token & { issuer: Wallet } {
+  const issuerWallet = issuer ?? wrapWallet(ledger, Keypair.fromPublicKey(asset.getIssuer()));
+  return buildToken(ledger, asset, issuerWallet);
+}
+
+function buildToken(ledger: Ledger, asset: Asset, issuer: Wallet): Token & { issuer: Wallet } {
   apply(ledger, sacCreateHostFn(asset), issuer.accountIdB64);
 
   const contractId = asset.contractId(ledger.networkPassphrase);
