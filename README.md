@@ -11,9 +11,12 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 71 tests, ~550 ms
+npm test               # 114 tests, ~840 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
+
+**[GUIDE.md](GUIDE.md) is the usage guide** — every snippet in it is executed by
+`test/guide.test.ts`, so it cannot rot.
 
 ```ts
 const svm   = new LiteStellar();
@@ -244,7 +247,11 @@ src/classic.ts            envelopes, seqnums, signatures, fees, fee bumps
 src/auth.ts               custom-account auth signing, P-256 signers
 src/fixtures.ts           wallets, tokens, trustlines
 src/fake-rpc.ts           rpc.Server adapter
+src/cost-params.ts        network cost calibration
 test/                     the green suite
+test/guide.test.ts        executes every snippet in GUIDE.md
+test/factory.test.ts      factory -> smart account -> passkey auth, end to end
 test/validation/          adversarial batteries, partly red by design
+scripts/build-fixtures.sh rebuild the contract fixtures from source
 test/bench*.mjs           measurements
 ```
