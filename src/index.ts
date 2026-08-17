@@ -33,6 +33,10 @@ export interface SimulateResult {
   readOnlyKeys: string[];
   readWriteKeys: string[];
   eventsXdr: string[];
+  /** Host diagnostics: fn_call, fn_return, error, contract events. Always present. */
+  diagnosticEventsXdr: string[];
+  /** Instruction count padded the way stellar-rpc pads it; this is in resourcesXdr. */
+  adjustedInstructions: number;
 }
 
 export interface SendResult {
@@ -42,7 +46,11 @@ export interface SendResult {
   changedKeys: string[];
   removedKeys: string[];
   eventsXdr: string[];
+  diagnosticEventsXdr: string[];
   cpuInsns: bigint;
+  memBytes: bigint;
+  /** Entries that only had their TTL bumped — invisible in changedKeys. */
+  ttlChangedKeys: string[];
 }
 
 export class Ledger {
@@ -79,6 +87,16 @@ export class Ledger {
   }
   entryCount(): number {
     return this.env.entryCount();
+  }
+
+  /** Hash of the ENTIRE ledger. Equal hashes mean byte-identical state. */
+  stateHash(): string {
+    return this.env.stateHash();
+  }
+
+  /** Every LedgerKey in the ledger, base64, in key order. */
+  allKeys(): string[] {
+    return this.env.allKeys();
   }
 
   get timestamp(): number {

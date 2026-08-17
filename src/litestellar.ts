@@ -179,6 +179,8 @@ export interface InvokeResult {
   value?: any;
   error?: HostFailure;
   events: xdr.ContractEvent[];
+  /** Host diagnostics: the fn_call/fn_return tree and the error, on failure too. */
+  diagnostics: xdr.DiagnosticEvent[];
   /** Instructions the enforcing pass measured. */
   instructions: number;
   readBytes: number;
@@ -311,6 +313,15 @@ export class LiteStellar {
   }
   get entryCount(): number {
     return this.ledger.entryCount();
+  }
+
+  /** Hash of the entire ledger — the only exact way to assert a rollback. */
+  stateHash(): string {
+    return this.ledger.stateHash();
+  }
+
+  allKeys(): string[] {
+    return this.ledger.allKeys();
   }
 
   /** The default source account, created on first use. */
@@ -447,6 +458,7 @@ export class LiteStellar {
       value: r.ok && r.rawReturn ? scValToNative(xdr.ScVal.fromXDR(r.rawReturn, 'base64')) : undefined,
       error: r.error,
       events: (r.events ?? []).map((e) => xdr.ContractEvent.fromXDR(e, 'base64')),
+      diagnostics: (r.diagnostics ?? []).map((e) => xdr.DiagnosticEvent.fromXDR(e, 'base64')),
       instructions: r.sim?.instructions ?? 0,
       readBytes: r.sim?.readBytes ?? 0,
       writeBytes: r.sim?.writeBytes ?? 0,
@@ -483,13 +495,19 @@ export class LiteStellar {
     rawReturn?: string;
     error?: HostFailure;
     events?: string[];
+    diagnostics?: string[];
     changedKeys?: string[];
     removedKeys?: string[];
     sim?: SimulateResult;
   } {
     const recorded = this.ledger.simulate(hostFn, source);
     if (!recorded.ok) {
-      return { ok: false, error: hostFailure('simulation failed', recorded.error), sim: recorded };
+      return {
+        ok: false,
+        error: hostFailure('simulation failed', recorded.error),
+        diagnostics: recorded.diagnosticEventsXdr,
+        sim: recorded,
+      };
     }
 
     let sim = recorded;
@@ -515,12 +533,18 @@ export class LiteStellar {
       hostFn, source, sim.resourcesXdr, auth, sim.restoredRwEntryIndices,
     );
     if (!sent.ok) {
-      return { ok: false, error: hostFailure('invocation failed', sent.error), sim };
+      return {
+        ok: false,
+        error: hostFailure('invocation failed', sent.error),
+        diagnostics: sent.diagnosticEventsXdr,
+        sim,
+      };
     }
     return {
       ok: true,
       rawReturn: sent.returnValueXdr,
       events: sent.eventsXdr,
+      diagnostics: sent.diagnosticEventsXdr,
       changedKeys: sent.changedKeys,
       removedKeys: sent.removedKeys,
       sim,

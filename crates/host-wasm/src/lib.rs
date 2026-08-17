@@ -117,6 +117,13 @@ fn needs_ttl(k: &LedgerKey) -> bool {
     matches!(k, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
+fn encode_diagnostics(events: &[soroban_env_host::xdr::DiagnosticEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| e.to_xdr(Limits::none()).ok().map(|b| b64e(&b)))
+        .collect()
+}
+
 fn key_hash(k: &LedgerKey) -> Result<Hash, JsError> {
     let bytes = k.to_xdr(Limits::none()).map_err(xdr_err)?;
     Ok(Hash(Sha256::digest(&bytes).into()))
@@ -171,6 +178,10 @@ struct SimulateResult {
     read_only_keys: Vec<String>,
     read_write_keys: Vec<String>,
     events_xdr: Vec<String>,
+    /// The host fills these on EVERY call, success or failure — fn_call,
+    /// fn_return, error, and each contract event tagged with
+    /// in_successful_contract_call. Previously computed and thrown away.
+    diagnostic_events_xdr: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -182,7 +193,12 @@ struct SendResult {
     changed_keys: Vec<String>,
     removed_keys: Vec<String>,
     events_xdr: Vec<String>,
+    diagnostic_events_xdr: Vec<String>,
     cpu_insns: u64,
+    mem_bytes: u64,
+    /// TTL bumps applied to entries that were otherwise untouched. Invisible in
+    /// changed_keys, because nothing about the entry itself changed.
+    ttl_changed_keys: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +361,32 @@ impl SorobanEnv {
             .borrow_mut()
             .insert(Rc::new(key), (Rc::new(entry), live_until));
         Ok(key_b64)
+    }
+
+    /// A hash over the ENTIRE ledger: every key, entry and TTL, in key order.
+    /// Two environments with the same state produce the same hash, which is the
+    /// only way a test can assert that a rollback was exact rather than merely
+    /// correct for the keys it happened to check.
+    #[wasm_bindgen(js_name = stateHash)]
+    pub fn state_hash(&self) -> Result<String, JsError> {
+        let store = self.store.borrow();
+        let mut hasher = Sha256::new();
+        for (key, (entry, live_until)) in store.iter() {
+            hasher.update(key.to_xdr(Limits::none()).map_err(xdr_err)?);
+            hasher.update(entry.to_xdr(Limits::none()).map_err(xdr_err)?);
+            hasher.update(live_until.unwrap_or(0).to_le_bytes());
+        }
+        Ok(b64e(&hasher.finalize()))
+    }
+
+    /// Every `LedgerKey` currently in the ledger, base64, in key order.
+    #[wasm_bindgen(js_name = allKeys)]
+    pub fn all_keys(&self) -> Result<Vec<String>, JsError> {
+        self.store
+            .borrow()
+            .keys()
+            .map(|k| to_xdr_b64(k.as_ref()))
+            .collect()
     }
 
     #[wasm_bindgen(js_name = removeEntry)]
@@ -545,6 +587,7 @@ impl SorobanEnv {
                 .iter()
                 .map(to_xdr_b64)
                 .collect::<Result<Vec<_>, _>>()?,
+            diagnostic_events_xdr: encode_diagnostics(&diagnostics),
         };
         serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
     }
@@ -651,8 +694,29 @@ impl SorobanEnv {
             &mut diagnostics,
             None,
             None,
-        )
-        .map_err(host_err)?;
+        );
+
+        // A top-level host error (bad inputs, exhausted budget) used to escape
+        // as a JsError, which no caller could observe as a failed transaction.
+        let res = match res {
+            Ok(r) => r,
+            Err(e) => {
+                let out = SendResult {
+                    ok: false,
+                    error: Some(format!("{e:?}")),
+                    return_value_xdr: None,
+                    changed_keys: Vec::new(),
+                    removed_keys: Vec::new(),
+                    events_xdr: Vec::new(),
+                    diagnostic_events_xdr: encode_diagnostics(&diagnostics),
+                    cpu_insns: budget.get_cpu_insns_consumed().unwrap_or(0),
+                    mem_bytes: budget.get_mem_bytes_consumed().unwrap_or(0),
+                    ttl_changed_keys: Vec::new(),
+                };
+                return serde_wasm_bindgen::to_value(&out)
+                    .map_err(|e| JsError::new(&format!("serialize: {e}")));
+            }
+        };
 
         let (ok, error, return_value_xdr) = match &res.encoded_invoke_result {
             Ok(v) => (true, None, Some(b64e(v))),
@@ -661,6 +725,7 @@ impl SorobanEnv {
 
         let mut changed_keys = Vec::new();
         let mut removed_keys = Vec::new();
+        let mut ttl_changed_keys = Vec::new();
 
         if ok {
             let mut store = self.store.borrow_mut();
@@ -682,6 +747,9 @@ impl SorobanEnv {
                     (None, true) => {
                         if let Some(t) = &ch.ttl_change {
                             if let Some(slot) = store.get_mut(&rc_key) {
+                                if slot.1 != Some(t.new_live_until_ledger) {
+                                    ttl_changed_keys.push(key_b64.clone());
+                                }
                                 slot.1 = Some(t.new_live_until_ledger);
                             }
                         }
@@ -702,7 +770,10 @@ impl SorobanEnv {
             changed_keys,
             removed_keys,
             events_xdr: res.encoded_contract_events.iter().map(|e| b64e(e)).collect(),
+            diagnostic_events_xdr: encode_diagnostics(&diagnostics),
             cpu_insns: budget.get_cpu_insns_consumed().map_err(host_err)?,
+            mem_bytes: budget.get_mem_bytes_consumed().map_err(host_err)?,
+            ttl_changed_keys,
         };
         serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
     }
