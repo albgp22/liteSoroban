@@ -341,8 +341,17 @@ const sent = await server.sendTransaction(assembled);   // PENDING
 const got  = await server.pollTransaction(sent.hash);   // SUCCESS
 ```
 
-`contract.Client` works the same way — pass `server` in `ClientOptions`.
-(`Client.deploy` is the one method that ignores it and reaches for the network.)
+All 18 `rpc.Server` methods work, including `getEvents` (fed from what
+`sendTransaction` applied), `getLedgers`, `getTransactions`, `getFeeStats`,
+`getVersionInfo` and `requestAirdrop` — which funds through an in-process
+friendbot, no socket involved. `test/rpc-compat.test.ts` calls every one of them
+and checks the SDK-parsed result, so a regression is named rather than vague.
+
+`contract.Client` works the same way — pass `server` in `ClientOptions`; the
+constructor, `Client.from` and `Client.fromWasmHash` all honour it.
+`Client.deploy` is the one exception: it builds its own `RpcServer` at
+`client.js:36-38` and reaches the network. There is a test pinning that, so if
+upstream fixes the leak we find out.
 
 When a test is not about envelopes, turn the classic rules off:
 

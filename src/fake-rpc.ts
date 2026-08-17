@@ -10,9 +10,12 @@
  * Deliberately partial: enough methods to carry the simulate path. A real
  * harness would cover the full 12-method surface plus sendTransaction/poll.
  */
-import { xdr, rpc, Address, TransactionBuilder, hash as sha256 } from '@stellar/stellar-sdk';
+import { xdr, rpc, Address, StrKey, TransactionBuilder, hash as sha256 } from '@stellar/stellar-sdk';
 import type { Ledger } from './index.js';
 import type { TxOutcome, TxResultCode } from './classic.js';
+
+/** A stand-in friendbot endpoint; the adapter answers it without a socket. */
+export const FRIENDBOT_URL = 'https://in-process.invalid/friendbot';
 
 export interface AdapterStats {
   calls: { method: string }[];
@@ -120,7 +123,101 @@ function transactionMeta(outcome: TxOutcome): xdr.TransactionMeta {
   );
 }
 
+/**
+ * The SDK's parseRawLatestLedger unconditionally decodes headerXdr and
+ * metadataXdr, so getLatestLedger is unusable without them even though nothing
+ * downstream reads their contents. These are structurally valid placeholders.
+ */
+function ledgerHeaderXdr(seq: number, closeTime: number): string {
+  const zero32 = Buffer.alloc(32);
+  return new xdr.LedgerHeader({
+    ledgerVersion: 27,
+    previousLedgerHash: zero32,
+    scpValue: new xdr.StellarValue({
+      txSetHash: zero32,
+      closeTime: new xdr.TimePoint(xdr.Uint64.fromString(String(closeTime))),
+      upgrades: [],
+      ext: new xdr.StellarValueExt(xdr.StellarValueType.stellarValueBasic()),
+    }),
+    txSetResultHash: zero32,
+    bucketListHash: zero32,
+    ledgerSeq: seq,
+    totalCoins: new xdr.Int64(0n),
+    feePool: new xdr.Int64(0n),
+    inflationSeq: 0,
+    idPool: new xdr.Uint64(0n),
+    baseFee: 100,
+    baseReserve: 5_000_000,
+    maxTxSetSize: 1000,
+    skipList: [zero32, zero32, zero32, zero32],
+    ext: new xdr.LedgerHeaderExt(0),
+  }).toXDR('base64');
+}
+
+function ledgerCloseMetaXdr(seq: number, closeTime: number): string {
+  return new xdr.LedgerCloseMeta(
+    0,
+    new xdr.LedgerCloseMetaV0({
+      ledgerHeader: new xdr.LedgerHeaderHistoryEntry({
+        hash: Buffer.alloc(32),
+        header: xdr.LedgerHeader.fromXDR(ledgerHeaderXdr(seq, closeTime), 'base64'),
+        ext: new xdr.LedgerHeaderHistoryEntryExt(0),
+      }),
+      txSet: new xdr.TransactionSet({ previousLedgerHash: Buffer.alloc(32), txes: [] }),
+      txProcessing: [],
+      upgradesProcessing: [],
+      scpInfo: [],
+    }),
+  ).toXDR('base64');
+}
+
+function rawTransaction(tx: SubmittedTx, latestLedger: number) {
+  const succeeded =
+    tx.outcome.code === 'txSUCCESS' || tx.outcome.code === 'txFEE_BUMP_INNER_SUCCESS';
+  return {
+    status: succeeded ? 'SUCCESS' : 'FAILED',
+    txHash: tx.hash,
+    applicationOrder: 1,
+    feeBump: tx.feeBump,
+    envelopeXdr: tx.envelopeB64,
+    resultXdr: tx.resultXdr,
+    resultMetaXdr: tx.resultMetaXdr,
+    ledger: tx.ledger,
+    createdAt: String(tx.createdAt),
+    events: { contractEventsXdr: [tx.outcome.eventsXdr ?? []] },
+  };
+}
+
+/**
+ * getLedgers wants a LedgerHeaderHistoryEntry where getLatestLedger wants a bare
+ * LedgerHeader. That inconsistency is in the RPC API itself, not here.
+ */
+function ledgerHeaderHistoryEntryXdr(seq: number, closeTime: number): string {
+  return new xdr.LedgerHeaderHistoryEntry({
+    hash: Buffer.alloc(32),
+    header: xdr.LedgerHeader.fromXDR(ledgerHeaderXdr(seq, closeTime), 'base64'),
+    ext: new xdr.LedgerHeaderHistoryEntryExt(0),
+  }).toXDR('base64');
+}
+
+/** One buffered contract event, in the shape getEvents returns. */
+interface BufferedEvent {
+  type: string;
+  ledger: number;
+  ledgerClosedAt: string;
+  contractId: string;
+  id: string;
+  pagingToken: string;
+  inSuccessfulContractCall: boolean;
+  topic: string[];
+  value: string;
+  txHash: string;
+  opIndex: number;
+  txIndex: number;
+}
+
 interface SubmittedTx {
+  hash: string;
   outcome: TxOutcome;
   envelopeB64: string;
   resultXdr: string;
@@ -143,8 +240,64 @@ function accountLedgerKey(accountId: string): xdr.LedgerKey {
 export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterStats {
   const stats: AdapterStats = { calls: [], networkAttempts: 0 };
   const submitted = new Map<string, SubmittedTx>();
+  const eventLog: BufferedEvent[] = [];
 
   (server as any).httpClient.defaults.adapter = async (config: any) => {
+    // requestAirdrop posts to the friendbot URL, which is NOT JSON-RPC. Handle
+    // it before assuming a JSON-RPC body, or the destructure below dies
+    // unhelpfully on any non-JSON-RPC request.
+    if (typeof config.url === 'string' && config.url.startsWith(FRIENDBOT_URL)) {
+      stats.calls.push({ method: 'friendbot' });
+      const addr = new URL(config.url).searchParams.get('addr');
+      if (!addr) throw new Error('friendbot: missing addr');
+      ledger.fund(addr, { balance: 10_000n * 10_000_000n });
+
+      // The SDK reads the new account's sequence out of the meta
+      // (findCreatedAccountSequenceInTransactionMeta), so the meta has to carry
+      // a ledgerEntryCreated change for the AccountEntry — funding alone is not
+      // enough to make requestAirdrop work.
+      const created = xdr.LedgerEntry.fromXDR(
+        ledger.getEntry(
+          xdr.LedgerKey.account(
+            new xdr.LedgerKeyAccount({
+              accountId: xdr.AccountId.publicKeyTypeEd25519(
+                StrKey.decodeEd25519PublicKey(addr),
+              ),
+            }),
+          ).toXDR('base64'),
+        )!,
+        'base64',
+      );
+
+      return {
+        data: {
+          hash: '0'.repeat(64),
+          result_meta_xdr: new xdr.TransactionMeta(
+            4,
+            new xdr.TransactionMetaV4({
+              ext: new xdr.ExtensionPoint(0),
+              txChangesBefore: [],
+              operations: [
+                new xdr.OperationMetaV2({
+                  ext: new xdr.ExtensionPoint(0),
+                  changes: [xdr.LedgerEntryChange.ledgerEntryCreated(created)],
+                  events: [],
+                }),
+              ],
+              txChangesAfter: [],
+              sorobanMeta: null,
+              events: [],
+              diagnosticEvents: [],
+            }),
+          ).toXDR('base64'),
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      };
+    }
+
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     const { id, method, params } = body;
     stats.calls.push({ method });
@@ -173,7 +326,7 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
         return ok({
           passphrase: ledger.networkPassphrase,
           protocolVersion: String(ledger.protocolVersion),
-          friendbotUrl: undefined,
+          friendbotUrl: FRIENDBOT_URL,
         });
 
       case 'getLatestLedger':
@@ -181,7 +334,95 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
           id: 'in-process',
           protocolVersion: ledger.protocolVersion,
           sequence: ledger.ledgerSeq,
+          headerXdr: ledgerHeaderXdr(ledger.ledgerSeq, ledger.timestamp),
+          metadataXdr: ledgerCloseMetaXdr(ledger.ledgerSeq, ledger.timestamp),
         });
+
+      case 'getVersionInfo':
+        return ok({
+          version: 'liteSoroban (in-process)',
+          commitHash: '0'.repeat(40),
+          buildTimestamp: '1970-01-01T00:00:00Z',
+          captiveCoreVersion: `soroban-env-host in-process, protocol ${ledger.protocolVersion}`,
+          protocolVersion: ledger.protocolVersion,
+        });
+
+      case 'getFeeStats':
+        // No fee market in process: everything is the base fee.
+        return ok({
+          sorobanInclusionFee: {
+            max: '100', min: '100', mode: '100', p10: '100', p20: '100', p30: '100',
+            p40: '100', p50: '100', p60: '100', p70: '100', p80: '100', p90: '100',
+            p95: '100', p99: '100', transactionCount: '0', ledgerCount: 1,
+          },
+          inclusionFee: {
+            max: '100', min: '100', mode: '100', p10: '100', p20: '100', p30: '100',
+            p40: '100', p50: '100', p60: '100', p70: '100', p80: '100', p90: '100',
+            p95: '100', p99: '100', transactionCount: '0', ledgerCount: 1,
+          },
+          latestLedger: ledger.ledgerSeq,
+        });
+
+      case 'getEvents': {
+        // Everything applied through sendTransaction is buffered, so an app's
+        // normal way of consuming Soroban events works unchanged.
+        const startLedger: number = params?.startLedger ?? 0;
+        const filters: any[] = params?.filters ?? [];
+        const matches = eventLog.filter((e) => {
+          if (e.ledger < startLedger) return false;
+          if (filters.length === 0) return true;
+          return filters.some((f) => {
+            if (f.contractIds?.length && !f.contractIds.includes(e.contractId)) return false;
+            if (f.type && f.type !== e.type) return false;
+            return true;
+          });
+        });
+        const limit: number | undefined = params?.pagination?.limit;
+        const page = limit ? matches.slice(0, limit) : matches;
+        return ok({
+          events: page,
+          latestLedger: ledger.ledgerSeq,
+          oldestLedger: 1,
+          latestLedgerCloseTime: String(ledger.timestamp),
+          oldestLedgerCloseTime: '0',
+          cursor: page.length ? page[page.length - 1].pagingToken : '',
+        });
+      }
+
+      case 'getTransactions': {
+        const start: number = params?.startLedger ?? 0;
+        const txs = [...submitted.values()]
+          .filter((t) => t.ledger >= start)
+          .map((t) => rawTransaction(t, ledger.ledgerSeq));
+        return ok({
+          transactions: txs,
+          latestLedger: ledger.ledgerSeq,
+          latestLedgerCloseTimestamp: String(ledger.timestamp),
+          oldestLedger: 1,
+          oldestLedgerCloseTimestamp: '0',
+          cursor: String(ledger.ledgerSeq),
+        });
+      }
+
+      case 'getLedgers': {
+        const start: number = params?.startLedger ?? ledger.ledgerSeq;
+        const count = Math.min(params?.pagination?.limit ?? 1, 200);
+        const ledgers = Array.from({ length: count }, (_, i) => ({
+          hash: Buffer.alloc(32).toString('hex'),
+          sequence: start + i,
+          ledgerCloseTime: String(ledger.timestamp),
+          headerXdr: ledgerHeaderHistoryEntryXdr(start + i, ledger.timestamp),
+          metadataXdr: ledgerCloseMetaXdr(start + i, ledger.timestamp),
+        }));
+        return ok({
+          ledgers,
+          latestLedger: ledger.ledgerSeq,
+          latestLedgerCloseTime: String(ledger.timestamp),
+          oldestLedger: 1,
+          oldestLedgerCloseTime: '0',
+          cursor: String(start + count),
+        });
+      }
 
       case 'getLedgerEntries': {
         const keys: string[] = params.keys;
@@ -273,7 +514,27 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
 
         // Anything that actually executed is PENDING here and resolved by
         // getTransaction, so the app's submit-then-poll loop runs for real.
+        for (const [i, evtB64] of (outcome.eventsXdr ?? []).entries()) {
+          const evt = xdr.ContractEvent.fromXDR(evtB64, 'base64');
+          const cid = evt.contractId();
+          eventLog.push({
+            type: 'contract',
+            ledger: ledger.ledgerSeq,
+            ledgerClosedAt: new Date(ledger.timestamp * 1000).toISOString(),
+            contractId: cid ? Address.contract(cid).toString() : '',
+            id: `${ledger.ledgerSeq}-${eventLog.length}`,
+            pagingToken: `${ledger.ledgerSeq}-${eventLog.length}`,
+            inSuccessfulContractCall: true,
+            topic: evt.body().v0().topics().map((t) => t.toXDR('base64')),
+            value: evt.body().v0().data().toXDR('base64'),
+            txHash: hashHex,
+            opIndex: 0,
+            txIndex: i,
+          });
+        }
+
         submitted.set(hashHex, {
+          hash: hashHex,
           outcome,
           envelopeB64,
           resultXdr,
@@ -301,35 +562,14 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
           oldestLedgerCloseTime: '0',
         };
         if (!tx) return ok({ ...base, status: 'NOT_FOUND' });
-
-        const succeeded =
-          tx.outcome.code === 'txSUCCESS' || tx.outcome.code === 'txFEE_BUMP_INNER_SUCCESS';
-        return ok({
-          ...base,
-          status: succeeded ? 'SUCCESS' : 'FAILED',
-          txHash: params.hash,
-          applicationOrder: 1,
-          feeBump: tx.feeBump,
-          envelopeXdr: tx.envelopeB64,
-          resultXdr: tx.resultXdr,
-          resultMetaXdr: tx.resultMetaXdr,
-          ledger: tx.ledger,
-          createdAt: String(tx.createdAt),
-        });
+        return ok({ ...base, ...rawTransaction(tx, ledger.ledgerSeq) });
       }
 
       default:
-        return {
-          data: {
-            jsonrpc: '2.0',
-            id,
-            error: { code: -32601, message: `in-process rpc: unimplemented method ${method}` },
-          },
-          status: 200,
-          statusText: 'OK',
-          headers: {},
-          config,
-        };
+        // Throwing a real Error matters: the SDK surfaces a raw JSON-RPC error
+        // object otherwise, and `catch (e) { if (e instanceof Error) ... }` in
+        // an app's retry logic silently fails to match it.
+        throw new Error(`in-process rpc: unimplemented method ${method}`);
     }
   };
 

@@ -169,10 +169,10 @@ node; the red tests in `test/validation/` pin them.
 - `AccountEntry` is written with `ext = v0`; stellar-core normalises to the
   v1→v2→v3 chain, 52 bytes larger, which lands in `disk_read_bytes`.
 
-**RPC facade**
-- `getEvents`, `getTransactions`, `getLedgers`, `getFeeStats` and
-  `getVersionInfo` return `-32601`.
-- `getTransaction` does not populate contract events in the meta.
+**RPC facade** — the surface is complete; `test/rpc-compat.test.ts` calls all 18
+`rpc.Server` methods and checks the SDK-parsed result of each. What remains:
+- `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
+- Fee stats are synthetic — there is no fee market in process.
 
 ## Findings worth keeping
 
@@ -251,6 +251,7 @@ src/cost-params.ts        network cost calibration
 test/                     the green suite
 test/guide.test.ts        executes every snippet in GUIDE.md
 test/factory.test.ts      factory -> smart account -> passkey auth, end to end
+test/rpc-compat.test.ts   all 18 rpc.Server methods + contract.Client
 test/validation/          adversarial batteries, partly red by design
 scripts/build-fixtures.sh rebuild the contract fixtures from source
 test/bench*.mjs           measurements
