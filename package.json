@@ -1,0 +1,19 @@
+{
+  "name": "stellar-testing-poc",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "THROWAWAY SPIKE: in-process Soroban ledger for Vitest, LiteSVM-shaped.",
+  "scripts": {
+    "build:wasm": "cd crates/host-wasm && wasm-pack build --release --target nodejs --out-dir ../../pkg --out-name soroban_host",
+    "test": "vitest run",
+    "//fixtures": "Contracts build to wasm32v1-none, NOT wasm32-unknown-unknown: soroban-sdk 27 refuses the latter on Rust 1.82+ (reference-types, multi-value). `stellar contract build` picks the right target. The host in crates/host-wasm is the opposite case - it targets wasm32-unknown-unknown because it runs in Node, not as a contract.",
+    "test:validation": "vitest run --config vitest.validation.config.ts"
+  },
+  "devDependencies": {
+    "@noble/curves": "^2.3.0",
+    "@stellar/stellar-sdk": "16.2.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

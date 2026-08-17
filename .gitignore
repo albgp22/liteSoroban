@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build artifacts
+pkg/
+target/
+crates/*/target/
+
+# scratch files left by exploratory runs
+.probe*.mjs
+.probe*.ts
+probe*.test.ts
+*.log
+
+# local env
+.env
+.env.*

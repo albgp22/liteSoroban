@@ -1,0 +1,45 @@
+[package]
+name = "soroban-host-wasm"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Pinned to the protocol the public network is running (P27).
+# stellar-rpc vendors both -prev and -curr; a v1 harness should do the same.
+# The P28 enforcing path has a DIFFERENT signature (13 args, TTL folded into
+# the ledger-entry iterator) -- see notes in lib.rs.
+[dependencies]
+soroban-env-host = { version = "=27.0.1", features = ["recording_mode", "testutils"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+base64 = "0.22"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# NOTE: SDF's own recipe for @stellar/stellar-xdr-json is just
+#   wasm-opt = ["-O", "--enable-bulk-memory"]
+# That is NOT sufficient here. soroban-env-host (via wasmi's float handling)
+# emits nontrapping float->int conversions, so wasm-opt fails validation with
+# "[wasm-validator error] i32.trunc_sat_f32_s ... all used features should be
+# allowed" unless the extra features Rust enables by default are listed too.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-reference-types",
+    # DO NOT add --enable-multivalue: wasm-opt then rewrites the return ABI and
+    # strips __wbindgen_add_to_stack_pointer, so the generated JS glue breaks at
+    # runtime with "__wbindgen_add_to_stack_pointer is not a function".
+]
