@@ -38,7 +38,9 @@ earlier version of this file conflated them.
 
 - Its metering is byte-identical to `soroban-env-host` 27.0.1's own e2e
   expectations (nine exact `expect![]` values reproduced, including the
-  1528075-instruction ADD_I32 upload preflight). **True.**
+  1,767,593-instruction ADD_I32 upload preflight at `e2e_tests.rs:894`).
+  **True.** (Beware when cross-checking against another host version: the same
+  test asserts 1,528,075 at `:883` in 28.0.1 — the calibration moved.)
 - Its instruction counts therefore agree with mainnet. **FALSE — retracted.**
 
 Measured differentially against a live `stellar/quickstart` node (stellar-rpc
