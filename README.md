@@ -41,32 +41,40 @@ earlier version of this file conflated them.
   1,767,593-instruction ADD_I32 upload preflight at `e2e_tests.rs:894`).
   **True.** (Beware when cross-checking against another host version: the same
   test asserts 1,528,075 at `:883` in 28.0.1 — the calibration moved.)
-- Its instruction counts therefore agree with mainnet. **FALSE — retracted.**
+- Its instruction counts agree with mainnet **only if you ask for it**:
 
-Measured differentially against a live `stellar/quickstart` node (stellar-rpc
-27.1.1, captive-core 27.1.0, protocol 27), raw in-process vs the node's implied
-raw count, over-metering throughout:
+```ts
+const svm = new LiteStellar().withNetworkCostParams();
+```
 
-| scenario | in-process | real node | delta |
+`soroban-env-host`'s `Budget::default()` is byte-for-byte stellar-core's
+`initialCpuCostParamsEntryForV20` — the calibration a network carries only until
+its first settings upgrade. 18 of 86 CPU cost entries differ from a live
+network's, dominated by `ValDeser` `const_term` **59,052** vs **331**. Measured
+differentially against a live node (stellar-rpc 27.1.1, captive-core 27.1.0,
+protocol 27), in-process raw vs the node's implied raw:
+
+| scenario | real node | default | `withNetworkCostParams()` |
 |---|---:|---:|---:|
-| upload add_i32 | 1,787,932 | 1,547,805 | +15.5% |
-| deploy | 880,275 | 530,127 | +66.0% |
-| `add(2,3)` | 712,883 | 304,084 | +134.4% |
-| `put_persistent` | 949,599 | 550,088 | +72.6% |
-| `get_persistent` | 1,066,743 | 550,166 | +93.9% |
-| native SAC transfer | 647,395 | 185,750 | +248.7% |
+| upload add_i32 | 1,547,805 | +14.1% | **+1.4%** |
+| `add(2,3)` | 304,084 | +134.1% | **+0.3%** |
+| `put_persistent` | 550,088 | +72.5% | **+0.1%** |
+| `get_persistent` | 550,166 | +93.8% | **+0.1%** |
 
-Root cause, confirmed by reading `ConfigSettingContractCostParamsCpuInstructions`
-off the running node: `Budget::default()` is byte-for-byte stellar-core's
-`initialCpuCostParamsEntryForV20` — the calibration a network has *before* its
-first settings upgrade. 18 of 86 CPU cost entries differ, dominated by `ValDeser`
-`const_term` **59,052** (host default) vs **331** (network).
+`withNetworkCostParams()` ships a protocol-27 table captured from a real node's
+`ConfigSetting` entries. To match a specific network exactly — mainnet at a
+specific moment, say — read its live table instead:
 
-There is a fix and it is wired up: pass the network's real table to
-`setCostParams(cpuParamsXdr, memParamsXdr, cpuLimit, memLimit)`, which builds the
-budget with `Budget::try_from_configs` the way stellar-rpc's preflight does.
-Read the params from any node's `ConfigSetting` ledger entries. Until you do
-that, **do not assert on instructions, resources or fees.**
+```ts
+svm.withNetworkCostParams(await loadCostParamsFromRpc(mainnetServer));
+```
+
+**Left on by default? No.** The default stays uncalibrated so that a harness
+that has not opted in cannot quietly produce numbers someone trusts. `metersLikeNetwork`
+tells you which mode you are in.
+
+The residual ~1.4% on upload is not calibration: it is the `AccountEntry`
+extension chain and the missing module cache, both under "Known gaps".
 
 What *is* byte-identical to the real node on all six scenarios: footprints
 (read-only and read-write key sets), return `ScVal`s, contract events, and

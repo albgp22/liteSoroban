@@ -51,9 +51,17 @@ import {
   type Token,
 } from './fixtures.js';
 import { attachInProcessRpc } from './fake-rpc.js';
+import {
+  PROTOCOL_27_COST_PARAMS,
+  P27_CPU_LIMIT,
+  P27_MEM_LIMIT,
+  loadCostParamsFromRpc,
+  type CostParams,
+} from './cost-params.js';
 import type { AuthProofBuilder } from './auth.js';
 
-export { XLM };
+export { XLM, PROTOCOL_27_COST_PARAMS, loadCostParamsFromRpc };
+export type { CostParams };
 export type { Wallet, Token, AuthProofBuilder };
 
 // ---------------------------------------------------------------------------
@@ -256,6 +264,9 @@ export class LiteStellar {
 
   private validation: ValidationOptions = {};
   private payerWallet?: Wallet;
+  /** Contract ids derive from (deployer, salt); a fixed salt makes the second
+   *  deploy from the same account collide with "contract already exists". */
+  private saltCounter = 0;
 
   constructor(opts: LiteStellarOptions = {}) {
     this.ledger = new Ledger({
@@ -291,6 +302,28 @@ export class LiteStellar {
   withoutClassicChecks(): this {
     return this.withSigverify(false).withSequenceCheck(false).withTimebounds(false);
   }
+  /**
+   * Meter with a real network's cost calibration instead of the host's
+   * protocol-20 defaults. Defaults to the shipped protocol-27 table; pass one
+   * from `loadCostParamsFromRpc(server)` to match a specific network exactly.
+   *
+   * Until you call this, DO NOT assert on instructions, resources or fees.
+   */
+  withNetworkCostParams(params: CostParams = PROTOCOL_27_COST_PARAMS): this {
+    this.ledger.setCostParams(
+      params.cpuInstructions,
+      params.memoryBytes,
+      params.cpuLimit ?? P27_CPU_LIMIT,
+      params.memLimit ?? P27_MEM_LIMIT,
+    );
+    return this;
+  }
+
+  /** True once a real cost table is installed. */
+  get metersLikeNetwork(): boolean {
+    return this.ledger.hasNetworkCostParams;
+  }
+
   /** The account used as the source when a call does not name one. */
   withPayer(wallet: Wallet): this {
     this.payerWallet = wallet;
@@ -414,7 +447,7 @@ export class LiteStellar {
   deployFromHash(wasmHashB64: string, opts: DeployOptions = {}): Contract {
     const source = this.sourceOf(opts);
     const hostFn = createContractHostFn(
-      source, wasmHashB64, opts.salt ?? Buffer.alloc(32), opts.constructorArgs ?? [],
+      source, wasmHashB64, opts.salt ?? this.nextSalt(), opts.constructorArgs ?? [],
     );
     const result = this.applyHostFn(hostFn, source, opts);
     if (!result.ok) throw result.error;
@@ -586,6 +619,12 @@ export class LiteStellar {
   }
 
   // -- internals -----------------------------------------------------------
+
+  private nextSalt(): Buffer {
+    const salt = Buffer.alloc(32);
+    salt.writeUInt32BE(this.saltCounter++, 28);
+    return salt;
+  }
 
   private sourceOf(opts: InvokeOptions): string {
     return (opts.as ?? this.payer).accountIdB64;

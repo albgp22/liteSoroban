@@ -89,6 +89,18 @@ export class Ledger {
     return this.env.entryCount();
   }
 
+  /**
+   * Install the network's real cost calibration. Without it the harness meters
+   * with the protocol-20 defaults and over-reports by 15-249%.
+   */
+  setCostParams(cpuParamsB64: string, memParamsB64: string, cpuLimit: bigint, memLimit: bigint): void {
+    this.env.setCostParams(cpuParamsB64, memParamsB64, cpuLimit, memLimit);
+  }
+
+  get hasNetworkCostParams(): boolean {
+    return this.env.hasNetworkCostParams;
+  }
+
   /** Hash of the ENTIRE ledger. Equal hashes mean byte-identical state. */
   stateHash(): string {
     return this.env.stateHash();
