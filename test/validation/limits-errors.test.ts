@@ -97,7 +97,7 @@ const DEFAULT_MEM_BYTES_LIMIT = 40 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 const fixture = (name: string) =>
-  new Uint8Array(readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))));
+  new Uint8Array(readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url))));
 
 const ADD_I32 = fixture('upstream_add_i32.wasm');
 const CONTRACT_STORAGE = fixture('upstream_contract_data.wasm');

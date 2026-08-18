@@ -539,8 +539,37 @@ impl SorobanEnv {
             snapshot,
             self.next_prng_seed(),
             &mut diagnostics,
-        )
-        .map_err(host_err)?;
+        );
+
+        // A top-level host error (exhausted budget, malformed input) must be an
+        // observable failed simulation, not a thrown JsError — upstream's
+        // soroban-simulation folds this same error in-band, and a real node
+        // returns it as HTTP 200 with an `error` field.
+        let res = match res {
+            Ok(r) => r,
+            Err(e) => {
+                let out = SimulateResult {
+                    ok: false,
+                    error: Some(format!("{e:?}")),
+                    return_value_xdr: None,
+                    resources_xdr: String::new(),
+                    auth_xdr: Vec::new(),
+                    restored_rw_entry_indices: Vec::new(),
+                    instructions: 0,
+                    adjusted_instructions: 0,
+                    read_bytes: 0,
+                    write_bytes: 0,
+                    cpu_insns: budget.get_cpu_insns_consumed().unwrap_or(0),
+                    mem_bytes: budget.get_mem_bytes_consumed().unwrap_or(0),
+                    read_only_keys: Vec::new(),
+                    read_write_keys: Vec::new(),
+                    events_xdr: Vec::new(),
+                    diagnostic_events_xdr: encode_diagnostics(&diagnostics),
+                };
+                return serde_wasm_bindgen::to_value(&out)
+                    .map_err(|e| JsError::new(&format!("serialize: {e}")));
+            }
+        };
 
         let (ok, error, return_value_xdr) = match &res.invoke_result {
             Ok(v) => (true, None, Some(to_xdr_b64(v)?)),

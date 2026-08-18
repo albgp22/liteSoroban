@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 114 tests, ~840 ms
+npm test               # 144 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -169,10 +169,19 @@ node; the red tests in `test/validation/` pin them.
 - `AccountEntry` is written with `ext = v0`; stellar-core normalises to the
   v1→v2→v3 chain, 52 bytes larger, which lands in `disk_read_bytes`.
 
-**RPC facade** — the surface is complete; `test/rpc-compat.test.ts` calls all 18
-`rpc.Server` methods and checks the SDK-parsed result of each. What remains:
+**RPC facade** — all 18 `rpc.Server` methods respond and `test/rpc-compat.test.ts`
+checks the SDK-parsed result of each. Still wrong, found by review round 2:
+- The four validation switches do not reach the RPC submit path, so the same
+  envelope can behave differently through `svm.sendTransaction` and `rpcServer()`.
+- `requestAirdrop` on an EXISTING account rebuilds its `AccountEntry`, rewinding
+  the sequence and dropping signers.
+- `instructionLeeway` in `resourceConfig` is ignored.
+- Diagnostics do not reach `getTransaction`; fee stats are synthetic.
 - `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
-- Fee stats are synthetic — there is no fee market in process.
+
+**Apply-path metering** is 58-121% high on ordinary invocations and +220% CPU on a
+custom-account authorization, because the enforcing path has no module cache.
+Only the PREFLIGHT numbers are calibrated. Do not assert on applied resources.
 
 ## Findings worth keeping
 
@@ -181,12 +190,22 @@ Things that cost time and are written down nowhere else.
 **An unsigned transaction is rejected even when the medium threshold is 0.**
 Tempting to conclude otherwise: a fresh account has `thresholds [1,0,0,0]`
 (`CreateAccountOpFrame.cpp:72`) and `getNeededThreshold` (`OperationFrame.cpp:57`)
-returns that 0 verbatim. But in `SignatureChecker::checkSignature` every
-`return true` sits **inside** the loop over the transaction's signatures, so an
-unsigned transaction falls through to `return false` whatever the threshold.
-Threshold 0 means "any one valid signer suffices". Core pins it in
-`TxEnvelopeTests.cpp SECTION("no signature")`. An earlier version of this harness
-asserted the opposite, in a test and in this file.
+returns that 0 verbatim. But for an ed25519-only account, weight in
+`SignatureChecker::checkSignature` accumulates only inside the loop over the
+transaction's signatures, so an unsigned transaction falls through to
+`return false` whatever the threshold. Threshold 0 means "any one valid signer
+suffices". Core pins it in `TxEnvelopeTests.cpp SECTION("no signature")`.
+(Careful with the general form of that statement: core's PRE_AUTH_TX loop runs
+over SIGNERS and *can* return true with no signatures. This harness implements
+ed25519 signers only — see "Known gaps".)
+
+**stellar-core checks signatures TWICE, independently.**
+`checkAllTransactionSignatures` checks the *transaction* source at
+`THRESHOLD_LOW`; `OperationFrame::checkSignature` separately checks the
+*operation* source at MEDIUM and fails with `opBAD_AUTH`. Implementing only the
+second leaves the transaction source unauthenticated whenever the operation
+names its own — accepting envelopes the network rejects. An earlier version of
+this harness did exactly that.
 
 **The operation source account is the Soroban invoker**, not the transaction
 source — `InvokeHostFunctionOpFrame.cpp` passes `mOpFrame.getSourceID()`.

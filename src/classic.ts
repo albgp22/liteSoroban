@@ -191,13 +191,23 @@ export function signatureWeight(
 }
 
 /**
- * Faithful port of stellar-core's SignatureChecker::checkSignature.
+ * PARTIAL port of stellar-core's SignatureChecker::checkSignature — ed25519
+ * signers only.
  *
- * The subtlety that matters: every `return true` in core sits INSIDE the loop
- * over the transaction's signatures. An unsigned transaction therefore falls
- * through to `return false` EVEN WHEN the needed weight is 0 — a threshold of 0
- * means "any one valid signer suffices", not "no signature required".
- * Core's own test TxEnvelopeTests.cpp SECTION("no signature") pins this.
+ * What it gets right, and why it matters: for an account whose signers are all
+ * ed25519, weight only ever accumulates inside the loop over the transaction's
+ * SIGNATURES, so an unsigned transaction returns false EVEN WHEN the needed
+ * weight is 0. A threshold of 0 means "any one valid signer suffices", not "no
+ * signature required". Core pins this in TxEnvelopeTests.cpp
+ * SECTION("no signature").
+ *
+ * What it does NOT implement: PRE_AUTH_TX, HASH_X and SIGNED_PAYLOAD signers.
+ * Note that core's PRE_AUTH_TX loop iterates over SIGNERS, not signatures, and
+ * CAN return true with zero signatures — so the blanket claim that "every
+ * return true sits inside the signature loop" is false, and an earlier version
+ * of this comment said exactly that. The omission is currently unreachable here
+ * because fundAccount only builds ed25519 signers and SetOptions is out of
+ * scope, but direct XDR surgery could construct such an account.
  */
 export function checkSignature(
   account: xdr.AccountEntry,
@@ -414,12 +424,19 @@ function applyInner(
   }
 
   // -- signatures ----------------------------------------------------------
+  // stellar-core makes TWO independent signature checks and both must pass:
+  //   TransactionFrame::checkAllTransactionSignatures -> TX source at LOW
+  //   OperationFrame::checkSignature                  -> OP source at MEDIUM,
+  //                                                      failing with opBAD_AUTH
+  // Checking only the operation source leaves the transaction source
+  // unauthenticated whenever the operation names its own — accepting envelopes
+  // the network rejects, which is the one direction a harness must never fail in.
   if (validation.sigverify !== false) {
-    if (!checkSignature(opAccount, tx.signatures, tx.hash(), opAccount.thresholds()[2])) {
+    if (!checkSignature(account, tx.signatures, tx.hash(), account.thresholds()[1])) {
       return fail(
         'txBAD_AUTH',
-        `signatures do not satisfy medium threshold ${opAccount.thresholds()[2]} for ${
-          StrKey.encodeEd25519PublicKey(opAccount.accountId().ed25519())
+        `transaction source signatures do not satisfy low threshold ${account.thresholds()[1]} for ${
+          StrKey.encodeEd25519PublicKey(account.accountId().ed25519())
         }`,
       );
     }
@@ -449,7 +466,25 @@ function applyInner(
   // -- commit the classic side, then run the host --------------------------
   if (validation.sequenceCheck !== false) bumpSequence(ledger, sourceId, txSeq);
   else bumpSequence(ledger, sourceId, currentSeq + 1n);
+
   if (payer) debit(ledger, payer, totalFee);
+
+  // OPERATION-level authorization. Core checks this while applying operations —
+  // after the fee is charged and the sequence consumed — so a failure here is
+  // opBAD_AUTH inside txFAILED, an APPLIED transaction that failed, not a
+  // submit-time rejection.
+  if (validation.sigverify !== false) {
+    if (!checkSignature(opAccount, tx.signatures, tx.hash(), opAccount.thresholds()[2])) {
+      return {
+        code: 'txFAILED',
+        ok: false,
+        feeCharged: feeBumped ? 0n : totalFee,
+        detail: `operation source signatures do not satisfy medium threshold ${
+          opAccount.thresholds()[2]
+        } for ${StrKey.encodeEd25519PublicKey(opAccount.accountId().ed25519())} (opBAD_AUTH)`,
+      };
+    }
+  }
 
   if (opType !== 'invokeHostFunction') {
     // ExtendFootprintTTL / RestoreFootprint are validated above but not

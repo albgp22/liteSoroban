@@ -46,7 +46,7 @@ import { Ledger, uploadWasmHostFn, invokeHostFn, accountScAddress } from '../../
 // test/fixtures/contract_data.wasm is opt/26 (CONTRACT_STORAGE_P26) — different
 // blobs, which would produce different instruction counts.
 const fixture = (name: string) =>
-  new Uint8Array(readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))));
+  new Uint8Array(readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url))));
 
 const ADD_I32 = fixture('e2e_add_i32.wasm');
 const ADD_F32 = fixture('e2e_add_f32.wasm');

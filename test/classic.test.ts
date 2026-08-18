@@ -106,12 +106,12 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
   // A freshly created account has thresholds [1,0,0,0], so getNeededThreshold
   // (OperationFrame.cpp:57) returns 0 for MEDIUM. It is tempting to conclude an
-  // unsigned transaction is therefore fine. It is NOT: in
-  // SignatureChecker::checkSignature every `return true` sits INSIDE the loop
-  // over the transaction's signatures, so an unsigned transaction falls through
-  // to `return false` whatever the threshold. Threshold 0 means "any one valid
-  // signer suffices", not "no signature required".
-  // Core pins this in TxEnvelopeTests.cpp SECTION("no signature").
+  // unsigned transaction is therefore fine. It is NOT: for an ed25519-only
+  // account, weight in SignatureChecker::checkSignature accumulates only inside
+  // the loop over the transaction's signatures, so an unsigned transaction falls
+  // through to `return false` whatever the threshold. Threshold 0 means "any one
+  // valid signer suffices". Core pins it in
+  // TxEnvelopeTests.cpp SECTION("no signature").
   it('an unsigned transaction is rejected even when the medium threshold is 0', async () => {
     expect(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.thresholds()[2]).toBe(0);
 
@@ -165,14 +165,24 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const tx = build(account, invokeHostFn(addr, 'put_persistent', [sym('m'), u64(9n)]));
     const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
 
-    assembled.sign(multi); // weight 1 < 2
+    // Weight 1 clears the tx source's LOW threshold (1) but not the operation's
+    // MEDIUM (2). Core reports that as opBAD_AUTH inside txFAILED — an APPLIED
+    // transaction that failed, so it is PENDING at submit and FAILED on poll,
+    // with the fee charged and the sequence consumed.
+    assembled.sign(multi);
     const under = await server.sendTransaction(assembled);
-    expect(under.status).toBe('ERROR');
-    expect(under.errorResult!.result().switch().name).toBe('txBadAuth');
+    expect(under.status).toBe('PENDING');
+    expect((await server.pollTransaction(under.hash)).status).toBe('FAILED');
 
-    assembled.sign(co); // now weight 2 >= 2
-    const okSent = await server.sendTransaction(assembled);
+    // The sequence was consumed by the failed attempt, so rebuild at the new one.
+    const account2 = await server.getAccount(multi.publicKey());
+    const tx2 = build(account2, invokeHostFn(addr, 'put_persistent', [sym('m'), u64(9n)]));
+    const assembled2 = rpc.assembleTransaction(tx2, await server.simulateTransaction(tx2)).build();
+    assembled2.sign(multi);
+    assembled2.sign(co); // now weight 2 >= 2
+    const okSent = await server.sendTransaction(assembled2);
     expect(okSent.status).toBe('PENDING');
+    expect((await server.pollTransaction(okSent.hash)).status).toBe('SUCCESS');
   });
 
   it('enforces timebounds', async () => {
@@ -209,6 +219,73 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
     expect(sent.errorResult!.result().switch().name).toBe('txSorobanInvalid');
+  });
+
+  // REGRESSION (round 2). stellar-core authenticates BOTH the transaction source
+  // (checkAllTransactionSignatures, THRESHOLD_LOW) and the operation source
+  // (OperationFrame::checkSignature, MEDIUM). An earlier version of this harness
+  // implemented only the second, so a transaction whose source signed NOTHING was
+  // applied — fee charged, sequence consumed — whenever the operation named its
+  // own source. A live protocol-27 node returns txBadAuth for that envelope.
+  it('REGRESSION: the transaction source must sign even when the operation names its own', async () => {
+    const victim = Keypair.random();
+    const operator = Keypair.random();
+    L.fund(victim.publicKey(), { thresholds: [1, 1, 1, 1] });
+    L.fund(operator.publicKey(), { thresholds: [1, 1, 1, 1] });
+
+    const account = await server.getAccount(victim.publicKey());
+    const tx = new TransactionBuilder(account, {
+      fee: '1000',
+      networkPassphrase: Networks.TESTNET,
+    })
+      .addOperation(
+        Operation.invokeHostFunction({
+          func: invokeHostFn(addr, 'put_persistent', [sym('x'), u64(1n)]),
+          auth: [],
+          source: operator.publicKey(), // operation names its own source
+        }),
+      )
+      .setTimeout(300)
+      .build();
+    const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
+    assembled.sign(operator); // ONLY the operation source signs
+
+    const balBefore = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance().toString();
+
+    const sent = await server.sendTransaction(assembled);
+    expect(sent.status).toBe('ERROR');
+    expect(sent.errorResult!.result().switch().name).toBe('txBadAuth');
+
+    // ...and nothing was taken from the account that never signed.
+    const after = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!;
+    expect(after.balance().toString()).toBe(balBefore);
+    expect(after.seqNum().toString()).toBe('0');
+  });
+
+  it('an operation source that DOES sign, alongside the tx source, succeeds', async () => {
+    const owner = Keypair.random();
+    L.fund(owner.publicKey(), { thresholds: [1, 1, 1, 1] });
+
+    const account = await server.getAccount(owner.publicKey());
+    const tx = new TransactionBuilder(account, {
+      fee: '1000',
+      networkPassphrase: Networks.TESTNET,
+    })
+      .addOperation(
+        Operation.invokeHostFunction({
+          func: invokeHostFn(addr, 'put_persistent', [sym('y'), u64(2n)]),
+          auth: [],
+          source: owner.publicKey(),
+        }),
+      )
+      .setTimeout(300)
+      .build();
+    const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
+    assembled.sign(owner);
+
+    const sent = await server.sendTransaction(assembled);
+    expect(sent.status).toBe('PENDING');
+    expect((await server.pollTransaction(sent.hash)).status).toBe('SUCCESS');
   });
 
   it('supports fee bumps: a different account pays', async () => {

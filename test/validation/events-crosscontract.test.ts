@@ -49,7 +49,7 @@ import { preFundedWallet, deployToken, type Wallet } from '../../src/fixtures.js
 // ---------------------------------------------------------------------------
 
 const fixture = (n: string) =>
-  new Uint8Array(readFileSync(fileURLToPath(new URL(`./fixtures/${n}`, import.meta.url))));
+  new Uint8Array(readFileSync(fileURLToPath(new URL(`../fixtures/${n}`, import.meta.url))));
 
 /** soroban-test-wasms INVOKE_CONTRACT: `add`, `add_with`, `add_with_try`. */
 const INVOKE_CONTRACT = fixture('invoke_contract.wasm');

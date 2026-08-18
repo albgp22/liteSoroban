@@ -213,6 +213,18 @@ export function establishTrustline(
     ext: new xdr.TrustLineEntryExt(0),
   });
 
+  // Only a CREATE charges a sub-entry and initialises the balance. core's
+  // ChangeTrustOpFrame increments numSubEntries when it creates the trustline
+  // and leaves it alone on modify; doing it unconditionally both double-counts
+  // (permanently locking 5 XLM per extra call out of availableBalance) and
+  // silently zeroes an existing balance.
+  const existingRaw = ledger.getEntry(trustlineKey(holder, asset).toXDR('base64'));
+  if (existingRaw) {
+    const existing = xdr.LedgerEntry.fromXDR(existingRaw, 'base64').data().trustLine();
+    // Preserve the balance unless the caller explicitly set one.
+    if (opts.balance === undefined) entry.balance(existing.balance());
+  }
+
   ledger.putEntry(
     new xdr.LedgerEntry({
       lastModifiedLedgerSeq: ledger.ledgerSeq,
@@ -221,46 +233,42 @@ export function establishTrustline(
     }).toXDR('base64'),
   );
 
-  // A trustline is a sub-entry: core's ChangeTrust path increments
-  // numSubEntries, which raises the holder's minimum balance by one base
-  // reserve. Skipping it lets native transfers through that core would reject.
-  const account = loadAccount(ledger, holder.accountId);
-  if (account) {
-    account.numSubEntries(account.numSubEntries() + 1);
-    storeAccount(ledger, account);
+  if (!existingRaw) {
+    const account = loadAccount(ledger, holder.accountId);
+    if (account) {
+      account.numSubEntries(account.numSubEntries() + 1);
+      storeAccount(ledger, account);
+    }
   }
+}
+
+/** The LedgerKey for a holder's trustline in a credit asset. */
+export function trustlineKey(holder: Wallet, asset: Asset): xdr.LedgerKey {
+  const code = asset.getCode();
+  const issuerId = accountIdFromPublicKey(asset.getIssuer());
+  const tlAsset =
+    code.length <= 4
+      ? xdr.TrustLineAsset.assetTypeCreditAlphanum4(
+          new xdr.AlphaNum4({
+            assetCode: Buffer.concat([Buffer.from(code, 'ascii'), Buffer.alloc(4)], 4),
+            issuer: issuerId,
+          }),
+        )
+      : xdr.TrustLineAsset.assetTypeCreditAlphanum12(
+          new xdr.AlphaNum12({
+            assetCode: Buffer.concat([Buffer.from(code, 'ascii'), Buffer.alloc(12)], 12),
+            issuer: issuerId,
+          }),
+        );
+  return xdr.LedgerKey.trustline(
+    new xdr.LedgerKeyTrustLine({ accountId: holder.accountId, asset: tlAsset }),
+  );
 }
 
 /** Idempotent: only writes a trustline if the holder has none for this asset. */
 function establishTrustlineIfMissing(ledger: Ledger, holder: Wallet, asset: Asset): void {
   if (asset.isNative()) return;
-  const code = asset.getCode();
-  const issuerId = accountIdFromPublicKey(asset.getIssuer());
-  const key =
-    code.length <= 4
-      ? xdr.LedgerKey.trustline(
-          new xdr.LedgerKeyTrustLine({
-            accountId: holder.accountId,
-            asset: xdr.TrustLineAsset.assetTypeCreditAlphanum4(
-              new xdr.AlphaNum4({
-                assetCode: Buffer.concat([Buffer.from(code, 'ascii'), Buffer.alloc(4)], 4),
-                issuer: issuerId,
-              }),
-            ),
-          }),
-        )
-      : xdr.LedgerKey.trustline(
-          new xdr.LedgerKeyTrustLine({
-            accountId: holder.accountId,
-            asset: xdr.TrustLineAsset.assetTypeCreditAlphanum12(
-              new xdr.AlphaNum12({
-                assetCode: Buffer.concat([Buffer.from(code, 'ascii'), Buffer.alloc(12)], 12),
-                issuer: issuerId,
-              }),
-            ),
-          }),
-        );
-  if (ledger.getEntry(key.toXDR('base64'))) return;
+  if (ledger.getEntry(trustlineKey(holder, asset).toXDR('base64'))) return;
   establishTrustline(ledger, holder, asset);
 }
 

@@ -457,7 +457,18 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
           : muxed.ed25519();
         const sourceAccountId = xdr.AccountId.publicKeyTypeEd25519(ed);
 
-        const sim = ledger.simulate(hostFn, sourceAccountId.toXDR('base64'));
+        // The envelope's auth entries are the whole point of a re-simulation:
+        // ignoring them means an INVALID signature simulates green, because
+        // plain recording mode never runs __check_auth. Honour them when present.
+        const suppliedAuth = op.body().invokeHostFunctionOp().auth();
+        const sim =
+          suppliedAuth.length > 0
+            ? ledger.simulateWithAuth(
+                hostFn,
+                sourceAccountId.toXDR('base64'),
+                suppliedAuth.map((a) => a.toXDR('base64')),
+              )
+            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'));
         if (!sim.ok) {
           return ok({ error: sim.error, latestLedger: ledger.ledgerSeq });
         }
@@ -485,7 +496,14 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
               event: xdr.ContractEvent.fromXDR(e, 'base64'),
             }).toXDR('base64'),
           ),
-          results: [{ xdr: sim.returnValueXdr, auth: sim.authXdr }],
+          results: [
+            {
+              xdr: sim.returnValueXdr,
+              auth: suppliedAuth.length > 0
+                ? suppliedAuth.map((a) => a.toXDR('base64'))
+                : sim.authXdr,
+            },
+          ],
           cost: { cpuInsns: String(sim.cpuInsns), memBytes: String(sim.memBytes) },
           stateChanges: [],
         });

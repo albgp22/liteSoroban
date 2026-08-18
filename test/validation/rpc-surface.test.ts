@@ -39,7 +39,7 @@ import { accountKey, accountIdFromPublicKey } from '../../src/classic.js';
 import { preFundedWallet, establishTrustline, type Wallet } from '../../src/fixtures.js';
 
 const fixture = (name: string) =>
-  new Uint8Array(readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))));
+  new Uint8Array(readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url))));
 
 const CONTRACT_DATA = fixture('contract_data.wasm');
 const ADD_I32 = fixture('add_i32.wasm');
