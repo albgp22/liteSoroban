@@ -291,6 +291,13 @@ export function attachInProcessRpc(
   const stats: AdapterStats = { calls: [], networkAttempts: 0 };
   const submitted = new Map<string, SubmittedTx>();
   const eventLog: BufferedEvent[] = [];
+  // `ledger.ledgerSeq` is the open ledger: the one a submission is validated
+  // against and applied in, which stellar-core's TransactionQueue takes as LCL
+  // + 1. A node reports the last closed ledger, one before it, as latest
+  // (stellar-rpc get_latest_ledger.go, send_transaction.go `LastLedger`), and
+  // preflights in it (simulate_transaction.go `LedgerSeq: latestLedger`). Its
+  // close time is the timestamp the open ledger validates and applies at.
+  const lastClosed = () => ledger.ledgerSeq - 1;
 
   (server as any).httpClient.defaults.adapter = async (config: any) => {
     // requestAirdrop posts to the friendbot URL, which is NOT JSON-RPC. Handle
@@ -379,9 +386,9 @@ export function attachInProcessRpc(
       case 'getHealth':
         return ok({
           status: 'healthy',
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
           oldestLedger: 1,
-          ledgerRetentionWindow: ledger.ledgerSeq,
+          ledgerRetentionWindow: lastClosed(),
         });
 
       case 'getNetwork':
@@ -398,9 +405,9 @@ export function attachInProcessRpc(
         return ok({
           id: 'in-process',
           protocolVersion: ledger.protocolVersion,
-          sequence: ledger.ledgerSeq,
-          headerXdr: ledgerHeaderXdr(ledger.ledgerSeq, ledger.timestamp),
-          metadataXdr: ledgerCloseMetaXdr(ledger.ledgerSeq, ledger.timestamp),
+          sequence: lastClosed(),
+          headerXdr: ledgerHeaderXdr(lastClosed(), ledger.timestamp),
+          metadataXdr: ledgerCloseMetaXdr(lastClosed(), ledger.timestamp),
         });
 
       case 'getVersionInfo':
@@ -425,7 +432,7 @@ export function attachInProcessRpc(
             p40: '100', p50: '100', p60: '100', p70: '100', p80: '100', p90: '100',
             p95: '100', p99: '100', transactionCount: '0', ledgerCount: 1,
           },
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
         });
 
       case 'getEvents': {
@@ -446,7 +453,7 @@ export function attachInProcessRpc(
         const page = limit ? matches.slice(0, limit) : matches;
         return ok({
           events: page,
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
           oldestLedger: 1,
           latestLedgerCloseTime: String(ledger.timestamp),
           oldestLedgerCloseTime: '0',
@@ -458,20 +465,31 @@ export function attachInProcessRpc(
         const start: number = params?.startLedger ?? 0;
         const txs = [...submitted.values()]
           .filter((t) => t.ledger >= start)
-          .map((t) => rawTransaction(t, ledger.ledgerSeq));
+          .map((t) => rawTransaction(t, lastClosed()));
         return ok({
           transactions: txs,
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
           latestLedgerCloseTimestamp: String(ledger.timestamp),
           oldestLedger: 1,
           oldestLedgerCloseTimestamp: '0',
-          cursor: String(ledger.ledgerSeq),
+          cursor: String(lastClosed()),
         });
       }
 
       case 'getLedgers': {
-        const start: number = params?.startLedger ?? ledger.ledgerSeq;
-        const count = Math.min(params?.pagination?.limit ?? 1, 200);
+        const latest = lastClosed();
+        const start: number = params?.startLedger ?? latest;
+        // Only closed ledgers exist. A start past the latest is refused, with
+        // the code and message a local stellar-rpc 29.0.1 answers (go-stellar-sdk
+        // protocols/rpc ValidatePagination); a page stops at the latest, and the
+        // cursor is the last ledger returned (get_ledgers.go).
+        if (start < 1 || start > latest) {
+          return rpcError(
+            -32600,
+            `start ledger (${start}) must be between the oldest ledger: 1 and the latest ledger: ${latest} for this rpc instance`,
+          );
+        }
+        const count = Math.min(params?.pagination?.limit ?? 1, 200, latest - start + 1);
         const ledgers = Array.from({ length: count }, (_, i) => ({
           hash: Buffer.alloc(32).toString('hex'),
           sequence: start + i,
@@ -481,11 +499,11 @@ export function attachInProcessRpc(
         }));
         return ok({
           ledgers,
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: latest,
           latestLedgerCloseTime: String(ledger.timestamp),
           oldestLedger: 1,
           oldestLedgerCloseTime: '0',
-          cursor: String(start + count),
+          cursor: String(start + count - 1),
         });
       }
 
@@ -502,12 +520,14 @@ export function attachInProcessRpc(
             return {
               key: k,
               xdr: data.toXDR('base64'),
-              lastModifiedLedgerSeq: ledger.ledgerSeq,
+              // Not tracked per entry; the latest ledger at least never
+              // names one that has not closed.
+              lastModifiedLedgerSeq: lastClosed(),
               liveUntilLedgerSeq: ledger.getEntryTtl(k),
             };
           })
           .filter(Boolean);
-        return ok({ entries, latestLedger: ledger.ledgerSeq });
+        return ok({ entries, latestLedger: lastClosed() });
       }
 
       case 'simulateTransaction': {
@@ -527,9 +547,9 @@ export function attachInProcessRpc(
           );
           const footprintSim =
             opName === 'extendFootprintTtl'
-              ? ledger.simulateExtendTtl(keys, op.body().extendFootprintTtlOp().extendTo())
-              : ledger.simulateRestore(keys);
-          if (!footprintSim.ok) return ok({ error: footprintSim.error, latestLedger: ledger.ledgerSeq });
+              ? ledger.simulateExtendTtl(keys, op.body().extendFootprintTtlOp().extendTo(), lastClosed())
+              : ledger.simulateRestore(keys, lastClosed());
+          if (!footprintSim.ok) return ok({ error: footprintSim.error, latestLedger: lastClosed() });
           const resources = xdr.SorobanResources.fromXDR(footprintSim.resourcesXdr!, 'base64');
           // As crude as the invoke path's below: real fees need the network's rent config.
           const fee = String(100_000 + resources.writeBytes() * 100);
@@ -539,7 +559,7 @@ export function attachInProcessRpc(
             resourceFee: (xdr as any).Int64.fromString(fee),
           });
           return ok({
-            latestLedger: ledger.ledgerSeq,
+            latestLedger: lastClosed(),
             minResourceFee: fee,
             transactionData: txData.toXDR('base64'),
           });
@@ -574,7 +594,7 @@ export function attachInProcessRpc(
           );
         }
         if (leeway > 0xffff_ffff) {
-          return ok({ error: 'number too large to fit in target type', latestLedger: ledger.ledgerSeq });
+          return ok({ error: 'number too large to fit in target type', latestLedger: lastClosed() });
         }
         const sim =
           suppliedAuth.length > 0
@@ -583,10 +603,11 @@ export function attachInProcessRpc(
                 sourceAccountId.toXDR('base64'),
                 suppliedAuth.map((a) => a.toXDR('base64')),
                 leeway,
+                lastClosed(),
               )
-            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'), leeway);
+            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'), leeway, lastClosed());
         if (!sim.ok) {
-          return ok({ error: sim.error, latestLedger: ledger.ledgerSeq });
+          return ok({ error: sim.error, latestLedger: lastClosed() });
         }
 
         const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
@@ -600,7 +621,7 @@ export function attachInProcessRpc(
         });
 
         return ok({
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
           minResourceFee: String(Math.ceil(resourceFee)),
           transactionData: txData.toXDR('base64'),
           // The RPC contract for this field is DiagnosticEvent, not
@@ -631,6 +652,12 @@ export function attachInProcessRpc(
         const txHash = tx.hash();
         const hashHex = txHash.toString('hex');
 
+        // The response names the ledger that was latest when the envelope
+        // arrived (send_transaction.go reads LastLedger before submitting).
+        const latestAtSubmit = {
+          latestLedger: lastClosed(),
+          latestLedgerCloseTime: String(ledger.timestamp),
+        };
         const outcome = submit(envelopeB64);
         const innerHash = tx instanceof FeeBumpTransaction ? tx.innerTransaction.hash() : txHash;
         const resultXdr = transactionResult(outcome, innerHash).toXDR('base64');
@@ -642,8 +669,7 @@ export function attachInProcessRpc(
           return ok({
             status: 'ERROR',
             hash: hashHex,
-            latestLedger: ledger.ledgerSeq,
-            latestLedgerCloseTime: String(ledger.timestamp),
+            ...latestAtSubmit,
             errorResultXdr: resultXdr,
           });
         }
@@ -679,26 +705,26 @@ export function attachInProcessRpc(
           createdAt: ledger.timestamp,
           feeBump: outcome.code.startsWith('txFEE_BUMP'),
         });
+        // The ledger it applied in closes: getLatestLedger now reports it.
         ledger.advanceLedgers(1);
 
         return ok({
           status: 'PENDING',
           hash: hashHex,
-          latestLedger: ledger.ledgerSeq,
-          latestLedgerCloseTime: String(ledger.timestamp),
+          ...latestAtSubmit,
         });
       }
 
       case 'getTransaction': {
         const tx = submitted.get(params.hash);
         const base = {
-          latestLedger: ledger.ledgerSeq,
+          latestLedger: lastClosed(),
           latestLedgerCloseTime: String(ledger.timestamp),
           oldestLedger: 1,
           oldestLedgerCloseTime: '0',
         };
         if (!tx) return ok({ ...base, status: 'NOT_FOUND' });
-        return ok({ ...base, ...rawTransaction(tx, ledger.ledgerSeq) });
+        return ok({ ...base, ...rawTransaction(tx, lastClosed()) });
       }
 
       default:

@@ -58,9 +58,12 @@ describe('rpc.Server compatibility', () => {
     expect(n.friendbotUrl).toBeTruthy();
   });
 
+  // `latestLedger` everywhere is the last closed ledger, one before the open
+  // `svm.ledgerSequence` the next transaction applies in, as on a node (see
+  // rpc-ledger-numbers.test.ts).
   it('getLatestLedger decodes, header and metadata included', async () => {
     const l = await server.getLatestLedger();
-    expect(l.sequence).toBe(svm.ledgerSequence);
+    expect(l.sequence).toBe(svm.ledgerSequence - 1);
     expect(l.protocolVersion).toBe(svm.protocolVersion);
   });
 
@@ -70,7 +73,7 @@ describe('rpc.Server compatibility', () => {
 
   it('getFeeStats', async () => {
     const f = await server.getFeeStats();
-    expect(f.latestLedger).toBe(svm.ledgerSequence);
+    expect(f.latestLedger).toBe(svm.ledgerSequence - 1);
     expect(f.sorobanInclusionFee.max).toBeTruthy();
   });
 
@@ -108,7 +111,7 @@ describe('rpc.Server compatibility', () => {
       new Asset('USDC', usdc.issuer.publicKey),
       svm.networkPassphrase,
     );
-    expect(r.latestLedger).toBe(svm.ledgerSequence);
+    expect(r.latestLedger).toBe(svm.ledgerSequence - 1);
   });
 
   it('requestAirdrop funds an account and returns its sequence', async () => {
@@ -158,8 +161,9 @@ describe('rpc.Server compatibility', () => {
     });
 
     it('getLedgers decodes headers', async () => {
+      const latest = (await server.getLatestLedger()).sequence;
       const r = await (server as any).getLedgers({
-        startLedger: svm.ledgerSequence,
+        startLedger: latest - 1,
         pagination: { limit: 2 },
       });
       expect(r.ledgers.length).toBe(2);
@@ -196,7 +200,7 @@ describe('rpc.Server compatibility', () => {
 
     const events = await server.getEvents({ startLedger: 1, filters: [] });
     expect(events.events.length).toBeGreaterThan(0);
-    expect(events.latestLedger).toBe(svm.ledgerSequence);
+    expect(events.latestLedger).toBe(svm.ledgerSequence - 1);
 
     // Filtering by contract id works.
     const filtered = await server.getEvents({

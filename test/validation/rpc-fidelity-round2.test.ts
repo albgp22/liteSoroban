@@ -392,7 +392,7 @@ describe('getLedgers paging contract', () => {
     // `res.latestLedgerCloseTime - res.oldestLedgerCloseTime` is NaN-adjacent
     // arithmetic against a real node and string concatenation here.
     const res = await jsonRpc('getLedgers', {
-      startLedger: svm.ledgerSequence,
+      startLedger: svm.ledgerSequence - 1, // the latest: the open ledger has not closed
       pagination: { limit: 1 },
     });
     expect({

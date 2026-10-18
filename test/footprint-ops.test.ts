@@ -127,7 +127,9 @@ describe('ExtendFootprintTTL', () => {
   it('skips an archived entry on apply; simulation says it must be restored first', async () => {
     const w = world();
     await w.put('k');
-    w.svm.advanceLedgers(w.ttl(w.key('k'))! - w.svm.ledger.ledgerSeq + 1); // now expired
+    // Expired in the last closed ledger too, which is where stellar-rpc
+    // preflights (simulate_transaction.go, LedgerSeq: latestLedger).
+    w.svm.advanceLedgers(w.ttl(w.key('k'))! - w.svm.ledger.ledgerSeq + 2);
     const expired = w.ttl(w.key('k'));
     expect((await w.simulate(extend(200_000), { ro: [w.key('k')] })).error).toMatch(
       /^Can't extend for an expired entry .* The entry must be restored before it can be extended\.$/,
@@ -168,7 +170,7 @@ describe('RestoreFootprint', () => {
   it('restores an archived entry to ledger + minPersistentTTL - 1 (core source; see header)', async () => {
     const w = world();
     await w.put('k');
-    w.svm.advanceLedgers(w.ttl(w.key('k'))! - w.svm.ledger.ledgerSeq + 1); // archived
+    w.svm.advanceLedgers(w.ttl(w.key('k'))! - w.svm.ledger.ledgerSeq + 2); // archived as of latestLedger
     const entryBytes = Buffer.from(w.svm.ledger.getEntry(w.key('k').toXDR('base64'))!, 'base64').length;
     expect(await w.simulate(restore(), { rw: [w.key('k')] })).toEqual({
       ro: 0, rw: 1, read: entryBytes, write: entryBytes, instructions: 0,

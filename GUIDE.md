@@ -363,6 +363,13 @@ real one does. Envelopes submitted through `rpcServer()` obey the same
 switches as `svm.sendTransaction`. `test/rpc-compat.test.ts` calls every one of them
 and checks the SDK-parsed result, so a regression is named rather than vague.
 
+Ledger numbers are a node's. `getLatestLedger` (and every `latestLedger`) is the
+last closed ledger, `svm.ledgerSequence - 1`, and `simulateTransaction` runs in
+it. A submission is validated against and applied in `svm.ledgerSequence`, which
+then closes: `getTransaction().ledger` is `latest + 1`, and `getLatestLedger`
+reports it from then on. Bounds a client writes from `latest` mean what they
+would on a network.
+
 `contract.Client` works the same way — pass `server` in `ClientOptions`; the
 constructor, `Client.from` and `Client.fromWasmHash` all honour it.
 `Client.deploy` is the one exception: it builds its own `RpcServer` at

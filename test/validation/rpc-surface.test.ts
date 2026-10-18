@@ -132,10 +132,14 @@ const codeKey = (hash = wasmHash) =>
 // ---------------------------------------------------------------------------
 
 describe('implemented methods, as the SDK parses them', () => {
-  it('getHealth reports the ledger the harness is actually on', async () => {
+  // Every `latestLedger` is the last closed ledger, one before the open
+  // `L.ledgerSeq` a submission applies in: stellar-rpc 29.0.1 reads it from its
+  // ledger store (get_latest_ledger.go) and core applies a submission in LCL + 1.
+  // On a local protocol-29 node, getTransaction().ledger was getLatestLedger + 1.
+  it('getHealth reports the last closed ledger', async () => {
     const health = await server.getHealth();
     expect(health.status).toBe('healthy');
-    expect(health.latestLedger).toBe(L.ledgerSeq);
+    expect(health.latestLedger).toBe(L.ledgerSeq - 1);
     expect(health.oldestLedger).toBe(1);
     expect(typeof health.ledgerRetentionWindow).toBe('number');
     expect(stats.calls.map((c) => c.method)).toContain('getHealth');
@@ -153,7 +157,7 @@ describe('implemented methods, as the SDK parses them', () => {
     // parsers.js:211 parseRawLatestLedger REQUIRES headerXdr and metadataXdr and
     // decodes them into xdr.LedgerHeader / xdr.LedgerCloseMeta.
     const latest = await server.getLatestLedger();
-    expect(latest.sequence).toBe(L.ledgerSeq);
+    expect(latest.sequence).toBe(L.ledgerSeq - 1);
     expect(latest.headerXdr).toBeInstanceOf(xdr.LedgerHeader);
     expect(latest.metadataXdr).toBeInstanceOf(xdr.LedgerCloseMeta);
   });
@@ -162,7 +166,7 @@ describe('implemented methods, as the SDK parses them', () => {
     const key = accountKey(w.accountId);
     const res = await server.getLedgerEntries(key);
 
-    expect(res.latestLedger).toBe(L.ledgerSeq);
+    expect(res.latestLedger).toBe(L.ledgerSeq - 1);
     expect(res.entries).toHaveLength(1);
 
     const entry = res.entries[0];
@@ -202,7 +206,7 @@ describe('implemented methods, as the SDK parses them', () => {
     const missing = accountKey(accountIdFromPublicKey(Keypair.random().publicKey()));
     const res = await server.getLedgerEntries(missing);
     expect(res.entries).toEqual([]);
-    expect(res.latestLedger).toBe(L.ledgerSeq);
+    expect(res.latestLedger).toBe(L.ledgerSeq - 1);
   });
 
   it('getLedgerEntries returns only the present entries of a mixed batch', async () => {
@@ -231,7 +235,7 @@ describe('implemented methods, as the SDK parses them', () => {
     expect(data.resources().instructions()).toBeGreaterThan(0);
     // The footprint must at least cover the contract instance and its code.
     expect(data.resources().footprint().readOnly().length).toBeGreaterThanOrEqual(2);
-    expect(s.latestLedger).toBe(L.ledgerSeq);
+    expect(s.latestLedger).toBe(L.ledgerSeq - 1);
     expect((s as unknown as { _parsed: boolean })._parsed).toBe(true);
   });
 
@@ -245,7 +249,7 @@ describe('implemented methods, as the SDK parses them', () => {
     const got = await server.getTransaction(ZERO_HASH);
     expect(got.status).toBe(rpc.Api.GetTransactionStatus.NOT_FOUND);
     expect(got.txHash).toBe(ZERO_HASH);
-    expect(got.latestLedger).toBe(L.ledgerSeq);
+    expect(got.latestLedger).toBe(L.ledgerSeq - 1);
     // NOT_FOUND must carry no transaction body at all.
     expect((got as unknown as Record<string, unknown>).envelopeXdr).toBeUndefined();
     expect((got as unknown as Record<string, unknown>).resultXdr).toBeUndefined();

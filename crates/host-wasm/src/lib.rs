@@ -659,25 +659,37 @@ impl SorobanEnv {
     }
 
     /// stellar-rpc's preflight for an ExtendFootprintTTL transaction, over its
-    /// read-only footprint. See `extend_ttl_resources`.
+    /// read-only footprint. See `extend_ttl_resources`; `ledger_seq` as for
+    /// `simulate`.
     #[wasm_bindgen(js_name = simulateExtendTtl)]
-    pub fn simulate_extend_ttl(&self, keys_b64: Vec<String>, extend_to: u32) -> Result<JsValue, JsError> {
+    pub fn simulate_extend_ttl(
+        &self,
+        keys_b64: Vec<String>,
+        extend_to: u32,
+        ledger_seq: Option<u32>,
+    ) -> Result<JsValue, JsError> {
         let keys = keys_b64
             .iter()
             .map(|k| from_xdr_b64::<LedgerKey>(k))
             .collect::<Result<Vec<_>, _>>()?;
-        footprint_simulation(self.extend_ttl_resources(&keys, extend_to))
+        let ledger_seq = ledger_seq.unwrap_or(self.ledger_seq);
+        footprint_simulation(self.extend_ttl_resources(&keys, extend_to, ledger_seq))
     }
 
     /// stellar-rpc's preflight for a RestoreFootprint transaction, over its
-    /// read-write footprint. See `restore_resources`.
+    /// read-write footprint. See `restore_resources`; `ledger_seq` as for
+    /// `simulate`.
     #[wasm_bindgen(js_name = simulateRestore)]
-    pub fn simulate_restore(&self, keys_b64: Vec<String>) -> Result<JsValue, JsError> {
+    pub fn simulate_restore(
+        &self,
+        keys_b64: Vec<String>,
+        ledger_seq: Option<u32>,
+    ) -> Result<JsValue, JsError> {
         let keys = keys_b64
             .iter()
             .map(|k| from_xdr_b64::<LedgerKey>(k))
             .collect::<Result<Vec<_>, _>>()?;
-        footprint_simulation(self.restore_resources(&keys))
+        footprint_simulation(self.restore_resources(&keys, ledger_seq.unwrap_or(self.ledger_seq)))
     }
 
     // -- requirement 4: isolation -------------------------------------------
@@ -717,14 +729,24 @@ impl SorobanEnv {
     /// Recording mode. Discovers the footprint by reading through the snapshot
     /// source, records auth, and measures resources. Does NOT mutate the ledger.
     /// `instruction_leeway` is stellar-rpc's `resourceConfig.instructionLeeway`;
-    /// see `adjust_instructions`.
+    /// see `adjust_instructions`. `ledger_seq` is the ledger to simulate in,
+    /// the open one (`ledger_seq`) by default. stellar-rpc preflights in the
+    /// last closed ledger, one before the one a submission applies in
+    /// (simulate_transaction.go, `LedgerSeq: latestLedger`, v29.0.1).
     pub fn simulate(
         &self,
         host_fn_b64: &str,
         source_b64: &str,
         instruction_leeway: Option<u32>,
+        ledger_seq: Option<u32>,
     ) -> Result<JsValue, JsError> {
-        self.simulate_inner(host_fn_b64, source_b64, None, instruction_leeway.unwrap_or(0))
+        self.simulate_inner(
+            host_fn_b64,
+            source_b64,
+            None,
+            instruction_leeway.unwrap_or(0),
+            ledger_seq.unwrap_or(self.ledger_seq),
+        )
     }
 
     /// Re-simulate with already-signed authorization entries, in ENFORCING auth
@@ -740,12 +762,14 @@ impl SorobanEnv {
         source_b64: &str,
         auth_b64: Vec<String>,
         instruction_leeway: Option<u32>,
+        ledger_seq: Option<u32>,
     ) -> Result<JsValue, JsError> {
         self.simulate_inner(
             host_fn_b64,
             source_b64,
             Some(auth_b64),
             instruction_leeway.unwrap_or(0),
+            ledger_seq.unwrap_or(self.ledger_seq),
         )
     }
 }
@@ -758,6 +782,7 @@ impl SorobanEnv {
         source_b64: &str,
         auth_b64: Option<Vec<String>>,
         instruction_leeway: u32,
+        ledger_seq: u32,
     ) -> Result<JsValue, JsError> {
         let host_fn: HostFunction = from_xdr_b64(host_fn_b64)?;
         let source: AccountId = from_xdr_b64(source_b64)?;
@@ -786,7 +811,10 @@ impl SorobanEnv {
             &host_fn,
             &source,
             auth_mode,
-            self.ledger_info(),
+            LedgerInfo {
+                sequence_number: ledger_seq,
+                ..self.ledger_info()
+            },
             snapshot,
             self.next_prng_seed(),
             &mut diagnostics,
@@ -1189,8 +1217,12 @@ impl SorobanEnv {
     /// One deliberate difference: stellar-rpc reads through an auto-restoring
     /// snapshot, so for an EXPIRED persistent key it answers with a restore
     /// preamble instead of this error. Both mean "restore it first".
-    fn extend_ttl_resources(&self, keys: &[LedgerKey], extend_to: u32) -> Result<SorobanResources, String> {
-        let current = self.ledger_seq;
+    fn extend_ttl_resources(
+        &self,
+        keys: &[LedgerKey],
+        extend_to: u32,
+        current: u32,
+    ) -> Result<SorobanResources, String> {
         let new_live_until = current.saturating_add(extend_to);
         let store = self.store.borrow();
         let mut extended = Vec::new();
@@ -1236,8 +1268,7 @@ impl SorobanEnv {
     /// persistent keys, every one of them present; live ones are skipped. The
     /// footprint is the restored keys, sorted, and both disk-read and write
     /// bytes are their total XDR size.
-    fn restore_resources(&self, keys: &[LedgerKey]) -> Result<SorobanResources, String> {
-        let current = self.ledger_seq;
+    fn restore_resources(&self, keys: &[LedgerKey], current: u32) -> Result<SorobanResources, String> {
         let store = self.store.borrow();
         let mut restored = Vec::new();
         let mut bytes = 0u32;

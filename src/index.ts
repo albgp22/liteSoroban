@@ -201,13 +201,14 @@ export class Ledger {
   /**
    * stellar-rpc's preflight for ExtendFootprintTTL / RestoreFootprint
    * (soroban-simulation's simulate_extend_ttl_op / simulate_restore_op): the
-   * SorobanResources to submit, or the reason there are none.
+   * SorobanResources to submit, or the reason there are none. `ledgerSeq` as
+   * for `simulate`.
    */
-  simulateExtendTtl(keysB64: string[], extendTo: number): FootprintSimulation {
-    return this.env.simulateExtendTtl(keysB64, extendTo);
+  simulateExtendTtl(keysB64: string[], extendTo: number, ledgerSeq?: number): FootprintSimulation {
+    return this.env.simulateExtendTtl(keysB64, extendTo, ledgerSeq);
   }
-  simulateRestore(keysB64: string[]): FootprintSimulation {
-    return this.env.simulateRestore(keysB64);
+  simulateRestore(keysB64: string[], ledgerSeq?: number): FootprintSimulation {
+    return this.env.simulateRestore(keysB64, ledgerSeq);
   }
 
   /** Requirement 4: isolation. */
@@ -222,9 +223,16 @@ export class Ledger {
    * Requirement 2. Records auth; does NOT run a custom account's __check_auth.
    * `instructionLeeway` is stellar-rpc's `resourceConfig.instructionLeeway`: the
    * returned instructions are padded by max(50_000, leeway), or x1.04 if larger.
+   * `ledgerSeq` is the ledger to simulate in, `ledgerSeq` (the open one) by
+   * default; stellar-rpc preflights in the last closed one, `ledgerSeq - 1`.
    */
-  simulate(hostFn: xdr.HostFunction, sourceB64: string, instructionLeeway?: number): SimulateResult {
-    return this.env.simulate(hostFn.toXDR('base64'), sourceB64, instructionLeeway);
+  simulate(
+    hostFn: xdr.HostFunction,
+    sourceB64: string,
+    instructionLeeway?: number,
+    ledgerSeq?: number,
+  ): SimulateResult {
+    return this.env.simulate(hostFn.toXDR('base64'), sourceB64, instructionLeeway, ledgerSeq);
   }
 
   /**
@@ -237,8 +245,9 @@ export class Ledger {
     sourceB64: string,
     authB64: string[],
     instructionLeeway?: number,
+    ledgerSeq?: number,
   ): SimulateResult {
-    return this.env.simulateWithAuth(hostFn.toXDR('base64'), sourceB64, authB64, instructionLeeway);
+    return this.env.simulateWithAuth(hostFn.toXDR('base64'), sourceB64, authB64, instructionLeeway, ledgerSeq);
   }
 
   /** Requirement 1. */

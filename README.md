@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 227 tests, ~800 ms
+npm test               # 236 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -200,13 +200,17 @@ scenario by scenario against a local protocol-29 node
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
 
 **RPC facade** — all 18 `rpc.Server` methods respond and `test/rpc-compat.test.ts`
-checks the SDK-parsed result of each. Still wrong, found by review round 2:
+checks the SDK-parsed result of each. Ledger numbers are a node's: every
+`latestLedger` is the last closed ledger (`svm.ledgerSequence - 1`), simulation
+runs in it as stellar-rpc's preflight does, and a submission is validated against
+and applied in the next one, so `getTransaction().ledger` is `latest + 1`. Checked
+against a local protocol-29 node (`test/rpc-ledger-numbers.test.ts`). Still wrong,
+found by review round 2:
 - Diagnostics do not reach `getTransaction`; fee stats are synthetic.
-- `getLatestLedger` reports the ledger the next transaction applies in; a node
-  reports the last closed one, which is one lower. Anything a client works out from it
-  is out by one ledger: `ledgerBounds.maxLedger = latest + 1` is accepted here and
-  txTOO_LATE on a node, and `minLedger = latest + 1` is the reverse. Relative to the
-  ledger a transaction applies in, the two agree.
+- The harness has one clock. The latest ledger's close time is the timestamp the
+  next transaction is validated and applied at, so once a transaction applies,
+  `getLatestLedger` names its ledger with a close time 5 s after its `createdAt`.
+  On a node the two are the same.
 - `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
 
 `getLedgerEntries` also serves no `ConfigSetting` entries, so neither the

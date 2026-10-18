@@ -420,7 +420,7 @@ describe('getLedgers vs the live node', () => {
     //   header.previousLedgerHash === previousEntry.hash
     // holds for a chain that was never linked.
     const res = await jsonRpc('getLedgers', {
-      startLedger: svm.ledgerSequence,
+      startLedger: svm.ledgerSequence - 1, // the latest: the open ledger has not closed
       pagination: { limit: 1 },
     });
     const entry = xdr.LedgerHeaderHistoryEntry.fromXDR(res.ledgers[0].headerXdr, 'base64');
@@ -628,7 +628,8 @@ describe('zero sockets', () => {
       await server.pollTransaction(sent.hash, { attempts: 2 });
       await server.getTransactions({ startLedger: 1 });
       await server.getEvents({ startLedger: 1, filters: [] });
-      await (server as any).getLedgers({ startLedger: svm.ledgerSequence, pagination: { limit: 1 } });
+      const latest = (await server.getLatestLedger()).sequence;
+      await (server as any).getLedgers({ startLedger: latest, pagination: { limit: 1 } });
       await server.getContractInstance(cd.contractId);
 
       // Control: the same guard MUST catch a server that was never patched, or

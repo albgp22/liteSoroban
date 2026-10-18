@@ -12,6 +12,9 @@
  * which is what a node checks ledgerBounds and minSeqLedgerGap against at
  * submission (TransactionQueue passes the last closed ledger + 1). Bounds below
  * are written relative to it; on the node they were written relative to LCL + 1.
+ * Through rpc.Server, getLatestLedger reports the last closed ledger,
+ * `ledgerSeq - 1`, as a node does, so a client's `latest + 1` is that same
+ * ledger (last describe block).
  *
  * Every rejection is at submission: nothing is debited, the sequence number does
  * not move, and the result reports feeCharged = resourceFee + 100, on the node
@@ -322,6 +325,26 @@ describe('under a fee bump, the inner transaction is judged the same way', () =>
     const inner = await w.tx(a, { cond: v2({ minSeqLedgerGap: w.svm.ledger.ledgerSeq + 1 }) });
     const out = w.send(bump(inner, f, w.svm.networkPassphrase));
     expect([out.code, out.innerCode]).toEqual(['txFEE_BUMP_INNER_FAILED', 'txBAD_MIN_SEQ_AGE_OR_GAP']);
+  });
+});
+
+describe('ledger bounds a client writes from getLatestLedger', () => {
+  it('maxLedger = latest + 1 is already txTOO_LATE (exclusive)', async () => {
+    const w = world();
+    const a = w.account();
+    const latest = (await w.server.getLatestLedger()).sequence;
+    const sent = await w.server.sendTransaction(await w.tx(a, { cond: v2({ ledgerBounds: lb(0, latest + 1) }) }));
+    expect([sent.status, sent.errorResult?.result().switch().name]).toEqual(['ERROR', 'txTooLate']);
+  });
+
+  it('minLedger = latest + 1 is met, and the transaction lands in that ledger', async () => {
+    const w = world();
+    const a = w.account();
+    const latest = (await w.server.getLatestLedger()).sequence;
+    const sent = await w.server.sendTransaction(await w.tx(a, { cond: v2({ ledgerBounds: lb(latest + 1, 0) }) }));
+    expect(sent.status).toBe('PENDING');
+    const got = await w.server.getTransaction(sent.hash);
+    expect([got.status, got.ledger]).toEqual(['SUCCESS', latest + 1]);
   });
 });
 
