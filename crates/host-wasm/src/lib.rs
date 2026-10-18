@@ -134,8 +134,16 @@ fn adjust_instructions(raw: u32, instruction_leeway: u32) -> u32 {
 /// soroban-simulation `default_adjustment()`: instructions additive factor.
 const DEFAULT_INSTRUCTION_ADDITIVE: u32 = 50_000;
 
-/// Matches the `min_persistent_entry_ttl` in `ledger_info()`.
-const MIN_PERSISTENT_ENTRY_TTL: u32 = 100_000;
+/// Testnet's `ConfigSettingStateArchival`, the defaults `ledger_info()` hands
+/// the host: read with getLedgerEntries from soroban-testnet.stellar.org on
+/// 2026-10-18 (ledger 5,264,566; the entry was last modified at ledger 2,332).
+/// A local stellar/quickstart (core 29.0.0, rpc 29.0.1) reports the same three,
+/// since it applies testnet's settings upgrade. The values these replace,
+/// 16 / 100_000 / 10_000_000, were soroban-env-host's own e2e_testutils.rs
+/// fixture and matched no network.
+const TESTNET_MIN_TEMP_ENTRY_TTL: u32 = 720;
+const TESTNET_MIN_PERSISTENT_ENTRY_TTL: u32 = 120_960;
+const TESTNET_MAX_ENTRY_TTL: u32 = 3_110_400;
 
 fn is_temporary(k: &LedgerKey) -> bool {
     matches!(k, LedgerKey::ContractData(d) if d.durability == ContractDataDurability::Temporary)
@@ -370,6 +378,14 @@ pub struct SorobanEnv {
     mem_cost_params: Option<ContractCostParams>,
     cpu_limit: u64,
     mem_limit: u64,
+    /// The network's `StateArchivalSettings` TTLs: the host gives a new entry
+    /// `ledger + min - 1` and caps any TTL at `ledger + max - 1`
+    /// (ledger_info.rs), and RestoreFootprint / auto-restore use the persistent
+    /// minimum. Testnet's by default; like the cost params, network
+    /// configuration rather than ledger state, so not part of a snapshot.
+    min_temp_entry_ttl: u32,
+    min_persistent_entry_ttl: u32,
+    max_entry_ttl: u32,
     /// Cap the enforcing pass at the DECLARED instruction count, the way
     /// stellar-core does. On by default.
     ///
@@ -418,6 +434,9 @@ impl SorobanEnv {
             mem_cost_params: None,
             cpu_limit: 100_000_000,
             mem_limit: 41_943_040,
+            min_temp_entry_ttl: TESTNET_MIN_TEMP_ENTRY_TTL,
+            min_persistent_entry_ttl: TESTNET_MIN_PERSISTENT_ENTRY_TTL,
+            max_entry_ttl: TESTNET_MAX_ENTRY_TTL,
             enforce_declared_resources: true,
             module_cache: None,
         }
@@ -446,6 +465,26 @@ impl SorobanEnv {
         self.mem_cost_params = Some(from_xdr_b64(mem_params_b64)?);
         self.cpu_limit = cpu_limit;
         self.mem_limit = mem_limit;
+        Ok(())
+    }
+
+    /// Install a network's state-archival TTLs (`ConfigSettingStateArchival`'s
+    /// minTemporaryTTL, minPersistentTTL, maxEntryTTL). Without this the
+    /// harness runs testnet's. Zero is refused: the host computes
+    /// `ledger + ttl.saturating_sub(1)`, which would quietly treat it as 1.
+    #[wasm_bindgen(js_name = setArchivalSettings)]
+    pub fn set_archival_settings(
+        &mut self,
+        min_temp_entry_ttl: u32,
+        min_persistent_entry_ttl: u32,
+        max_entry_ttl: u32,
+    ) -> Result<(), JsError> {
+        if min_temp_entry_ttl == 0 || min_persistent_entry_ttl == 0 || max_entry_ttl == 0 {
+            return Err(JsError::new("state-archival TTLs must be at least 1"));
+        }
+        self.min_temp_entry_ttl = min_temp_entry_ttl;
+        self.min_persistent_entry_ttl = min_persistent_entry_ttl;
+        self.max_entry_ttl = max_entry_ttl;
         Ok(())
     }
 
@@ -571,7 +610,9 @@ impl SorobanEnv {
     }
 
     /// Seed contract code directly (skipping the upload transaction).
-    /// Returns the wasm hash as base64.
+    /// Returns the wasm hash as base64. The code gets the TTL an upload at this
+    /// ledger would give it: `ledger + min_persistent_entry_ttl - 1`, the
+    /// host's `get_min_live_until_ledger(Persistent)` (lifecycle.rs:400).
     ///
     /// NOTE: the parameter must NOT be called `wasm`. wasm-bindgen copies Rust
     /// parameter names verbatim into the generated JS, where a parameter named
@@ -581,7 +622,10 @@ impl SorobanEnv {
     pub fn seed_wasm(&mut self, code: &[u8]) -> Result<String, JsError> {
         let entry = wasm_entry(code);
         let key = get_wasm_key(code);
-        let ttl = self.ledger_seq.saturating_add(100_000);
+        let ttl = self
+            .ledger_info()
+            .min_live_until_ledger_checked(ContractDataDurability::Persistent)
+            .ok_or_else(|| JsError::new("persistent TTL overflows the ledger sequence"))?;
         self.store
             .borrow_mut()
             .insert(Rc::new(key), (Rc::new(entry), Some(ttl)));
@@ -870,7 +914,7 @@ impl SorobanEnv {
                 .collect();
             let restored_live_until = self
                 .ledger_seq
-                .saturating_add(MIN_PERSISTENT_ENTRY_TTL)
+                .saturating_add(self.min_persistent_entry_ttl)
                 .saturating_sub(1);
 
             let all_keys = resources
@@ -1128,9 +1172,9 @@ impl SorobanEnv {
             timestamp: self.timestamp,
             network_id: self.network_id,
             base_reserve: 5_000_000,
-            min_temp_entry_ttl: 16,
-            min_persistent_entry_ttl: 100_000,
-            max_entry_ttl: 10_000_000,
+            min_temp_entry_ttl: self.min_temp_entry_ttl,
+            min_persistent_entry_ttl: self.min_persistent_entry_ttl,
+            max_entry_ttl: self.max_entry_ttl,
         }
     }
 }

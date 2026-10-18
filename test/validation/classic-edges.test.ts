@@ -159,7 +159,7 @@ function extendOp(source?: xdr.MuxedAccount): xdr.Operation {
   return new xdr.Operation({
     sourceAccount: source ?? null,
     body: xdr.OperationBody.extendFootprintTtl(
-      new xdr.ExtendFootprintTtlOp({ ext: new xdr.ExtensionPoint(0), extendTo: 100_000 }),
+      new xdr.ExtendFootprintTtlOp({ ext: new xdr.ExtensionPoint(0), extendTo: 200_000 }),
     ),
   });
 }
@@ -958,8 +958,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       );
 
       expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'extendFootprintTtlSuccess']);
-      // extendTo 100_000 from this ledger outlives the TTL the write left.
-      expect(L.getEntryTtl(dataKey.toXDR('base64'))).toBe(L.ledgerSeq + 100_000);
+      // extendTo 200_000 from this ledger outlives the TTL the write left
+      // (ledger + 120_959: testnet's minPersistentTTL - 1).
+      expect(L.getEntryTtl(dataKey.toXDR('base64'))).toBe(L.ledgerSeq + 200_000);
       expect(L.getEntryTtl(dataKey.toXDR('base64'))!).toBeGreaterThan(ttlBefore!);
     });
 

@@ -10,9 +10,10 @@
  *
  *   - `LedgerInfo::min_live_until_ledger_checked`
  *     (soroban-env-host-27.0.1/src/ledger_info.rs:16) —
- *     `live_until = sequence_number + min_ttl - 1`, with
- *     `min_persistent_entry_ttl = 100_000` and `min_temp_entry_ttl = 16`
- *     as configured in crates/host-wasm/src/lib.rs `ledger_info()`.
+ *     `live_until = sequence_number + min_ttl - 1`, with testnet's
+ *     `min_persistent_entry_ttl = 120_960` and `min_temp_entry_ttl = 720`
+ *     (ConfigSettingStateArchival on soroban-testnet.stellar.org, read
+ *     2026-10-18), which the harness runs by default.
  *   - `Storage::handle_maybe_expired_entry` (src/storage.rs:723) — a temporary
  *     entry whose `live_until < sequence_number` reads back as ABSENT.
  *   - `HerderSCPDriver::checkCloseTime` (core-src/src/herder/HerderSCPDriver.cpp:280)
@@ -44,10 +45,10 @@ import { preFundedWallet, deployToken, establishTrustline } from '../../src/fixt
 import { signAuthEntries, smartAccountEd25519 } from '../../src/auth.js';
 
 // ---------------------------------------------------------------------------
-// ground-truth constants (crates/host-wasm/src/lib.rs `ledger_info()`)
+// ground-truth constants (testnet's ConfigSettingStateArchival)
 // ---------------------------------------------------------------------------
-const MIN_PERSISTENT_ENTRY_TTL = 100_000;
-const MIN_TEMP_ENTRY_TTL = 16;
+const MIN_PERSISTENT_ENTRY_TTL = 120_960;
+const MIN_TEMP_ENTRY_TTL = 720;
 /** `advanceLedgers` models a 5-second ledger close interval. */
 const SECONDS_PER_LEDGER = 5;
 /** `new Ledger()` defaults, from src/index.ts and lib.rs. */

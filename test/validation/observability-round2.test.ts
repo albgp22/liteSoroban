@@ -238,7 +238,7 @@ describe('changedKeys / removedKeys / ttlChangedKeys vs get_ledger_changes', () 
     const ttlAfter = svm.ledger.getEntryTtl(dataKey)!;
 
     expect(sent.ok).toBe(true);
-    expect(ttlAfter).toBeGreaterThan(ttlBefore); // 1099999 -> 1600000
+    expect(ttlAfter).toBeGreaterThan(ttlBefore); // 1120959 -> 1600000
 
     // The entry's VALUE was untouched — this is exactly the case the
     // `ttl_changed_keys` doc comment describes ("TTL bumps applied to entries

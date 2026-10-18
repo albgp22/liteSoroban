@@ -39,7 +39,8 @@ const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
 const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
 const plain = (pk: string) => xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 const RESOURCE_FEE = 5_000_000n;
-const MIN_PERSISTENT_ENTRY_TTL = 100_000;
+/** Testnet's minPersistentTTL (ConfigSettingStateArchival, read 2026-10-18). */
+const MIN_PERSISTENT_ENTRY_TTL = 120_960;
 
 const persistentKey = (c: xdr.ScAddress, k: string) =>
   xdr.LedgerKey.contractData(

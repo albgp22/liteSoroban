@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 import { xdr, Networks, hash as sha256 } from '@stellar/stellar-sdk';
 import { applyTransaction, fundAccount as classicFundAccount } from './classic.js';
 import type { TxOutcome, FundOptions } from './classic.js';
+import type { ArchivalSettings } from './state-archival.js';
 
 const require = createRequire(import.meta.url);
 // wasm-pack --target nodejs emits CommonJS.
@@ -182,10 +183,19 @@ export class Ledger {
     return this.env.getEntryTtl(keyB64);
   }
 
-  /** The state-archival settings the host runs with. */
-  get archivalSettings(): { minTemporaryTtl: number; minPersistentTtl: number; maxEntryTtl: number } {
+  /** The state-archival settings the host runs with. Testnet's unless set. */
+  get archivalSettings(): ArchivalSettings {
     const [minTemporaryTtl, minPersistentTtl, maxEntryTtl] = this.env.archivalSettings();
     return { minTemporaryTtl, minPersistentTtl, maxEntryTtl };
+  }
+
+  /**
+   * Install a network's state-archival TTLs, e.g. from
+   * `loadArchivalSettingsFromRpc(server)`. They decide the TTL of every entry
+   * created, restored or seeded from here on; existing TTLs are left alone.
+   */
+  setArchivalSettings(s: ArchivalSettings): void {
+    this.env.setArchivalSettings(s.minTemporaryTtl, s.minPersistentTtl, s.maxEntryTtl);
   }
 
   /**

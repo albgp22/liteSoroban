@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 194 tests, ~800 ms
+npm test               # 201 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -99,7 +99,8 @@ recorded auth entries. Disk/write bytes match on five of six.
 ## What it is good for
 
 - **Contract behaviour** — does my contract do the right thing, with real
-  storage, real TTL arithmetic, real cross-contract calls.
+  storage, real TTL arithmetic under testnet's state-archival settings, real
+  cross-contract calls.
 - **Authorization** — the host runs a custom account's `__check_auth` for real,
   including ed25519 and secp256r1/passkey proofs, nonce replay and expiry.
 - **Footprints** — recorded *and* enforced; stripping a footprint fails.
@@ -190,14 +191,16 @@ were checked scenario by scenario against a local protocol-29 node
   `INSUFFICIENT_REFUNDABLE_FEE` never happens.
 - Simulating an extend over an expired persistent entry is an error here;
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
-- State-archival settings are not the network's: minimum temporary / persistent
-  TTL 16 / 100,000 and max TTL 10,000,000, where a node with testnet's settings
-  runs 720 / 120,960 / 3,110,400. Absolute TTLs differ accordingly.
 
 **RPC facade** — all 18 `rpc.Server` methods respond and `test/rpc-compat.test.ts`
 checks the SDK-parsed result of each. Still wrong, found by review round 2:
 - Diagnostics do not reach `getTransaction`; fee stats are synthetic.
 - `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
+
+`getLedgerEntries` also serves no `ConfigSetting` entries, so neither the
+state-archival settings nor the cost tables can be read back through
+`svm.rpcServer()`. The harness itself runs testnet's state-archival settings
+(720 / 120,960 / 3,110,400); `loadArchivalSettingsFromRpc` reads a real node's.
 
 **Apply-path metering** matches the node. The enforcing path used to pass
 `module_cache: None`, so every applied invocation re-parsed its Wasm at the full
@@ -326,6 +329,7 @@ src/auth.ts               custom-account auth signing, P-256 signers
 src/fixtures.ts           wallets, tokens, trustlines
 src/fake-rpc.ts           rpc.Server adapter
 src/cost-params.ts        network cost calibration
+src/state-archival.ts     network state-archival TTLs
 test/                     the green suite
 test/guide.test.ts        executes every snippet in GUIDE.md
 test/factory.test.ts      factory -> smart account -> passkey auth, end to end

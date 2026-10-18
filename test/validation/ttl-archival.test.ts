@@ -18,11 +18,13 @@
  *     PERSISTENT entry is auto-restored, promoted to the READ-WRITE footprint
  *     and given seq + min_persistent_entry_ttl - 1.
  *
- * The harness's LedgerInfo (crates/host-wasm/src/lib.rs:582-593) is
- * byte-identical to upstream's `default_ledger_info()`
- * (soroban-env-host-27.0.1/src/e2e_testutils.rs:105-116):
- * min_temp_entry_ttl 16, min_persistent_entry_ttl 100_000, max_entry_ttl
- * 10_000_000.
+ * The harness's LedgerInfo carries testnet's state-archival settings:
+ * min_temp_entry_ttl 720, min_persistent_entry_ttl 120_960, max_entry_ttl
+ * 3_110_400, read from soroban-testnet.stellar.org's
+ * ConfigSettingStateArchival entry (getLedgerEntries, 2026-10-18) and reported
+ * identically by a local stellar/quickstart (core 29.0.0). Until then it ran
+ * upstream's `default_ledger_info()` fixture (e2e_testutils.rs:112-114:
+ * 16 / 100_000 / 10_000_000), which matches no network.
  *
  * ---------------------------------------------------------------------------
  * KNOWN HARNESS GAPS pinned by the failing tests below. Both live in
@@ -61,10 +63,10 @@ const CONTRACT_DATA = new Uint8Array(
   readFileSync(fileURLToPath(new URL('../fixtures/contract_data.wasm', import.meta.url))),
 );
 
-// -- the pinned network's state-archival settings ---------------------------
-const MIN_TEMP_ENTRY_TTL = 16;
-const MIN_PERSISTENT_ENTRY_TTL = 100_000;
-const MAX_ENTRY_TTL = 10_000_000;
+// -- testnet's state-archival settings, which the harness runs by default ----
+const MIN_TEMP_ENTRY_TTL = 720;
+const MIN_PERSISTENT_ENTRY_TTL = 120_960;
+const MAX_ENTRY_TTL = 3_110_400;
 /** `new Ledger()` starts here (src/index.ts:65). */
 const START_SEQ = 1_000_000;
 
@@ -151,6 +153,14 @@ describe('TTL, state archival and auto-restore', () => {
   // persistent entries: initial TTL
   // -------------------------------------------------------------------------
 
+  it('the harness runs testnet state-archival settings', () => {
+    expect(L.archivalSettings).toEqual({
+      minTemporaryTtl: MIN_TEMP_ENTRY_TTL,
+      minPersistentTtl: MIN_PERSISTENT_ENTRY_TTL,
+      maxEntryTtl: MAX_ENTRY_TTL,
+    });
+  });
+
   it('a written persistent entry gets live_until = seq + min_persistent_entry_ttl - 1', () => {
     expect(L.ledgerSeq).toBe(START_SEQ);
     const { addr } = deploy(L, source);
@@ -159,7 +169,7 @@ describe('TTL, state archival and auto-restore', () => {
 
     // ledger_info.rs:16-23 — min_live_until_ledger_checked(Persistent).
     expect(L.getEntryTtl(persistentKey(addr, 'k'))).toBe(minPersistentLiveUntil(START_SEQ));
-    expect(minPersistentLiveUntil(START_SEQ)).toBe(1_099_999);
+    expect(minPersistentLiveUntil(START_SEQ)).toBe(1_120_959);
   });
 
   it('the contract instance written by CreateContract gets the same initial TTL', () => {
@@ -189,9 +199,9 @@ describe('TTL, state archival and auto-restore', () => {
     call(L, addr, 'put_persistent', [sym('k'), u64(42n)], source);
     expect(L.getEntryTtl(key)).toBe(minPersistentLiveUntil(START_SEQ));
 
-    // current_ttl = 1_099_999 - 1_000_000 = 99_999, which is <= threshold, so
+    // current_ttl = 1_120_959 - 1_000_000 = 120_959, which is <= threshold, so
     // the extension applies. storage.rs:530-573.
-    call(L, addr, 'extend_persistent', [sym('k'), u32(100_000), u32(500_000)], source);
+    call(L, addr, 'extend_persistent', [sym('k'), u32(MIN_PERSISTENT_ENTRY_TTL), u32(500_000)], source);
 
     expect(L.getEntryTtl(key)).toBe(START_SEQ + 500_000);
     expect(L.getEntryTtl(key)).toBe(1_500_000);
@@ -205,7 +215,7 @@ describe('TTL, state archival and auto-restore', () => {
     const key = persistentKey(addr, 'k');
 
     call(L, addr, 'put_persistent', [sym('k'), u64(42n)], source);
-    call(L, addr, 'extend_persistent', [sym('k'), u32(100_000), u32(500_000)], source);
+    call(L, addr, 'extend_persistent', [sym('k'), u32(MIN_PERSISTENT_ENTRY_TTL), u32(500_000)], source);
     expect(L.getEntryTtl(key)).toBe(START_SEQ + 500_000);
 
     // current_ttl is now 500_000, far above threshold 10 -> no extension.
@@ -234,7 +244,7 @@ describe('TTL, state archival and auto-restore', () => {
     const key = persistentKey(addr, 'k');
 
     call(L, addr, 'put_persistent', [sym('k'), u64(42n)], source);
-    call(L, addr, 'extend_persistent', [sym('k'), u32(100_000), u32(500_000)], source);
+    call(L, addr, 'extend_persistent', [sym('k'), u32(MIN_PERSISTENT_ENTRY_TTL), u32(500_000)], source);
     expect(L.getEntryTtl(key)).toBe(START_SEQ + 500_000);
 
     // current_ttl = 500_000 <= threshold, so the threshold gate opens, but
@@ -257,7 +267,7 @@ describe('TTL, state archival and auto-restore', () => {
     call(L, addr, 'extend_persistent', [sym('k'), u32(200_000), u32(2 * MAX_ENTRY_TTL)], source);
 
     expect(L.getEntryTtl(key)).toBe(maxLiveUntil(START_SEQ));
-    expect(L.getEntryTtl(key)).toBe(10_999_999);
+    expect(L.getEntryTtl(key)).toBe(4_110_399);
   });
 
   it('an entry already at the ceiling cannot be pushed past it', () => {
@@ -307,19 +317,19 @@ describe('TTL, state archival and auto-restore', () => {
 
     call(L, addr, 'put_temporary', [sym('t'), u64(7n)], source);
     expect(L.getEntryTtl(key)).toBe(minTempLiveUntil(START_SEQ));
-    expect(L.getEntryTtl(key)).toBe(1_000_015);
+    expect(L.getEntryTtl(key)).toBe(1_000_719);
 
     expect(nativeReturn(read(L, addr, 'has_temporary', [sym('t')], source))).toBe(true);
 
     // live_until >= seq is still LIVE (storage.rs:660).
     L.advanceLedgers(MIN_TEMP_ENTRY_TTL - 1);
-    expect(L.ledgerSeq).toBe(1_000_015);
+    expect(L.ledgerSeq).toBe(1_000_719);
     expect(nativeReturn(read(L, addr, 'has_temporary', [sym('t')], source))).toBe(true);
     expect(nativeReturn(read(L, addr, 'get_temporary', [sym('t')], source))).toBe(7n);
 
     // One more ledger and live_until < seq: the host must not see it any more.
     L.advanceLedgers(1);
-    expect(L.ledgerSeq).toBe(1_000_016);
+    expect(L.ledgerSeq).toBe(1_000_720);
     expect(nativeReturn(read(L, addr, 'has_temporary', [sym('t')], source))).toBe(false);
 
     const gone = read(L, addr, 'get_temporary', [sym('t')], source);
@@ -398,7 +408,7 @@ describe('TTL, state archival and auto-restore', () => {
     // a ttl_change that raises live_until. Nothing is written.
     const hostFn = invokeHostFn(addr, 'extend_persistent', [
       sym('k'),
-      u32(100_000),
+      u32(MIN_PERSISTENT_ENTRY_TTL),
       u32(300_000),
     ]);
     const sim = L.simulate(hostFn, source);
@@ -447,8 +457,8 @@ describe('TTL, state archival and auto-restore', () => {
 
     call(L, addr, 'put_persistent', [sym('k'), u64(42n)], source);
 
-    // Past the TTL of the data entry (1_099_999), the instance (1_099_999) and
-    // the seeded code entry (1_100_000). All three are archived.
+    // Past the TTL of the data entry, the instance and the seeded code entry
+    // (1_120_959 each). All three are archived.
     L.advanceLedgers(150_000);
     const seq = L.ledgerSeq;
     expect(seq).toBe(1_150_000);
@@ -491,7 +501,7 @@ describe('TTL, state archival and auto-restore', () => {
     // e2e_invoke.rs:472-482 — a restored key's new_live_until_ledger is raised
     // to min_live_until_ledger = seq + min_persistent_entry_ttl - 1.
     const restored = minPersistentLiveUntil(seq);
-    expect(restored).toBe(1_249_999);
+    expect(restored).toBe(1_270_959);
     expect(L.getEntryTtl(dataK)).toBe(restored);
     expect(L.getEntryTtl(instK)).toBe(restored);
     expect(L.getEntryTtl(codeK)).toBe(restored);
@@ -607,7 +617,7 @@ describe('TTL, state archival and auto-restore', () => {
     expect(L.getEntryTtl(key)).toBe(minPersistentLiveUntil(START_SEQ));
 
     const snap = L.snapshot();
-    call(L, addr, 'extend_persistent', [sym('k'), u32(100_000), u32(300_000)], source);
+    call(L, addr, 'extend_persistent', [sym('k'), u32(MIN_PERSISTENT_ENTRY_TTL), u32(300_000)], source);
     expect(L.getEntryTtl(key)).toBe(START_SEQ + 300_000);
 
     L.restore(snap);

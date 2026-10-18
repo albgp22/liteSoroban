@@ -305,6 +305,9 @@ describe('ROUND 2 — fix 6: expired TEMPORARY entries skipped from host inputs'
   // crates/host-wasm/src/lib.rs `send`:
   //   if is_temporary(key) && live_until.map_or(false, |t| t < self.ledger_seq) { continue; }
   // Boundary from soroban-env-host-27.0.1/src/storage.rs:660 — live_until >= seq is LIVE.
+  // Testnet's minTemporaryTTL (ConfigSettingStateArchival, read 2026-10-18),
+  // which the harness runs by default.
+  const MIN_TEMP_ENTRY_TTL = 720;
   const tempKey = (c: xdr.ScAddress, k: string) =>
     xdr.LedgerKey.contractData(
       new xdr.LedgerKeyContractData({
@@ -335,10 +338,10 @@ describe('ROUND 2 — fix 6: expired TEMPORARY entries skipped from host inputs'
     const src = accB64(dep.publicKey());
 
     callTx(L, addr, 'put_temporary', [sym('t'), u64(7n)], src);
-    expect(L.getEntryTtl(tempKey(addr, 't'))).toBe(L.ledgerSeq + 16 - 1);
+    expect(L.getEntryTtl(tempKey(addr, 't'))).toBe(L.ledgerSeq + MIN_TEMP_ENTRY_TTL - 1);
 
     // Exactly at live_until: still LIVE, must be handed to the host.
-    L.advanceLedgers(15);
+    L.advanceLedgers(MIN_TEMP_ENTRY_TTL - 1);
     const live = callTx(L, addr, 'has_temporary', [sym('t')], src);
     expect(live.sent.ok, live.sent.error).toBe(true);
 

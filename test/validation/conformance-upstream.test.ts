@@ -15,8 +15,10 @@
  *     protocol 29, sequence_number 1_000_000, timestamp 12_345_678,
  *     network_id [5;32], base_reserve 5_000_000, min_temp_entry_ttl 16,
  *     min_persistent_entry_ttl 100_000, max_entry_ttl 10_000_000.
- *   crates/host-wasm/src/lib.rs hardcodes base_reserve and the three TTL
- *   constants to exactly those values, so only `timestamp` has to be set here.
+ *   crates/host-wasm/src/lib.rs hardcodes base_reserve to that value. Its TTLs
+ *   default to testnet's state-archival settings (720 / 120_960 / 3_110_400),
+ *   so `e2eLedger()` installs upstream's three with `setArchivalSettings`, and
+ *   sets `timestamp`.
  *
  *   NETWORK ID: `Ledger` overrides the host's DEFAULT_NETWORK_ID ([5;32]) with
  *   sha256(networkPassphrase) and offers no way back. That changes exactly one
@@ -58,10 +60,16 @@ const DEFAULT_LEDGER_SEQ = 1_000_000;
 const DEFAULT_TIMESTAMP = 12_345_678;
 const MIN_TEMP_ENTRY_TTL = 16;
 const MIN_PERSISTENT_ENTRY_TTL = 100_000;
+const MAX_ENTRY_TTL = 10_000_000;
 
 function e2eLedger(): Ledger {
   const L = new Ledger({ ledgerSeq: DEFAULT_LEDGER_SEQ });
   L.setTimestamp(DEFAULT_TIMESTAMP);
+  L.setArchivalSettings({
+    minTemporaryTtl: MIN_TEMP_ENTRY_TTL,
+    minPersistentTtl: MIN_PERSISTENT_ENTRY_TTL,
+    maxEntryTtl: MAX_ENTRY_TTL,
+  });
   return L;
 }
 

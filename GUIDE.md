@@ -270,6 +270,17 @@ svm.timestamp;
 Ledger sequence and timestamp are part of a snapshot, so `restore()` rolls the
 clock back too.
 
+TTLs follow testnet's state-archival settings: a persistent entry written at
+ledger `n` lives until `n + 120_959`, a temporary one until `n + 719`, and no
+TTL reaches past `n + 3_110_399`. To match another network, read its settings
+with `loadArchivalSettingsFromRpc(server)` or pass them in; they apply to
+entries written from then on:
+
+```ts
+svm.ledger.archivalSettings;   // { minTemporaryTtl: 720, minPersistentTtl: 120_960, maxEntryTtl: 3_110_400 }
+svm.withArchivalSettings({ minTemporaryTtl: 16, minPersistentTtl: 4_096, maxEntryTtl: 6_312_000 });
+```
+
 ## Asserting on failures
 
 `invoke` throws a `HostFailure` with the error parsed out, not a string to grep:

@@ -60,7 +60,9 @@ const TL_AUTHORIZED = 1, TL_AUTHORIZED_TO_MAINTAIN_LIABILITIES = 2, TL_CLAWBACK_
 
 /** LedgerInfo written by crates/host-wasm/src/lib.rs::ledger_info(). */
 const BASE_RESERVE = 5_000_000;
-const MIN_PERSISTENT_ENTRY_TTL = 100_000;
+/** Testnet's ConfigSettingStateArchival (read 2026-10-18), the harness default. */
+const MIN_TEMP_ENTRY_TTL = 720;
+const MIN_PERSISTENT_ENTRY_TTL = 120_960;
 /** storage_types.rs: BALANCE_EXTEND_AMOUNT = 30 * DAY_IN_LEDGERS (17280). */
 const BALANCE_EXTEND_AMOUNT = 30 * 17280;
 
@@ -335,7 +337,10 @@ describe('SAC: approve / allowance / transfer_from', () => {
   it('the allowance lives in a TEMPORARY ContractData entry whose TTL is live_until', () => {
     const { L, alice, bob, token } = world();
     token.mint(alice, 1_000n);
-    const live = L.ledgerSeq + 100;
+    // allowance.rs:90-107 writes a NEW allowance (TTL seq + minTemporaryTTL - 1)
+    // and then only extends it to live_until, so live_until must lie past that
+    // minimum: on testnet an allowance 100 ledgers out keeps seq + 719.
+    const live = L.ledgerSeq + 2 * MIN_TEMP_ENTRY_TTL;
     const ap = call(L, token.address, 'approve',
       [alice.scAddress, bob.scAddress, i128(300n), u32v(live)], alice.accountIdB64);
 

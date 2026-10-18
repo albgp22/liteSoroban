@@ -60,10 +60,16 @@ import {
   loadCostParamsFromRpc,
   type CostParams,
 } from './cost-params.js';
+import {
+  TESTNET_ARCHIVAL_SETTINGS,
+  loadArchivalSettingsFromRpc,
+  type ArchivalSettings,
+} from './state-archival.js';
 import type { AuthProofBuilder } from './auth.js';
 
 export { XLM, PROTOCOL_27_COST_PARAMS, loadCostParamsFromRpc };
-export type { CostParams };
+export { TESTNET_ARCHIVAL_SETTINGS, loadArchivalSettingsFromRpc };
+export type { CostParams, ArchivalSettings };
 export type { Wallet, Token, AuthProofBuilder };
 
 // ---------------------------------------------------------------------------
@@ -317,6 +323,16 @@ export class LiteStellar {
       params.cpuLimit ?? P27_CPU_LIMIT,
       params.memLimit ?? P27_MEM_LIMIT,
     );
+    return this;
+  }
+
+  /**
+   * Run with a network's state-archival TTLs instead of testnet's, e.g. from
+   * `loadArchivalSettingsFromRpc(server)`. Applies to entries created,
+   * restored or seeded from here on.
+   */
+  withArchivalSettings(settings: ArchivalSettings): this {
+    this.ledger.setArchivalSettings(settings);
     return this;
   }
 

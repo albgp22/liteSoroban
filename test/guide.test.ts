@@ -169,6 +169,14 @@ describe('GUIDE.md', () => {
     svm.advanceLedgers(500);
     svm.restore(snap);
     expect(svm.ledgerSequence).toBe(2_000_000);
+
+    // TTLs follow testnet's state-archival settings
+    expect(svm.ledger.archivalSettings).toEqual({
+      minTemporaryTtl: 720, minPersistentTtl: 120_960, maxEntryTtl: 3_110_400,
+    });
+    const other = { minTemporaryTtl: 16, minPersistentTtl: 4_096, maxEntryTtl: 6_312_000 };
+    svm.withArchivalSettings(other);
+    expect(svm.ledger.archivalSettings).toEqual(other);
   });
 
   it('Asserting on failures', () => {
