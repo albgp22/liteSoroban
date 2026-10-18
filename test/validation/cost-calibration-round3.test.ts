@@ -1,20 +1,20 @@
 /**
- * ROUND-3 AUDIT of the cost-calibration fix, measured differentially against
- * the live protocol-27 quickstart node (stellar-rpc 27.1.1 / captive-core
- * 27.1.0) at http://localhost:8000/rpc.
+ * ROUND-3 AUDIT of the cost-calibration fix, measured differentially against a
+ * live PROTOCOL-29 `stellar/quickstart` node at http://localhost:8000/rpc.
  *
- * STALE SINCE THE PROTOCOL-29 BUMP: these numbers were measured with
- * soroban-env-host 27.0.1 against that protocol-27 node. The pinned host is now
- * 29.0.2, whose metering moved in 28.0.0, so the exact-match tests below go red
- * until the node numbers are re-captured against a protocol-29 node.
+ * PINNED NODE: stellar-rpc 29.0.1 (commit 055dc9c7), stellar-core v29.0.0
+ * (which embeds soroban-env-host 29.0.0, git a721944), `getNetwork()` protocol
+ * 29, standalone passphrase. Every "node" number below was re-captured on
+ * 2026-10-18; the harness pins soroban-env-host 29.0.2. Two rounds on fresh
+ * contract ids and salts returned identical counts. The earlier protocol-27
+ * constants (stellar-rpc 27.1.1 / captive-core 27.1.0, host 27.0.1) are gone:
+ * the host's metering moved in 28.0.0.
  *
  * RED 1 (APPLY PATH) IS CLOSED: `send()` now passes a module cache, as
  * stellar-core does, so the 58-121% / +220% / +53% gaps its tests name are gone
- * (a live protocol-29 node: applied CPU and memory within 0.1% of
- * `core_metrics`; README "Apply-path metering"). The tests keep their names and
- * their protocol-27 constants; they pass because they assert an upper bound the
- * harness now meets. Against protocol-27 constants the distance that remains is
- * the host's own metering moving between versions.
+ * (applied CPU within 0.14% and applied memory equal to `core_metrics`;
+ * README "Apply-path metering"); its tests now assert that closed state against
+ * these protocol-29 numbers.
  *
  * Everything labelled "node" below was MEASURED by this author, not inherited:
  *
@@ -30,10 +30,10 @@
  *      `SimulationAdjustmentConfig::default_adjustment()` (`src/simulation.rs`),
  *      and `additive = max(additive, instruction_leeway)` in
  *      `stellar-rpc/cmd/stellar-rpc/lib/preflight/src/shared.rs`.
- *      Confirmed live: add(2,3) returns 353_123 at leeway 0 / 1_000 / 50_000,
- *      353_124 at 50_001, 403_123 at 100_000, 1_303_123 at 1_000_000 and
- *      20_303_123 at 20_000_000 — i.e. raw + max(50_000, leeway), pinning raw
- *      at exactly 303_123.
+ *      Confirmed live: add(2,3) returns 325_616 at leeway 0 / 1_000 / 50_000,
+ *      325_617 at 50_001, 375_616 at 100_000, 1_275_616 at 1_000_000 and
+ *      20_275_616 at 20_000_000 — i.e. raw + max(50_000, leeway), pinning raw
+ *      at exactly 275_616.
  *
  *  (b) APPLY — `core_metrics`/`cpu_insn` and `core_metrics`/`mem_byte`
  *      diagnostic events off the applied transaction. This is the only way to
@@ -41,18 +41,25 @@
  *      field.
  *
  * BEWARE when reproducing: several of these counts are BIMODAL, and the mode is
- * chosen by the byte order of the two contract addresses in the footprint. A
- * contract-to-contract native SAC transfer costs 643_783 when the destination
- * id sorts BEFORE the source id and 636_107 when it sorts after — **on the node
- * as well as in the harness**. Comparing across modes manufactures a 1.2%
- * "gap" that is not real. Round 2's `crossContract` and `contractSacTransfer`
- * numbers are one mode; this file matches modes before comparing.
+ * chosen by the byte order of the two ids in the footprint — **on the node as
+ * well as in the harness**. Measured on this node (raw, instructions):
+ *
+ *   crossContract  618_891 caller id > callee id | 618_741 caller id < callee id
+ *   sacToAccount   159_028 payer key < dest key  | 159_364 payer key > dest key
+ *
+ * and the applied sacToAccount memory moves 7.6% with it (36_665 vs 39_465
+ * bytes). Comparing across modes manufactures a "gap" that is not real, so this
+ * file matches modes before comparing. `sacToContract` is not bimodal: a
+ * destination contract id sorting before or after the native SAC id both give
+ * 192_286.
  *
  * VERDICT: the preflight claim holds and is stronger than the README says —
  * EXACT, not "~1%", on every scenario whose footprint is pure Soroban,
- * including a custom-account __check_auth round trip (3,136,297 instructions,
- * zero difference). Memory on that path is equally good, which nobody had
- * checked. Three things are wrong, and all three are in this file.
+ * including a custom-account __check_auth round trip (912,700 recording,
+ * 2,037,481 or 2,040,027 enforcing depending on the nonce; zero difference).
+ * Applied memory equals the node's. What is still wrong is in this file:
+ * anything holding a classic AccountEntry (RED 2) and the RPC facade ignoring
+ * instructionLeeway (RED 3). RED 1 and RED 4 are closed.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -89,35 +96,46 @@ const A = (a: xdr.ScAddress) => xdr.ScVal.scvAddress(a);
 /** exactly what crates/host-wasm/src/lib.rs:103 does, and what stellar-rpc does */
 const pad = (raw: number) => Math.max(raw + 50_000, Math.floor(raw * 1.04));
 
-/** node preflight, leeway 0, already de-adjusted to RAW */
+/** node preflight, leeway 0, already de-adjusted to RAW (protocol-29 node, 2026-10-18) */
 const NODE_PREFLIGHT_RAW = {
-  uploadUnique: 1_542_113,
-  deploy: 529_166,
-  add: 303_123,
-  putPersistent: 549_484,
-  getPersistent: 549_562,
-  largeWrite: 594_696,
-  crossContract: 715_982,          // A->B; B->A is 715_582 (the other mode)
-  checkAuthRecording: 2_006_499,
-  checkAuthEnforcing: 3_136_297,
-  sacToAccount: 185_414,           // other mode 185_750
-  sacToContract: 212_515,
+  uploadUnique: 1_542_915,
+  deploy: 495_354,
+  add: 275_616,
+  putPersistent: 413_712,
+  getPersistent: 414_915,
+  largeWrite: 460_445,
+  crossContract: 618_891,          // caller id > callee id; the other mode is 618_741
+  checkAuthRecording: 912_700,
+  // BIMODAL on the recorded nonce (key order in the footprint): 24 fresh recordings
+  // on the node gave 2_037_481 x10 and 2_040_027 x14; the recording pass is 912_700 x24.
+  checkAuthEnforcing: [2_037_481, 2_040_027],
+  sacToAccount: 159_028,           // payer key < dest key; the other mode is 159_364
+  sacToContract: 192_286,
 };
 
-/** node `core_metrics` off the applied transaction */
+/** node `core_metrics` off the applied transaction (same node, same date) */
 const NODE_APPLY = {
-  uploadUnique: { cpu: 1_540_336, mem: 1_447_946 },
-  deploy: { cpu: 516_432, mem: 2_267_630 },
-  add: { cpu: 298_100, mem: 1_146_659 },
-  putPersistent: { cpu: 541_405, mem: 1_181_784 },
-  getPersistent: { cpu: 541_868, mem: 1_182_523 },
-  largeWrite: { cpu: 584_524, mem: 1_223_301 },
-  crossContract: { cpu: 704_534, mem: 2_437_186 },
-  failing: { cpu: 395_573, mem: 1_206_651 },
-  sacToAccount: { cpu: 162_989, mem: 57_951 },
-  sacToContract: { cpu: 193_100, mem: 65_302 },
-  checkAuth: { cpu: 3_100_868, mem: 2_796_310 },
+  uploadUnique: { cpu: 1_541_138, mem: 1_439_796 },
+  deploy: { cpu: 493_979, mem: 2_260_048 },
+  add: { cpu: 276_240, mem: 1_130_954 },
+  putPersistent: { cpu: 411_280, mem: 1_151_268 },
+  getPersistent: { cpu: 412_868, mem: 1_151_485 },
+  largeWrite: { cpu: 456_020, mem: 1_173_633 },
+  crossContract: { cpu: 619_017, mem: 2_405_938 },
+  failing: { cpu: 330_700, mem: 1_206_580 },
+  sacToAccount: { cpu: 150_401, mem: 36_665 },   // payer key < dest key; the other mode 154_879 / 39_465
+  sacToContract: { cpu: 184_326, mem: 48_531 },
+  checkAuth: { cpu: 2_016_866, mem: 2_553_360 },
 };
+
+/**
+ * The node's ledger limits. NOT the shipped P27_* constants (mainnet's
+ * protocol-27 limits): the quickstart standalone network allows 4x the
+ * instructions per transaction (ConfigSettingContractComputeV0
+ * tx_max_instructions); the memory ceiling is the same.
+ */
+const NODE_CPU_LIMIT = 400_000_000n;
+const NODE_MEM_LIMIT = 41_943_040n;
 
 // ---------------------------------------------------------------------------
 // the same scenarios, in process, calibrated
@@ -199,7 +217,12 @@ async function build() {
     record('failing', sim, sent);
   }
 
-  const dest = preFundedWallet(L);
+  // bimodal on the byte order of the two account keys: pin payer < dest
+  const payerKey = Buffer.from(payer.keypair.rawPublicKey());
+  let dest = preFundedWallet(L);
+  while (Buffer.compare(payerKey, Buffer.from(dest.keypair.rawPublicKey())) >= 0) {
+    dest = preFundedWallet(L);
+  }
   const nat = nativeToken(L, payer);
   both('sacToAccount', invokeHostFn(nat.address, 'transfer',
     [A(payer.address), A(dest.address), i128(1000n)]));
@@ -247,24 +270,37 @@ describe('GREEN: the preflight claim, verified beyond the four tuned scenarios',
   // NEW in this round: nobody had ever compared a custom-account authorization.
   it('a custom-account __check_auth round trip is exact, both passes', () => {
     expect(rows.checkAuthRecording.sim).toBe(NODE_PREFLIGHT_RAW.checkAuthRecording);
-    // The enforcing pass is bimodal by 2_700 (0.086%) on the recorded nonce.
-    expect(Math.abs(pct(rows.checkAuthEnforcing.sim, NODE_PREFLIGHT_RAW.checkAuthEnforcing)))
-      .toBeLessThan(0.1);
+    // The enforcing pass is bimodal by 2_546 (0.125%) on the recorded nonce, on
+    // the node and in the harness alike: it must land on one of the node's modes.
+    expect(NODE_PREFLIGHT_RAW.checkAuthEnforcing).toContain(rows.checkAuthEnforcing.sim);
   });
 
   // NEW in this round: memory had never been checked against anything.
-  it('recording-mode MEMORY tracks the node as tightly as instructions do', () => {
+  //
+  // The node exposes no RECORDED memory (SorobanResources has no memory field
+  // and simulateTransaction returns no `cost`), so the only reference is the
+  // applied `mem_byte`. On the protocol-27 host the two coincided to <0.03%. On
+  // protocol 29 they do not: the harness's own recorded memory sits 0.05-0.6%
+  // below its own applied memory (1.7% on the two-module auth path). The cause
+  // is not isolated. So the verifiable claims are two: applied memory equals
+  // the node's, and recorded memory is within 1% of it (2% on the auth path).
+  it('MEMORY: applied equals the node, recording-mode is within 1% of it', () => {
     const keys = ['uploadUnique', 'deploy', 'add', 'putPersistent', 'getPersistent',
       'largeWrite', 'crossContract', 'failing'] as const;
     const report = keys.map(k =>
       `  ${k.padEnd(18)} node=${String(NODE_APPLY[k].mem).padStart(9)}  ` +
-      `harness=${String(rows[k].simMem).padStart(9)}  ${pct(rows[k].simMem, NODE_APPLY[k].mem).toFixed(4)}%`);
+      `applied=${String(rows[k].mem).padStart(9)} (${pct(rows[k].mem, NODE_APPLY[k].mem).toFixed(4)}%)  ` +
+      `recorded=${String(rows[k].simMem).padStart(9)} (${pct(rows[k].simMem, NODE_APPLY[k].mem).toFixed(4)}%)`);
     console.log('\n' + report.join('\n'));
     for (const k of keys) {
-      expect(Math.abs(pct(rows[k].simMem, NODE_APPLY[k].mem)), `${k} memory`).toBeLessThan(0.05);
+      expect(Math.abs(pct(rows[k].mem, NODE_APPLY[k].mem)), `${k} applied memory`).toBeLessThan(0.05);
+      expect(Math.abs(pct(rows[k].simMem, NODE_APPLY[k].mem)), `${k} recorded memory`).toBeLessThan(1);
     }
-    expect(Math.abs(pct(rows.checkAuthEnforcing.simMem, NODE_APPLY.checkAuth.mem)))
-      .toBeLessThan(0.1);
+    expect(Math.abs(pct(rows.checkAuthEnforcing.mem, NODE_APPLY.checkAuth.mem)), 'checkAuth applied memory')
+      .toBeLessThan(0.05);
+    // the auth path is the widest (1.7%): it runs two modules
+    expect(Math.abs(pct(rows.checkAuthEnforcing.simMem, NODE_APPLY.checkAuth.mem)), 'checkAuth recorded memory')
+      .toBeLessThan(2);
   });
 
   it('the shipped table IS the live node table, entry for entry, CPU and memory', async () => {
@@ -272,8 +308,8 @@ describe('GREEN: the preflight claim, verified beyond the four tuned scenarios',
     const live = await loadCostParamsFromRpc(S);
     expect(live.cpuInstructions).toBe(PROTOCOL_27_COST_PARAMS.cpuInstructions);
     expect(live.memoryBytes).toBe(PROTOCOL_27_COST_PARAMS.memoryBytes);
-    expect(live.cpuLimit).toBe(P27_CPU_LIMIT);
-    expect(live.memLimit).toBe(P27_MEM_LIMIT);
+    expect(live.cpuLimit).toBe(NODE_CPU_LIMIT);
+    expect(live.memLimit).toBe(NODE_MEM_LIMIT);
 
     const dec = (b: string) => xdr.ContractCostParams.fromXDR(Buffer.from(b, 'base64'));
     for (const [name, a, b] of [
@@ -292,36 +328,38 @@ describe('GREEN: the preflight claim, verified beyond the four tuned scenarios',
 });
 
 // ===========================================================================
-describe('RED 1: the apply path is far worse than any document admits', () => {
-  // README "Known gaps" quantifies the module_cache: None defect as 25-59%.
-  // Round 2 measured 55-121% on contract invocations. On a CUSTOM-ACCOUNT
-  // authorization it is 220%, because the enforcing pass instantiates the
-  // smart account's Wasm for __check_auth *and* the invoked contract's, paying
-  // VmInstantiation const_term 417,482 twice where core pays
-  // VmCachedInstantiation 41,142 out of a prepopulated SorobanModuleCache.
-  it('GAP: applied CPU on a __check_auth invocation is 3.2x the node', () => {
+describe('CLOSED 1: the apply path matches core_metrics now that send() passes a module cache', () => {
+  // History: with `module_cache: None` every apply paid VmInstantiation
+  // (const_term 417,482) where stellar-core pays VmCachedInstantiation (41,142)
+  // out of a prepopulated SorobanModuleCache. README "Known gaps" put that at
+  // 25-59%, round 2 measured 55-121% on contract invocations, and a CUSTOM-
+  // ACCOUNT authorization was +220% CPU / +53% memory because the enforcing
+  // pass instantiates both the smart account's Wasm and the invoked contract's.
+  // These assert the closed state against the protocol-29 `core_metrics`: the
+  // measured CPU residue is <=0.14% (the largest is largeWrite, +0.13%) and
+  // applied memory is exact, so 0.25% leaves headroom without letting the
+  // cache regress unnoticed.
+  it('applied CPU on a __check_auth invocation is within 0.25% of the node', () => {
     const d = pct(rows.checkAuthEnforcing.cpu, NODE_APPLY.checkAuth.cpu);
-    console.log(`\n  checkAuth apply  node=${NODE_APPLY.checkAuth.cpu}  harness=${rows.checkAuthEnforcing.cpu}  +${d.toFixed(1)}%`);
-    expect(d, 'README "Known gaps" says 25-59%').toBeLessThan(59);
+    console.log(`\n  checkAuth apply  node=${NODE_APPLY.checkAuth.cpu}  harness=${rows.checkAuthEnforcing.cpu}  ${d.toFixed(3)}%`);
+    expect(Math.abs(d), 'applied CPU on the auth path').toBeLessThan(0.25);
   });
 
-  it('GAP: and its applied MEMORY is +53%, which no document mentions at all', () => {
-    // README discusses the module cache purely as an INSTRUCTION problem.
-    // VmInstantiation also has a memory cost, and on this path it dominates.
+  it('applied MEMORY on that path equals the node', () => {
     const d = pct(rows.checkAuthEnforcing.mem, NODE_APPLY.checkAuth.mem);
-    console.log(`  checkAuth mem    node=${NODE_APPLY.checkAuth.mem}  harness=${rows.checkAuthEnforcing.mem}  +${d.toFixed(1)}%`);
-    expect(d, 'applied memory is uncalibrated on the auth path').toBeLessThan(1);
+    console.log(`  checkAuth mem    node=${NODE_APPLY.checkAuth.mem}  harness=${rows.checkAuthEnforcing.mem}  ${d.toFixed(3)}%`);
+    expect(Math.abs(d), 'applied memory on the auth path').toBeLessThan(0.05);
   });
 
-  it('GAP: applied CPU is 58-121% high on ordinary invocations too', () => {
+  it('applied CPU on ordinary invocations is within 0.25% of the node', () => {
     const keys = ['add', 'deploy', 'putPersistent', 'getPersistent',
       'largeWrite', 'crossContract', 'failing'] as const;
     const report = keys.map(k =>
       `  ${k.padEnd(18)} node=${String(NODE_APPLY[k].cpu).padStart(9)}  ` +
-      `harness=${String(rows[k].cpu).padStart(9)}  +${pct(rows[k].cpu, NODE_APPLY[k].cpu).toFixed(1)}%`);
+      `harness=${String(rows[k].cpu).padStart(9)}  ${pct(rows[k].cpu, NODE_APPLY[k].cpu).toFixed(3)}%`);
     console.log('\n' + report.join('\n'));
     for (const k of keys) {
-      expect(Math.abs(pct(rows[k].cpu, NODE_APPLY[k].cpu)), `${k} applied CPU`).toBeLessThan(59);
+      expect(Math.abs(pct(rows[k].cpu, NODE_APPLY[k].cpu)), `${k} applied CPU`).toBeLessThan(0.25);
     }
   });
 });
@@ -331,16 +369,29 @@ describe('RED 2: anything holding a classic AccountEntry is mis-metered', () => 
   // fundAccount() writes AccountEntry with ext = v0 (92 bytes); stellar-core
   // normalises to the v1->v2->v3 chain (144 bytes). 52 bytes per account, and
   // it lands in instructions, memory AND the fee-bearing byte counts.
-  it('GAP: a native SAC transfer between two G-accounts under-meters ~6.8%', () => {
+  it('GAP: a native SAC transfer between two G-accounts under-meters ~5.1%', () => {
     const d = pct(rows.sacToAccount.sim, NODE_PREFLIGHT_RAW.sacToAccount);
     console.log(`\n  sacToAccount  node=${NODE_PREFLIGHT_RAW.sacToAccount}  harness=${rows.sacToAccount.sim}  ${d.toFixed(2)}%`);
     // "wallet sends XLM" is the single most common thing a test does.
     expect(Math.abs(d), 'README claims ~1% after calibration').toBeLessThan(1);
   });
 
-  it('GAP: its MEMORY is short by the same 6.7%, and memory is never mentioned', () => {
-    const d = pct(rows.sacToAccount.simMem, NODE_APPLY.sacToAccount.mem);
-    console.log(`  sacToAccount mem  node=${NODE_APPLY.sacToAccount.mem}  harness=${rows.sacToAccount.simMem}  ${d.toFixed(2)}%`);
+  it('GAP: its applied MEMORY through Ledger.send is ~7% under the node', () => {
+    // An earlier version compared RECORDED memory with the node's APPLIED
+    // memory (simulateTransaction returns no cost). That stopped being a valid
+    // proxy here: preflight hands the host both accounts promoted to ext v3
+    // (soroban-simulation's SimulationSnapshotSource) while apply sees the
+    // fresh destination at v0, so the two differ on the node too.
+    //
+    // Applied against applied, 2026-10-18: harness 34_085 vs node 36_665 bytes
+    // (-7.0%), CPU 147_409 vs 150_401 (-2.0%). This scenario drives Ledger.send
+    // directly, which does not bump the payer's sequence, and on a network that
+    // bump promotes the transaction source to ext v3 before the host runs.
+    // Promoting the payer by hand first gives 36_885 bytes (+0.6%) and 151_887
+    // instructions (+1.0%). An envelope through sendTransaction does get the
+    // promotion; the low-level path does not.
+    const d = pct(rows.sacToAccount.mem, NODE_APPLY.sacToAccount.mem);
+    console.log(`  sacToAccount applied mem  node=${NODE_APPLY.sacToAccount.mem}  harness=${rows.sacToAccount.mem}  ${d.toFixed(2)}%`);
     expect(Math.abs(d)).toBeLessThan(1);
   });
 
@@ -365,13 +416,12 @@ describe('RED 3 (fixed): the RPC facade honours instructionLeeway', () => {
   // stellar-rpc: adjustment_config.instructions.additive_factor =
   //   max(50_000, resource_config.instruction_leeway)   (preflight/src/shared.rs)
   // This used to be hard-coded at 50_000, so every leeway returned the same
-  // number. Measured on the live protocol-27 node for add(2,3):
-  //   leeway 0 -> 353_123 | 50_001 -> 353_124 | 100_000 -> 403_123
-  //   leeway 1_000_000 -> 1_303_123 | 20_000_000 -> 20_303_123
-  // The absolute counts are the separate host-version drift (RED 4 and the
-  // README table): host 29.0.2 records 325_616 for add(2,3), and so does a
-  // local protocol-29 node (stellar-rpc 29.0.1, core 29.0.0) metering with the
-  // same table. What leeway must reproduce is the node's DELTAS.
+  // number. Measured on a live protocol-29 node (stellar-rpc 29.0.1, core
+  // 29.0.0) for add(2,3), in two separate captures that agree:
+  //   leeway 0 -> 325_616 | 50_001 -> 325_617 | 100_000 -> 375_616
+  //   leeway 1_000_000 -> 1_275_616 | 20_000_000 -> 20_275_616
+  // (A protocol-27 node gave 353_123 / 403_123 / 1_303_123 / 20_303_123: the
+  // same deltas on the older host's metering.)
   it('scales the padding with the leeway exactly as the node does', async () => {
     const svm = new LiteStellar({ networkPassphrase: PASS }).withNetworkCostParams();
     const c = svm.deployContract(ADD_I32);
@@ -388,35 +438,36 @@ describe('RED 3 (fixed): the RPC facade honours instructionLeeway', () => {
       seen[leeway] = sim.transactionData.build().resources().instructions();
     }
     console.log('\n  harness leeway ->', JSON.stringify(seen));
-    console.log('  node    leeway -> {"0":353123,"100000":403123,"1000000":1303123,"20000000":20303123}');
+    console.log('  node    leeway -> {"0":325616,"100000":375616,"1000000":1275616,"20000000":20275616}');
 
-    const node = { 0: 353_123, 100_000: 403_123, 1_000_000: 1_303_123, 20_000_000: 20_303_123 };
-    for (const leeway of [100_000, 1_000_000, 20_000_000] as const) {
-      expect(seen[leeway] - seen[0], `leeway ${leeway}: delta`).toBe(node[leeway] - node[0]);
+    const node = { 0: 325_616, 100_000: 375_616, 1_000_000: 1_275_616, 20_000_000: 20_275_616 };
+    for (const leeway of [0, 100_000, 1_000_000, 20_000_000] as const) {
+      expect(seen[leeway], `leeway ${leeway}`).toBe(node[leeway]);
     }
   });
 });
 
 // ===========================================================================
-describe('RED 4: the acceptance test pins numbers the node does not produce', () => {
-  // test/cost-params.test.ts's NODE constants, against the leeway-0 truth.
-  it('GAP: test/cost-params.test.ts NODE constants are 0.11-0.32% too high', () => {
-    const pinned = { add: 304_084, putPersistent: 550_088, getPersistent: 550_166 };
-    for (const [k, v] of Object.entries(pinned)) {
-      const measured = NODE_PREFLIGHT_RAW[k as keyof typeof NODE_PREFLIGHT_RAW];
-      expect(v, `${k}: test pins ${v}, node returns ${measured}`).toBe(measured);
+describe('CLOSED 4: the acceptance test no longer pins node numbers it cannot reproduce', () => {
+  // History: test/cost-params.test.ts pinned {add 304_084, putPersistent 550_088,
+  // getPersistent 550_166}, 0.11-0.32% above the leeway-0 truth, and asserted
+  // `delta > 0.5` on an upload against 1_547_805 — a node that ALREADY held
+  // that ContractCode, so its preflight wrote nothing while the harness
+  // uploaded for the first time. That assertion failed if the code became
+  // exact. The file has since dropped both and compares only against the
+  // shipped table; these keep it that way.
+  const acceptance = readFileSync(
+    fileURLToPath(new URL('../cost-params.test.ts', import.meta.url)), 'utf8');
+
+  it('test/cost-params.test.ts pins none of the stale node counts', () => {
+    for (const stale of ['304_084', '550_088', '550_166', '1_547_805', '1547805']) {
+      expect(acceptance, `still pins ${stale}`).not.toContain(stale);
     }
   });
 
-  it('GAP: "upload retains a small documented residue" REQUIRES the harness to be wrong', () => {
-    // cost-params.test.ts:109-114 asserts `delta > 0.5` — a test that fails if
-    // the code becomes exact. Its reference (1,547,805) is a node that ALREADY
-    // held that ContractCode, so its preflight wrote nothing; the harness was
-    // uploading for the first time. With the same bytes fresh on both sides the
-    // difference is zero, so the "residue" is an artifact of the reference.
+  it('and does not require the harness to be wrong on upload', () => {
+    expect(acceptance).not.toMatch(/delta\s*>\s*0\.5/);
+    // same bytes, fresh on both sides: the difference is zero
     expect(rows.uploadUnique.sim).toBe(NODE_PREFLIGHT_RAW.uploadUnique);
-    const residue = Math.abs(pct(rows.uploadUnique.sim, NODE_PREFLIGHT_RAW.uploadUnique));
-    expect(residue, 'a lower bound on error is not a property worth pinning')
-      .toBeGreaterThan(0.5);
   });
 });
