@@ -8,6 +8,14 @@
  * 29.0.2, whose metering moved in 28.0.0, so the exact-match tests below go red
  * until the node numbers are re-captured against a protocol-29 node.
  *
+ * RED 1 (APPLY PATH) IS CLOSED: `send()` now passes a module cache, as
+ * stellar-core does, so the 58-121% / +220% / +53% gaps its tests name are gone
+ * (a live protocol-29 node: applied CPU and memory within 0.1% of
+ * `core_metrics`; README "Apply-path metering"). The tests keep their names and
+ * their protocol-27 constants; they pass because they assert an upper bound the
+ * harness now meets. Against protocol-27 constants the distance that remains is
+ * the host's own metering moving between versions.
+ *
  * Everything labelled "node" below was MEASURED by this author, not inherited:
  *
  *  (a) PREFLIGHT — `simulateTransaction` with `resourceConfig.instructionLeeway`

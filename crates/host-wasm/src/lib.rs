@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
-use soroban_env_host::budget::Budget;
+use soroban_env_host::budget::{AsBudget, Budget};
 use soroban_env_host::e2e_invoke::{
     entry_size_for_rent, invoke_host_function, invoke_host_function_in_recording_mode,
     RecordingInvocationAuthMode, TtlLedgerEntryMeta,
@@ -50,10 +50,12 @@ use soroban_env_host::xdr::{
     LedgerFootprint, Liabilities, SponsorshipDescriptor, TimePoint,
     AccountId, HostFunction, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount,
     LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine, Limits, ReadXdr,
-    ContractCostParams, ContractDataDurability, SorobanAuthorizationEntry, SorobanResources,
-    WriteXdr,
+    ContractCostParams, ContractDataDurability, Hash, SorobanAuthorizationEntry,
+    SorobanResources, WriteXdr,
 };
-use soroban_env_host::{HostError, LedgerInfo};
+use soroban_env_host::{
+    CompilationContext, Error as ScError, ErrorHandler, HostError, LedgerInfo, ModuleCache, Val,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -252,6 +254,43 @@ fn update_account_entry(acc: &mut AccountEntry) {
     }
 }
 
+/// Where contract code is compiled for the module cache. The host's own
+/// reference embedder (`E2eTestCompilationContext`, test-only and so not
+/// reachable) does the same: compilation happens outside any transaction, so it
+/// runs against an unlimited budget that nothing else observes.
+#[derive(Clone)]
+struct CompileCtx(Budget);
+
+impl CompileCtx {
+    fn new() -> Result<Self, HostError> {
+        let budget = Budget::default();
+        budget.reset_unlimited()?;
+        Ok(Self(budget))
+    }
+}
+
+impl ErrorHandler for CompileCtx {
+    fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostError>
+    where
+        ScError: From<E>,
+        E: std::fmt::Debug,
+    {
+        res.map_err(HostError::from)
+    }
+
+    fn error(&self, error: ScError, _msg: &str, _args: &[Val]) -> HostError {
+        HostError::from(error)
+    }
+}
+
+impl AsBudget for CompileCtx {
+    fn as_budget(&self) -> &Budget {
+        &self.0
+    }
+}
+
+impl CompilationContext for CompileCtx {}
+
 // ---------------------------------------------------------------------------
 // results returned to JS
 // ---------------------------------------------------------------------------
@@ -334,16 +373,27 @@ pub struct SorobanEnv {
     /// Cap the enforcing pass at the DECLARED instruction count, the way
     /// stellar-core does.
     ///
-    /// Off by default, and that is a deliberate, documented compromise: this
-    /// crate passes `module_cache: None`, so the enforcing pass pays the full
-    /// `VmInstantiation` Wasm-parse cost (const_term 451,626) while recording
-    /// mode charges that same parse to the SHADOW budget on the assumption that
-    /// enforcement will find a cache. The two halves therefore disagree by more
-    /// than stellar-rpc's padding covers, and enforcing the declared limit
-    /// makes every deploy fail with Error(Budget, ExceededLimit).
-    /// Turn it on to test resource-limit failures; fix the module cache to make
-    /// it safe as a default.
+    /// Off by default. It used to be off because the enforcing pass ran with
+    /// `module_cache: None`: it paid the full `VmInstantiation` Wasm-parse cost
+    /// (const_term 451,626) where recording mode charges the cached price to its
+    /// shadow budget, the two halves disagreed by 71-188% per invocation, and
+    /// enforcing the declared limit failed every deploy with
+    /// Error(Budget, ExceededLimit). `send` now hands the host a module cache
+    /// (see `prepare_module_cache`) and the applied count tracks the recorded
+    /// one to within 1%, so turning this on is safe; every deploy and invocation
+    /// in the calibration scenarios fits its declared count with 3.8-27% to
+    /// spare.
+    ///
+    /// The floor of that margin is stellar-rpc's own padding
+    /// (`max(raw + 50_000, raw * 1.04)`): an apply that costs more than 4% over
+    /// what the simulation recorded is refused, exactly as on a network.
     enforce_declared_resources: bool,
+    /// Parsed contract code, shared by every `send` on this environment, built
+    /// lazily so `new()` stays free. It is content-addressed by wasm hash, so it
+    /// is deliberately NOT part of a snapshot: after `restore()` it can hold
+    /// modules whose code is gone from the ledger, and the host checks storage
+    /// before it trusts a cache hit. `None` until the first contract call.
+    module_cache: Option<ModuleCache>,
 }
 
 #[wasm_bindgen]
@@ -363,11 +413,11 @@ impl SorobanEnv {
             cpu_limit: 100_000_000,
             mem_limit: 41_943_040,
             enforce_declared_resources: false,
+            module_cache: None,
         }
     }
 
-    /// See `enforce_declared_resources`. Off by default; read the note there
-    /// before turning it on.
+    /// See `enforce_declared_resources`. Off by default.
     #[wasm_bindgen(js_name = enforceDeclaredResources)]
     pub fn set_enforce_declared_resources(&mut self, on: bool) {
         self.enforce_declared_resources = on;
@@ -800,6 +850,10 @@ impl SorobanEnv {
         let mut entries: Vec<(Option<Vec<u8>>, Option<TtlLedgerEntryMeta>)> = Vec::with_capacity(
             resources.footprint.read_only.len() + resources.footprint.read_write.len(),
         );
+        // Contract code the module cache must hold for this call, and the code
+        // this call restores, which it must not; see `prepare_module_cache`.
+        let mut live_code: Vec<(Hash, Rc<LedgerEntry>)> = Vec::new();
+        let mut restored_code: Vec<Hash> = Vec::new();
         {
             let store = self.store.borrow();
             // Entries the simulation marked for auto-restore, by read_write index.
@@ -832,6 +886,14 @@ impl SorobanEnv {
                     continue;
                 }
 
+                if let LedgerKey::ContractCode(code_key) = key {
+                    if restored.contains(key) {
+                        restored_code.push(code_key.hash.clone());
+                    } else if live_until.map_or(true, |t| t >= self.ledger_seq) {
+                        live_code.push((code_key.hash.clone(), Rc::clone(entry)));
+                    }
+                }
+
                 let encoded = entry.to_xdr(Limits::none()).map_err(xdr_err)?;
                 let ttl_meta = if needs_ttl(key) {
                     // Restoring is the EMBEDDER's job: core rewrites the TTL of
@@ -861,6 +923,8 @@ impl SorobanEnv {
             }
         }
 
+        let module_cache = self.prepare_module_cache(&live_code, &restored_code)?;
+
         let auth_entries: Vec<Vec<u8>> = auth_b64
             .iter()
             .map(|s| b64d(s))
@@ -881,7 +945,7 @@ impl SorobanEnv {
             vec![0u8; 32],
             &mut diagnostics,
             None,
-            None,
+            Some(module_cache),
         );
 
         // A top-level host error (bad inputs, exhausted budget) used to escape
@@ -968,6 +1032,58 @@ impl SorobanEnv {
 }
 
 impl SorobanEnv {
+    /// The module cache for one enforcing call: every live contract in the
+    /// footprint parsed and ready, nothing the call restores.
+    ///
+    /// stellar-core hands the host a cache pre-built from the ledger, so an
+    /// invocation pays `VmCachedInstantiation` (41,142 + a per-byte term)
+    /// instead of re-parsing the Wasm at `VmInstantiation` (451,626). Recording
+    /// mode already charges the cached price, to the shadow budget, assuming the
+    /// enforcing pass will find a cache; passing none made the two halves
+    /// disagree by 58-121% per invocation.
+    ///
+    /// One cache lives on the environment and is topped up per call. Parsing is
+    /// the expensive part and a contract is parsed once, however many sends
+    /// call it; adding a module that is already there is a no-op.
+    ///
+    /// Code the transaction RESTORES is taken out. Core cannot have cached an
+    /// archived entry, so the host must compile it during execution and bill
+    /// the full parse; leaving a stale module in would hide that cost. The next
+    /// call puts it back.
+    ///
+    /// Code that does not compile is simply left out. The host then falls back
+    /// to compiling it during execution and fails the call with the real error,
+    /// which is what an unusable `seedWasm` blob should do.
+    fn prepare_module_cache(
+        &mut self,
+        live_code: &[(Hash, Rc<LedgerEntry>)],
+        restored_code: &[Hash],
+    ) -> Result<ModuleCache, JsError> {
+        let ctx = CompileCtx::new().map_err(host_err)?;
+        let cache = match self.module_cache.take() {
+            Some(cache) => cache,
+            None => ModuleCache::new(&ctx).map_err(host_err)?,
+        };
+        for (hash, entry) in live_code {
+            if cache.contains_module(hash).map_err(host_err)? {
+                continue;
+            }
+            if let LedgerEntryData::ContractCode(code) = &entry.data {
+                let _ = cache.parse_and_cache_module_simple(
+                    &ctx,
+                    self.protocol_version,
+                    code.code.as_slice(),
+                );
+            }
+        }
+        for hash in restored_code {
+            cache.remove_module(hash).map_err(host_err)?;
+        }
+        // A clone is a shallow handle on the same shared module map.
+        self.module_cache = Some(cache.clone());
+        Ok(cache)
+    }
+
     /// Build a budget from the installed network cost parameters when we have
     /// them, falling back to the host's default table when we do not.
     fn make_budget(&self, cpu_limit: Option<u64>) -> Result<Budget, JsError> {
