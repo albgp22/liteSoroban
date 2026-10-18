@@ -612,10 +612,16 @@ export class LiteStellar {
     return applyTransaction(this.ledger, envelopeB64, this.ledger.networkPassphrase, this.validation);
   }
 
-  /** An rpc.Server backed by this environment, with zero network access. */
+  /**
+   * An rpc.Server backed by this environment, with zero network access.
+   * Envelopes it submits go through `sendTransaction`, so the validation
+   * switches (`withSigverify`, `withSequenceCheck`, ...) apply to them too.
+   */
   rpcServer(url = 'https://in-process.invalid'): rpc.Server {
     const server = new rpc.Server(url);
-    attachInProcessRpc(server, this.ledger);
+    attachInProcessRpc(server, this.ledger, {
+      submit: (envelopeB64) => this.sendTransaction(envelopeB64),
+    });
     return server;
   }
 

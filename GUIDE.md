@@ -346,7 +346,10 @@ const got  = await server.pollTransaction(sent.hash);   // SUCCESS
 All 18 `rpc.Server` methods work, including `getEvents` (fed from what
 `sendTransaction` applied), `getLedgers`, `getTransactions`, `getFeeStats`,
 `getVersionInfo` and `requestAirdrop` — which funds through an in-process
-friendbot, no socket involved. `test/rpc-compat.test.ts` calls every one of them
+friendbot, no socket involved, and refuses an account that already exists, as the
+real one does. Envelopes submitted through `rpcServer()` obey the same
+`withSigverify` / `withSequenceCheck` / `withFeeCharging` / `withTimebounds`
+switches as `svm.sendTransaction`. `test/rpc-compat.test.ts` calls every one of them
 and checks the SDK-parsed result, so a regression is named rather than vague.
 
 `contract.Client` works the same way — pass `server` in `ClientOptions`; the

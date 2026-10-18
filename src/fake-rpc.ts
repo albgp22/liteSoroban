@@ -233,11 +233,35 @@ function accountLedgerKey(accountId: string): xdr.LedgerKey {
   );
 }
 
+export interface InProcessRpcOptions {
+  /**
+   * How a submitted envelope is applied. Defaults to `ledger.sendTransaction`:
+   * full classic validation, every check on. `LiteStellar.rpcServer()` passes
+   * its own `sendTransaction` so the `withSigverify` / `withSequenceCheck` /
+   * `withFeeCharging` / `withTimebounds` switches reach this path too.
+   */
+  submit?: (envelopeB64: string) => TxOutcome;
+}
+
+/** The error axios rejects with for a non-2xx response; the SDK reads `.response`. */
+function httpError(config: unknown, status: number, statusText: string, data: unknown): Error {
+  return Object.assign(new Error(`Request failed with status code ${status}`), {
+    isAxiosError: true,
+    config,
+    response: { status, statusText, data, headers: {}, config },
+  });
+}
+
 /**
  * Install an in-process JSON-RPC adapter on an existing `rpc.Server`.
  * Returns stats so a test can assert which methods were exercised.
  */
-export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterStats {
+export function attachInProcessRpc(
+  server: rpc.Server,
+  ledger: Ledger,
+  opts: InProcessRpcOptions = {},
+): AdapterStats {
+  const submit = opts.submit ?? ((envelopeB64: string) => ledger.sendTransaction(envelopeB64));
   const stats: AdapterStats = { calls: [], networkAttempts: 0 };
   const submitted = new Map<string, SubmittedTx>();
   const eventLog: BufferedEvent[] = [];
@@ -250,24 +274,31 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
       stats.calls.push({ method: 'friendbot' });
       const addr = new URL(config.url).searchParams.get('addr');
       if (!addr) throw new Error('friendbot: missing addr');
+      const accountKey = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({
+          accountId: xdr.AccountId.publicKeyTypeEd25519(StrKey.decodeEd25519PublicKey(addr)),
+        }),
+      ).toXDR('base64');
+
+      // Friendbot creates NEW accounts and refuses an existing one. Observed
+      // live: HTTP 400, "account already funded to starting balance". Funding
+      // it anyway would rebuild its AccountEntry: sequence back to 0, signers
+      // and thresholds gone, every envelope it already spent replayable.
+      if (ledger.getEntry(accountKey)) {
+        throw httpError(config, 400, 'Bad Request', {
+          type: 'https://stellar.org/friendbot-errors/bad_request',
+          title: 'Bad Request',
+          status: 400,
+          detail: 'account already funded to starting balance',
+        });
+      }
       ledger.fund(addr, { balance: 10_000n * 10_000_000n });
 
       // The SDK reads the new account's sequence out of the meta
       // (findCreatedAccountSequenceInTransactionMeta), so the meta has to carry
       // a ledgerEntryCreated change for the AccountEntry — funding alone is not
       // enough to make requestAirdrop work.
-      const created = xdr.LedgerEntry.fromXDR(
-        ledger.getEntry(
-          xdr.LedgerKey.account(
-            new xdr.LedgerKeyAccount({
-              accountId: xdr.AccountId.publicKeyTypeEd25519(
-                StrKey.decodeEd25519PublicKey(addr),
-              ),
-            }),
-          ).toXDR('base64'),
-        )!,
-        'base64',
-      );
+      const created = xdr.LedgerEntry.fromXDR(ledger.getEntry(accountKey)!, 'base64');
 
       return {
         data: {
@@ -515,7 +546,7 @@ export function attachInProcessRpc(server: rpc.Server, ledger: Ledger): AdapterS
         const txHash = tx.hash();
         const hashHex = txHash.toString('hex');
 
-        const outcome = ledger.sendTransaction(envelopeB64);
+        const outcome = submit(envelopeB64);
         const resultXdr = transactionResult(outcome, txHash).toXDR('base64');
 
         // Classic validation failures come back synchronously as ERROR, exactly
