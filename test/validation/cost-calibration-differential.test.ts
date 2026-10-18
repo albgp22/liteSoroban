@@ -8,6 +8,13 @@
  * 29.0.2, whose metering moved in 28.0.0, so the exact-match tests below go red
  * until the node numbers are re-captured against a protocol-29 node.
  *
+ * APPLY PATH, CLOSED BY THE MODULE CACHE: the `apply` block below was written
+ * when `send()` passed `module_cache: None`, and its GAP tests assert bounds the
+ * harness now meets (applied CPU/memory within 0.1% of a live protocol-29
+ * node's `core_metrics`; README "Apply-path metering"). The constants here stay
+ * protocol-27, so the remaining distance to them is host-version drift, not the
+ * cache: compare applied against RECORDED, which does not move with the host.
+ *
  * Every "node" number below was MEASURED, not inferred, in two independent ways:
  *
  *  (1) PREFLIGHT — `simulateTransaction` with `resourceConfig.instructionLeeway`

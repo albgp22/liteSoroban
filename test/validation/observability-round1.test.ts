@@ -327,9 +327,17 @@ describe('verified against the host', () => {
     );
     expect(sim.memBytes).toBeGreaterThan(0n);
     expect(sent.memBytes).toBeGreaterThan(0n);
-    // The enforcing pass parses the Wasm module itself (module_cache: None),
-    // so it must consume strictly more of both dimensions than recording did.
-    expect(sent.memBytes).toBeGreaterThan(sim.memBytes);
-    expect(sent.cpuInsns).toBeGreaterThan(sim.cpuInsns);
+    // Both passes report the non-shadow dimension. This used to assert that the
+    // enforcing pass consumed strictly MORE of both than recording, which was
+    // the missing module cache showing through (it re-parsed the Wasm that
+    // recording charged to its shadow budget). With the cache the two agree to
+    // within a percent, and the enforcing pass is, if anything, a hair cheaper.
+    for (const [applied, recorded] of [
+      [Number(sent.cpuInsns), Number(sim.cpuInsns)],
+      [Number(sent.memBytes), Number(sim.memBytes)],
+    ]) {
+      expect(applied / recorded).toBeGreaterThan(0.97);
+      expect(applied / recorded).toBeLessThan(1.03);
+    }
   });
 });
