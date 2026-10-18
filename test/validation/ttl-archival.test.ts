@@ -90,23 +90,23 @@ function contractDataKey(
 ): string {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({ contract, key, durability }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 const persistentKey = (c: xdr.ScAddress, k: string) =>
-  contractDataKey(c, sym(k), xdr.ContractDataDurability.persistent());
+  contractDataKey(c, sym(k), xdr.ContractDataDurability.persistent);
 const temporaryKey = (c: xdr.ScAddress, k: string) =>
-  contractDataKey(c, sym(k), xdr.ContractDataDurability.temporary());
+  contractDataKey(c, sym(k), xdr.ContractDataDurability.temporary);
 const instanceKey = (c: xdr.ScAddress) =>
   contractDataKey(
     c,
     xdr.ScVal.scvLedgerKeyContractInstance(),
-    xdr.ContractDataDurability.persistent(),
+    xdr.ContractDataDurability.persistent,
   );
 const codeKey = (wasmHashB64: string) =>
   xdr.LedgerKey.contractCode(
     new xdr.LedgerKeyContractCode({ hash: Buffer.from(wasmHashB64, 'base64') }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 // -- helpers ----------------------------------------------------------------
 
@@ -119,7 +119,10 @@ function deploy(L: Ledger, source: string): Deployed {
   const wasmHash = L.seedWasm(CONTRACT_DATA);
   const { sent } = L.simulateAndSend(createContractHostFn(source, wasmHash), source);
   expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-  return { addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(), wasmHash };
+  return {
+    addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
+    wasmHash,
+  };
 }
 
 /** simulate -> send, asserting both legs. Returns the simulation for inspection. */
@@ -138,7 +141,7 @@ function read(L: Ledger, addr: xdr.ScAddress, fn: string, args: xdr.ScVal[], sou
 }
 
 const nativeReturn = (sim: { returnValueXdr?: string }) =>
-  scValToNative(xdr.ScVal.fromXDR(sim.returnValueXdr!, 'base64'));
+  scValToNative(xdr.ScVal.fromXdr(sim.returnValueXdr!, 'base64'));
 
 describe('TTL, state archival and auto-restore', () => {
   let L: Ledger;
@@ -605,7 +608,7 @@ describe('TTL, state archival and auto-restore', () => {
     const sent = L.send(hostFn, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
     expect(sent.ok, `deploy onto archived code failed: ${sent.error}`).toBe(true);
 
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
     expect(L.getEntryTtl(codeKey(wasmHash))).toBe(minPersistentLiveUntil(seq));
     expect(L.getEntryTtl(instanceKey(addr))).toBe(minPersistentLiveUntil(seq));
   });

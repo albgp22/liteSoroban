@@ -374,34 +374,43 @@ describe('README.md claims that are true (pinned)', () => {
       }
 
       const table = JSON.parse(readFileSync('src/costparams/protocol27.json', 'utf8'));
-      const params = xdr.ContractCostParams.fromXDR(
+      const params = xdr.decodeArray(
+        xdr.ContractCostParamEntry,
         Buffer.from(table.cpuInstructions, 'base64'),
-      ) as any[];
-      const names = xdr.ContractCostType.values().map((v: any) => v.name.toLowerCase());
+      );
+      const names = [...xdr.ContractCostType.schema.nameByValue.values()].map((n) => n.toLowerCase());
 
       expect(params.length).toBe(86);
       let differing = 0;
       for (let i = 0; i < names.length; i++) {
         const h = host[names[i]];
         const n = [
-          Number(params[i].constTerm().toString()),
-          Number(params[i].linearTerm().toString()),
+          Number(params[i].constTerm),
+          Number(params[i].linearTerm),
         ];
         if (h[0] !== n[0] || h[1] !== n[1]) differing++;
       }
       expect(differing).toBe(18);
       expect(host['valdeser'][0]).toBe(59052);
-      expect(Number(params[7].constTerm().toString())).toBe(331);
+      expect(Number(params[7].constTerm)).toBe(331);
       // and the entry the "protocol-20" story would require to differ, does not
       expect(host['vmcachedinstantiation']).toEqual([41142, 634]);
     },
   );
 
-  it("'accountId' in someScAddress is always true", () => {
+  it("'accountId' in someScAddress is not a Wallet check", () => {
     const svm = new LiteStellar();
+    const alice = svm.airdrop();
     const c = svm.deployContract(wasm('add_i32.wasm'));
-    expect(c.address.switch().name).toBe('scAddressTypeContract');
-    expect('accountId' in c.address).toBe(true);
+    expect(c.address.type).toBe('scAddressTypeContract');
+    // SDK 17: an ScAddress carries only its own arm's field (16.2.0 answered
+    // true for every arm), so the probe matches an account ScAddress and a
+    // Wallet alike; accountIdB64 tells them apart.
+    expect('accountId' in c.address).toBe(false);
+    expect('accountId' in alice.address).toBe(true);
+    expect('accountId' in alice).toBe(true);
+    expect('accountIdB64' in alice.address).toBe(false);
+    expect('accountIdB64' in alice).toBe(true);
   });
 
   it('an unsorted ScMap is rejected with Error(Object, InvalidInput)', () => {

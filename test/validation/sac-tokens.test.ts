@@ -104,7 +104,7 @@ function call(
 function read(L: Ledger, addr: xdr.ScAddress, fn: string, args: xdr.ScVal[], src: string) {
   const sim = L.simulate(invokeHostFn(addr, fn, args), src);
   if (!sim.ok) throw new Error(sim.error);
-  return scValToNative(xdr.ScVal.fromXDR(sim.returnValueXdr!, 'base64'));
+  return scValToNative(xdr.ScVal.fromXdr(sim.returnValueXdr!, 'base64'));
 }
 
 /** Assert a call failed with a specific builtin ContractError and message. */
@@ -117,15 +117,14 @@ function expectContractError(r: CallResult, code: number, messageFragment: strin
 /** Overwrite an existing account's flags in place (no FundOptions for this). */
 function setIssuerFlags(L: Ledger, w: Wallet, flags: number) {
   const ae = loadAccount(L, w.accountId)!;
-  ae.flags(flags);
-  storeAccount(L, ae);
+  storeAccount(L, new xdr.AccountEntry({ ...ae, flags }));
 }
 
 function deployPlainContract(L: Ledger, src: string, salt = Buffer.alloc(32)): xdr.ScAddress {
   const wasmHash = L.seedWasm(ADD_I32);
   const { sent } = L.simulateAndSend(createContractHostFn(src, wasmHash, salt), src);
   if (!sent.ok) throw new Error(sent.error);
-  return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+  return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 }
 
 function trustLineAsset(asset: Asset): xdr.TrustLineAsset {
@@ -141,18 +140,18 @@ function trustLineAsset(asset: Asset): xdr.TrustLineAsset {
 function trustLineKey(holder: Wallet, asset: Asset): string {
   return xdr.LedgerKey.trustline(new xdr.LedgerKeyTrustLine({
     accountId: holder.accountId, asset: trustLineAsset(asset),
-  })).toXDR('base64');
+  })).toXdr('base64');
 }
 
 function loadTrustLine(L: Ledger, holder: Wallet, asset: Asset): xdr.TrustLineEntry {
   const raw = L.getEntry(trustLineKey(holder, asset));
   if (!raw) throw new Error('no trustline');
-  return xdr.LedgerEntry.fromXDR(raw, 'base64').data().trustLine();
+  return xdr.expectUnionVariant(xdr.LedgerEntry.fromXdr(raw, 'base64').data, 'trustline').trustLine;
 }
 
 function eventTopics(eventB64: string): unknown[] {
-  return xdr.ContractEvent.fromXDR(eventB64, 'base64')
-    .body().v0().topics().map((t) => scValToNative(t));
+  return xdr.expectUnionVariant(xdr.ContractEvent.fromXdr(eventB64, 'base64').body, 'v0')
+    .v0.topics.map((t) => scValToNative(t));
 }
 
 /** A fresh issuer + a deployed credit SAC + a holder with a trustline. */
@@ -177,7 +176,7 @@ describe('SAC: burn, burn_from, and transfer-to-issuer', () => {
     expect(r.ok, r.error).toBe(true);
     expect(token.balanceOf(alice)).toBe(900n);
     // The trustline balance is the token supply for this holder.
-    expect(BigInt(loadTrustLine(L, alice, token.asset).balance().toString())).toBe(900n);
+    expect(BigInt(loadTrustLine(L, alice, token.asset).balance.toString())).toBe(900n);
 
     // event.rs::burn -> topics [burn, from, name]; name is "CODE:ISSUER".
     expect(r.sent!.eventsXdr.length).toBe(1);
@@ -274,9 +273,11 @@ describe('SAC: approve / allowance / transfer_from', () => {
     expect(read(L, token.address, 'allowance', [alice.scAddress, bob.scAddress], issuer.accountIdB64)).toBe(180n);
     // No address-credential auth entry was recorded for alice at all.
     const addresses = tf.sim.authXdr
-      .map((b64) => xdr.SorobanAuthorizationEntry.fromXDR(b64, 'base64'))
-      .filter((e) => e.credentials().switch().name === 'sorobanCredentialsAddress')
-      .map((e) => Address.fromScAddress(e.credentials().address().address()).toString());
+      .map((b64) => xdr.SorobanAuthorizationEntry.fromXdr(b64, 'base64'))
+      .filter((e) => e.credentials.type === 'sorobanCredentialsAddress')
+      .map((e) => Address.fromScAddress(
+        xdr.expectUnionVariant(e.credentials, 'sorobanCredentialsAddress').address.address,
+      ).toString());
     expect(addresses).not.toContain(alice.publicKey);
   });
 
@@ -345,12 +346,13 @@ describe('SAC: approve / allowance / transfer_from', () => {
       [alice.scAddress, bob.scAddress, i128(300n), u32v(live)], alice.accountIdB64);
 
     const tempKeys = ap.sent!.changedKeys.filter((k) => {
-      const key = xdr.LedgerKey.fromXDR(k, 'base64');
-      return key.switch().name === 'contractData' && key.contractData().durability().name === 'temporary';
+      const key = xdr.LedgerKey.fromXdr(k, 'base64');
+      return key.type === 'contractData' && key.contractData.durability.name === 'temporary';
     });
     expect(tempKeys.length).toBe(1);
     expect(L.getEntryTtl(tempKeys[0])).toBe(live);
-    const key = xdr.LedgerKey.fromXDR(tempKeys[0], 'base64').contractData().key();
+    const key = xdr.expectUnionVariant(xdr.LedgerKey.fromXdr(tempKeys[0], 'base64'), 'contractData')
+      .contractData.key;
     // storage_types.rs: DataKey::Allowance(AllowanceDataKey { from, spender })
     expect(scValToNative(key)).toEqual([
       'Allowance', { from: alice.publicKey, spender: bob.publicKey },
@@ -373,7 +375,7 @@ describe('SAC: clawback', () => {
     const { L, issuer, alice, token } = world({ issuerFlags: AUTH_CLAWBACK_ENABLED });
     // create_trustline_if_needed copies the issuer's clawback flag onto the trustline.
     expect(call(L, token.address, 'trust', [alice.scAddress], alice.accountIdB64).ok).toBe(true);
-    expect(loadTrustLine(L, alice, token.asset).flags() & TL_CLAWBACK_ENABLED).toBe(TL_CLAWBACK_ENABLED);
+    expect(loadTrustLine(L, alice, token.asset).flags & TL_CLAWBACK_ENABLED).toBe(TL_CLAWBACK_ENABLED);
 
     expect(call(L, token.address, 'mint', [alice.scAddress, i128(100n)], issuer.accountIdB64).ok).toBe(true);
     const cb = call(L, token.address, 'clawback', [alice.scAddress, i128(40n)], issuer.accountIdB64);
@@ -432,17 +434,17 @@ describe('SAC: set_authorized', () => {
   it('flips exactly the flags balance.rs::set_trustline_authorization specifies', () => {
     const { L, issuer, alice, token } = world({ issuerFlags: AUTH_REVOCABLE });
     token.mint(alice, 100n);
-    expect(loadTrustLine(L, alice, token.asset).flags()).toBe(TL_AUTHORIZED);
+    expect(loadTrustLine(L, alice, token.asset).flags).toBe(TL_AUTHORIZED);
 
     expect(call(L, token.address, 'set_authorized',
       [alice.scAddress, boolv(false)], issuer.accountIdB64).ok).toBe(true);
     // AUTHORIZED cleared, AUTHORIZED_TO_MAINTAIN_LIABILITIES set.
-    expect(loadTrustLine(L, alice, token.asset).flags()).toBe(TL_AUTHORIZED_TO_MAINTAIN_LIABILITIES);
+    expect(loadTrustLine(L, alice, token.asset).flags).toBe(TL_AUTHORIZED_TO_MAINTAIN_LIABILITIES);
     expect(read(L, token.address, 'authorized', [alice.scAddress], issuer.accountIdB64)).toBe(false);
 
     expect(call(L, token.address, 'set_authorized',
       [alice.scAddress, boolv(true)], issuer.accountIdB64).ok).toBe(true);
-    expect(loadTrustLine(L, alice, token.asset).flags()).toBe(TL_AUTHORIZED);
+    expect(loadTrustLine(L, alice, token.asset).flags).toBe(TL_AUTHORIZED);
   });
 
   it('blocks both directions of transfer while deauthorized', () => {
@@ -486,23 +488,23 @@ describe('SAC: set_authorized', () => {
 describe('SAC: trust() creates a real TrustLineEntry', () => {
   it('creates an unlimited authorized trustline and bumps num_sub_entries', () => {
     const { L, issuer, alice, token } = world();
-    expect(loadAccount(L, alice.accountId)!.numSubEntries()).toBe(0);
+    expect(loadAccount(L, alice.accountId)!.numSubEntries).toBe(0);
 
     const r = call(L, token.address, 'trust', [alice.scAddress], alice.accountIdB64);
     expect(r.ok, r.error).toBe(true);
 
     const tl = loadTrustLine(L, alice, token.asset);
-    expect(BigInt(tl.balance().toString())).toBe(0n);
-    expect(BigInt(tl.limit().toString())).toBe(9_223_372_036_854_775_807n); // i64::MAX
-    expect(tl.flags()).toBe(TL_AUTHORIZED);
-    expect(loadAccount(L, alice.accountId)!.numSubEntries()).toBe(1);
+    expect(BigInt(tl.balance.toString())).toBe(0n);
+    expect(BigInt(tl.limit.toString())).toBe(9_223_372_036_854_775_807n); // i64::MAX
+    expect(tl.flags).toBe(TL_AUTHORIZED);
+    expect(loadAccount(L, alice.accountId)!.numSubEntries).toBe(1);
     expect(read(L, token.address, 'authorized', [alice.scAddress], issuer.accountIdB64)).toBe(true);
   });
 
   it('leaves the trustline UNAUTHORIZED when the issuer has AUTH_REQUIRED', () => {
     const { L, issuer, alice, token } = world({ issuerFlags: AUTH_REQUIRED });
     expect(call(L, token.address, 'trust', [alice.scAddress], alice.accountIdB64).ok).toBe(true);
-    expect(loadTrustLine(L, alice, token.asset).flags()).toBe(0);
+    expect(loadTrustLine(L, alice, token.asset).flags).toBe(0);
     expectContractError(
       call(L, token.address, 'mint', [alice.scAddress, i128(10n)], issuer.accountIdB64),
       E.BalanceDeauthorized, 'balance is deauthorized',
@@ -541,7 +543,7 @@ describe('SAC: trust() creates a real TrustLineEntry', () => {
     // Source is the issuer, so alice authorizes nothing — and it still succeeds.
     const again = call(L, token.address, 'trust', [alice.scAddress], issuer.accountIdB64);
     expect(again.ok, again.error).toBe(true);
-    expect(loadAccount(L, alice.accountId)!.numSubEntries()).toBe(1);
+    expect(loadAccount(L, alice.accountId)!.numSubEntries).toBe(1);
   });
 });
 
@@ -557,9 +559,11 @@ describe('SAC: authorization — who signed what', () => {
     expect(sim.ok, sim.error).toBe(true);
     // Recording auth never verifies anything; the gap only shows on submit.
     expect(sim.authXdr.length).toBe(1);
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(sim.authXdr[0], 'base64');
-    expect(entry.credentials().switch().name).toBe('sorobanCredentialsAddress');
-    expect(Address.fromScAddress(entry.credentials().address().address()).toString())
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(sim.authXdr[0], 'base64');
+    expect(entry.credentials.type).toBe('sorobanCredentialsAddress');
+    expect(Address.fromScAddress(
+      xdr.expectUnionVariant(entry.credentials, 'sorobanCredentialsAddress').address.address,
+    ).toString())
       .toBe(alice.publicKey);
     return { L, issuer, alice, bob, token, hostFn, sim, entry };
   }
@@ -585,26 +589,33 @@ describe('SAC: authorization — who signed what', () => {
     // Build a well-formed AccountEd25519Signature over the correct payload,
     // but with BOB's keypair while the credential address is ALICE.
     const validUntil = L.ledgerSeq + 100;
-    const cred = entry.credentials().address();
-    cred.signatureExpirationLedger(validUntil);
+    const cred = xdr.expectUnionVariant(entry.credentials, 'sorobanCredentialsAddress').address;
     const preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
       new xdr.HashIdPreimageSorobanAuthorization({
         networkId: sha256(L.networkPassphrase),
-        nonce: cred.nonce(),
-        invocation: entry.rootInvocation(),
+        nonce: cred.nonce,
+        invocation: entry.rootInvocation,
         signatureExpirationLedger: validUntil,
       }),
     );
-    const payload = sha256(preimage.toXDR());
-    cred.signature(xdr.ScVal.scvVec([
-      xdr.ScVal.scvMap([
-        new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('public_key'), val: xdr.ScVal.scvBytes(bob.keypair.rawPublicKey()) }),
-        new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(bob.keypair.sign(payload)) }),
-      ]),
-    ]));
+    const payload = sha256(preimage.toXdr());
+    // xdr structs are read-only: rebuild the entry with the expiration and signature set.
+    const signedEntry = new xdr.SorobanAuthorizationEntry({
+      ...entry,
+      credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(new xdr.SorobanAddressCredentials({
+        ...cred,
+        signatureExpirationLedger: validUntil,
+        signature: xdr.ScVal.scvVec([
+          xdr.ScVal.scvMap([
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('public_key'), val: xdr.ScVal.scvBytes(bob.keypair.rawPublicKey()) }),
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(bob.keypair.sign(payload)) }),
+          ]),
+        ]),
+      })),
+    });
 
     const sent = L.send(hostFn, bob.accountIdB64, sim.resourcesXdr,
-      [entry.toXDR('base64')], sim.restoredRwEntryIndices);
+      [signedEntry.toXdr('base64')], sim.restoredRwEntryIndices);
     expect(sent.ok).toBe(false);
     expect(sent.error).toMatch(/Error\(Auth, InvalidAction\)/);
     // account_contract.rs::check_account_authentication
@@ -618,7 +629,7 @@ describe('SAC: authorization — who signed what', () => {
     const { L, alice, bob, token, hostFn, sim, entry } = crossAccountTransfer();
     const signed = await authorizeEntry(entry, alice.keypair, L.ledgerSeq + 100, L.networkPassphrase);
     const sent = L.send(hostFn, bob.accountIdB64, sim.resourcesXdr,
-      [signed.toXDR('base64')], sim.restoredRwEntryIndices);
+      [signed.toXdr('base64')], sim.restoredRwEntryIndices);
     expect(sent.ok, sent.error).toBe(true);
     expect(token.balanceOf(alice)).toBe(990n);
     expect(token.balanceOf(bob)).toBe(10n);
@@ -629,7 +640,7 @@ describe('SAC: authorization — who signed what', () => {
     // Signed by the right key, over the right payload, but already expired.
     const signed = await authorizeEntry(entry, alice.keypair, L.ledgerSeq - 1, L.networkPassphrase);
     const sent = L.send(hostFn, bob.accountIdB64, sim.resourcesXdr,
-      [signed.toXDR('base64')], sim.restoredRwEntryIndices);
+      [signed.toXdr('base64')], sim.restoredRwEntryIndices);
     expect(sent.ok).toBe(false);
     expect(sent.error).toMatch(/Error\(Auth, /);
   });
@@ -684,16 +695,16 @@ describe('SAC: trustline limits, liabilities and the AUTHORIZED flag', () => {
       data: xdr.LedgerEntryData.trustline(new xdr.TrustLineEntry({
         accountId: alice.accountId,
         asset: trustLineAsset(token.asset),
-        balance: new xdr.Int64(100n),
-        limit: new xdr.Int64(1_000n),
+        balance: 100n,
+        limit: 1_000n,
         flags: TL_AUTHORIZED,
-        ext: new xdr.TrustLineEntryExt(1, new xdr.TrustLineEntryV1({
-          liabilities: new xdr.Liabilities({ buying: new xdr.Int64(200n), selling: new xdr.Int64(50n) }),
-          ext: new xdr.TrustLineEntryV1Ext(0),
+        ext: xdr.TrustLineEntryExt.v1(new xdr.TrustLineEntryV1({
+          liabilities: new xdr.Liabilities({ buying: 200n, selling: 50n }),
+          ext: xdr.TrustLineEntryV1Ext.v0(),
         })),
       })),
-      ext: new xdr.LedgerEntryExt(0),
-    }).toXDR('base64'));
+      ext: xdr.LedgerEntryExt.v0(),
+    }).toXdr('base64'));
 
     // max = 1000 - 200 = 800
     expect(call(L, token.address, 'mint', [alice.scAddress, i128(700n)], issuer.accountIdB64).ok).toBe(true);
@@ -719,12 +730,12 @@ describe('SAC: trustline limits, liabilities and the AUTHORIZED flag', () => {
 
     const ae = loadAccount(L, alice.accountId)!;
     storeAccount(L, new xdr.AccountEntry({
-      accountId: ae.accountId(), balance: ae.balance(), seqNum: ae.seqNum(),
-      numSubEntries: ae.numSubEntries(), inflationDest: ae.inflationDest(), flags: ae.flags(),
-      homeDomain: ae.homeDomain(), thresholds: ae.thresholds(), signers: ae.signers(),
-      ext: new xdr.AccountEntryExt(1, new xdr.AccountEntryExtensionV1({
-        liabilities: new xdr.Liabilities({ buying: new xdr.Int64(0n), selling: new xdr.Int64(30n * XLM) }),
-        ext: new xdr.AccountEntryExtensionV1Ext(0),
+      accountId: ae.accountId, balance: ae.balance, seqNum: ae.seqNum,
+      numSubEntries: ae.numSubEntries, inflationDest: ae.inflationDest, flags: ae.flags,
+      homeDomain: ae.homeDomain, thresholds: ae.thresholds, signers: ae.signers,
+      ext: xdr.AccountEntryExt.v1(new xdr.AccountEntryExtensionV1({
+        liabilities: new xdr.Liabilities({ buying: 0n, selling: 30n * XLM }),
+        ext: xdr.AccountEntryExtensionV1Ext.v0(),
       })),
     }));
 
@@ -844,30 +855,30 @@ describe('SAC native XLM: transferring to a G-account that does not exist', () =
     const alice = preFundedWallet(L, { xlm: 1_000n * XLM });
     const native = nativeToken(L, alice);
     const g = ghost();
-    expect(L.getEntry(accountKey(g.id).toXDR('base64'))).toBeUndefined();
+    expect(L.getEntry(accountKey(g.id).toXdr('base64'))).toBeUndefined();
 
     const amount = 20n * XLM;
     const r = call(L, native.address, 'transfer', [alice.scAddress, g.val, i128(amount)], alice.accountIdB64);
     expect(r.ok, r.error).toBe(true);
 
-    const raw = L.getEntry(accountKey(g.id).toXDR('base64'));
+    const raw = L.getEntry(accountKey(g.id).toXdr('base64'));
     expect(raw, 'the SAC must have created the AccountEntry').toBeDefined();
-    const le = xdr.LedgerEntry.fromXDR(raw!, 'base64');
-    const ae = le.data().account();
+    const le = xdr.LedgerEntry.fromXdr(raw!, 'base64');
+    const ae = xdr.expectUnionVariant(le.data, 'account').account;
 
-    expect(BigInt(ae.balance().toString())).toBe(amount);
+    expect(BigInt(ae.balance.toString())).toBe(amount);
     // (ledger_seq as i64) << 32, hard-coded for ledger 1_000_000.
-    expect(BigInt(ae.seqNum().toString())).toBe(4_294_967_296_000_000n);
-    expect(BigInt(ae.seqNum().toString())).toBe(BigInt(L.ledgerSeq) << 32n);
-    expect(ae.numSubEntries()).toBe(0);
-    expect(ae.inflationDest() ?? null).toBeNull(); // js-xdr decodes `void*` as undefined
-    expect(ae.flags()).toBe(0);
-    expect(ae.homeDomain().toString()).toBe('');
-    expect([...ae.thresholds()]).toEqual([1, 0, 0, 0]); // master weight 1, thresholds 0
-    expect(ae.signers()).toEqual([]);
-    expect(ae.ext().switch()).toBe(0);
+    expect(BigInt(ae.seqNum.toString())).toBe(4_294_967_296_000_000n);
+    expect(BigInt(ae.seqNum.toString())).toBe(BigInt(L.ledgerSeq) << 32n);
+    expect(ae.numSubEntries).toBe(0);
+    expect(ae.inflationDest ?? null).toBeNull(); // an absent `void*` decodes as null (v16's js-xdr gave undefined)
+    expect(ae.flags).toBe(0);
+    expect(ae.homeDomain.toString()).toBe('');
+    expect([...ae.thresholds.toBytes()]).toEqual([1, 0, 0, 0]); // master weight 1, thresholds 0
+    expect(ae.signers).toEqual([]);
+    expect(ae.ext.type).toBe('v0');
     // balance.rs writes `last_modified_ledger_seq: 0`; core stamps it on commit.
-    expect(le.lastModifiedLedgerSeq()).toBe(0);
+    expect(le.lastModifiedLedgerSeq).toBe(0);
 
     // The created account is a first-class holder from here on.
     expect(read(L, native.address, 'balance', [g.val], alice.accountIdB64)).toBe(amount);
@@ -888,9 +899,11 @@ describe('SAC native XLM: transferring to a G-account that does not exist', () =
       const g = ghost();
       const r = call(L, native.address, 'transfer', [alice.scAddress, g.val, i128(20n * XLM)], alice.accountIdB64);
       expect(r.ok, `ledgerSeq ${seq}: ${r.error}`).toBe(true);
-      const ae = xdr.LedgerEntry.fromXDR(L.getEntry(accountKey(g.id).toXDR('base64'))!, 'base64').data().account();
-      expect(BigInt(ae.seqNum().toString()), `ledgerSeq ${seq}`).toBe(expected);
-      expect(BigInt(ae.seqNum().toString())).toBe(BigInt(seq) << 32n);
+      const ae = xdr.expectUnionVariant(
+        xdr.LedgerEntry.fromXdr(L.getEntry(accountKey(g.id).toXdr('base64'))!, 'base64').data, 'account',
+      ).account;
+      expect(BigInt(ae.seqNum.toString()), `ledgerSeq ${seq}`).toBe(expected);
+      expect(BigInt(ae.seqNum.toString())).toBe(BigInt(seq) << 32n);
     }
   });
 
@@ -917,13 +930,14 @@ describe('SAC native XLM: transferring to a G-account that does not exist', () =
       call(L, native.address, 'transfer', [alice.scAddress, g1.val, i128(minNew - 1n)], alice.accountIdB64),
       E.InsufficientAccountReserve, 'transfer amount is below minimum balance for new account',
     );
-    expect(L.getEntry(accountKey(g1.id).toXDR('base64'))).toBeUndefined();
+    expect(L.getEntry(accountKey(g1.id).toXdr('base64'))).toBeUndefined();
 
     const g2 = ghost();
     expect(call(L, native.address, 'transfer',
       [alice.scAddress, g2.val, i128(minNew)], alice.accountIdB64).ok).toBe(true);
-    expect(BigInt(xdr.LedgerEntry.fromXDR(L.getEntry(accountKey(g2.id).toXDR('base64'))!, 'base64')
-      .data().account().balance().toString())).toBe(minNew);
+    expect(BigInt(xdr.expectUnionVariant(
+      xdr.LedgerEntry.fromXdr(L.getEntry(accountKey(g2.id).toXdr('base64'))!, 'base64').data, 'account',
+    ).account.balance.toString())).toBe(minNew);
 
     // amount <= 0 takes the AccountMissingError branch instead.
     const g3 = ghost();
@@ -951,13 +965,13 @@ describe('SAC native XLM: transferring to a G-account that does not exist', () =
     const r = call(L, native.address, 'transfer', [alice.scAddress, muxed, i128(20n * XLM)], alice.accountIdB64);
     expect(r.ok, r.error).toBe(true);
 
-    const raw = L.getEntry(accountKey(g.id).toXDR('base64'));
+    const raw = L.getEntry(accountKey(g.id).toXdr('base64'));
     expect(raw).toBeDefined();
-    const ae = xdr.LedgerEntry.fromXDR(raw!, 'base64').data().account();
-    expect(BigInt(ae.seqNum().toString())).toBe(BigInt(L.ledgerSeq) << 32n);
+    const ae = xdr.expectUnionVariant(xdr.LedgerEntry.fromXdr(raw!, 'base64').data, 'account').account;
+    expect(BigInt(ae.seqNum.toString())).toBe(BigInt(L.ledgerSeq) << 32n);
     // event.rs: the mux id rides in the event data, not in the ledger entry.
-    const ev = xdr.ContractEvent.fromXDR(r.sent!.eventsXdr[0], 'base64');
-    expect(scValToNative(ev.body().v0().data())).toEqual({ amount: 20n * XLM, to_muxed_id: 42n });
+    const ev = xdr.ContractEvent.fromXdr(r.sent!.eventsXdr[0], 'base64');
+    expect(scValToNative(xdr.expectUnionVariant(ev.body, 'v0').v0.data)).toEqual({ amount: 20n * XLM, to_muxed_id: 42n });
   });
 });
 
@@ -975,17 +989,17 @@ describe('SAC: contract (C...) addresses hold balances in ContractData', () => {
     expect(r.ok, r.error).toBe(true);
     expect(r.sent!.changedKeys.length).toBe(1);
 
-    const key = xdr.LedgerKey.fromXDR(r.sent!.changedKeys[0], 'base64');
-    expect(key.switch().name).toBe('contractData');
-    expect(key.contractData().durability().name).toBe('persistent');
+    const key = xdr.LedgerKey.fromXdr(r.sent!.changedKeys[0], 'base64');
+    expect(key.type).toBe('contractData');
+    expect(xdr.expectUnionVariant(key, 'contractData').contractData.durability.name).toBe('persistent');
     // The entry lives under the TOKEN contract, keyed by DataKey::Balance(addr).
-    expect(Address.fromScAddress(key.contractData().contract()).toString())
+    expect(Address.fromScAddress(xdr.expectUnionVariant(key, 'contractData').contractData.contract).toString())
       .toBe(Address.fromScAddress(token.address).toString());
-    expect(scValToNative(key.contractData().key())).toEqual(['Balance', contractId]);
+    expect(scValToNative(xdr.expectUnionVariant(key, 'contractData').contractData.key)).toEqual(['Balance', contractId]);
 
     // storage_types.rs: BalanceValue { amount, authorized, clawback }
-    const entry = xdr.LedgerEntry.fromXDR(L.getEntry(r.sent!.changedKeys[0])!, 'base64');
-    expect(scValToNative(entry.data().contractData().val()))
+    const entry = xdr.LedgerEntry.fromXdr(L.getEntry(r.sent!.changedKeys[0])!, 'base64');
+    expect(scValToNative(xdr.expectUnionVariant(entry.data, 'contractData').contractData.val))
       .toEqual({ amount: 777n, authorized: true, clawback: false });
 
     // extend_ttl sets live_until = ledger_seq + BALANCE_EXTEND_AMOUNT.
@@ -1041,7 +1055,7 @@ describe('SAC: contract (C...) addresses hold balances in ContractData', () => {
     expect(r.ok, r.error).toBe(true);
     expect(read(L, native.address, 'balance', [c], alice.accountIdB64)).toBe(5n * XLM);
 
-    const kinds = r.sent!.changedKeys.map((k) => xdr.LedgerKey.fromXDR(k, 'base64').switch().name);
+    const kinds = r.sent!.changedKeys.map((k) => xdr.LedgerKey.fromXdr(k, 'base64').type);
     expect(kinds).toContain('contractData');
     expect(kinds).toContain('account'); // alice's AccountEntry was debited
   });
@@ -1057,7 +1071,7 @@ describe('harness: the ledger entry types the SAC touches', () => {
     const seen = new Set<string>();
     const collect = (sim: SimulateResult) => {
       for (const k of [...sim.readOnlyKeys, ...sim.readWriteKeys]) {
-        seen.add(xdr.LedgerKey.fromXDR(k, 'base64').switch().name);
+        seen.add(xdr.LedgerKey.fromXdr(k, 'base64').type);
       }
     };
     token.trust(alice);
@@ -1081,7 +1095,7 @@ describe('harness: the ledger entry types the SAC touches', () => {
     const alice = preFundedWallet(L);
     const token = deployToken(L, { issuer });
     // Account
-    expect(L.getEntry(accountKey(alice.accountId).toXDR('base64'))).toBeDefined();
+    expect(L.getEntry(accountKey(alice.accountId).toXdr('base64'))).toBeDefined();
     // Trustline
     establishTrustline(L, alice, token.asset);
     expect(L.getEntry(trustLineKey(alice, token.asset))).toBeDefined();
@@ -1089,12 +1103,12 @@ describe('harness: the ledger entry types the SAC touches', () => {
     const wasmHash = L.seedWasm(ADD_I32);
     expect(L.getEntry(xdr.LedgerKey.contractCode(new xdr.LedgerKeyContractCode({
       hash: Buffer.from(wasmHash, 'base64'),
-    })).toXDR('base64'))).toBeDefined();
+    })).toXdr('base64'))).toBeDefined();
     const instanceKey = xdr.LedgerKey.contractData(new xdr.LedgerKeyContractData({
       contract: token.address,
       key: xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: xdr.ContractDataDurability.persistent(),
-    })).toXDR('base64');
+      durability: xdr.ContractDataDurability.persistent,
+    })).toXdr('base64');
     expect(L.getEntry(instanceKey)).toBeDefined();
   });
 
@@ -1102,16 +1116,16 @@ describe('harness: the ledger entry types the SAC touches', () => {
     const L = new Ledger();
     const w = preFundedWallet(L);
     const mk = (data: xdr.LedgerEntryData) => new xdr.LedgerEntry({
-      lastModifiedLedgerSeq: 1, data, ext: new xdr.LedgerEntryExt(0),
-    }).toXDR('base64');
+      lastModifiedLedgerSeq: 1, data, ext: xdr.LedgerEntryExt.v0(),
+    }).toXdr('base64');
     const unsupported: [string, xdr.LedgerEntryData][] = [
       ['data', xdr.LedgerEntryData.data(new xdr.DataEntry({
-        accountId: w.accountId, dataName: 'x', dataValue: Buffer.from([1]), ext: new xdr.DataEntryExt(0),
+        accountId: w.accountId, dataName: 'x', dataValue: Buffer.from([1]), ext: xdr.DataEntryExt.v0(),
       }))],
       ['claimableBalance', xdr.LedgerEntryData.claimableBalance(new xdr.ClaimableBalanceEntry({
         balanceId: xdr.ClaimableBalanceId.claimableBalanceIdTypeV0(Buffer.alloc(32)),
-        claimants: [], asset: xdr.Asset.assetTypeNative(), amount: new xdr.Int64(1n),
-        ext: new xdr.ClaimableBalanceEntryExt(0),
+        claimants: [], asset: xdr.Asset.assetTypeNative(), amount: 1n,
+        ext: xdr.ClaimableBalanceEntryExt.v0(),
       }))],
       ['ttl', xdr.LedgerEntryData.ttl(new xdr.TtlEntry({
         keyHash: Buffer.alloc(32), liveUntilLedgerSeq: 1,
@@ -1215,9 +1229,9 @@ describe('HARNESS GAP: lastModifiedLedgerSeq is never stamped on merge', () => {
     expect(r.ok, r.error).toBe(true);
 
     for (const key of [accountKey(alice.accountId), accountKey(bob.accountId)]) {
-      const le = xdr.LedgerEntry.fromXDR(L.getEntry(key.toXDR('base64'))!, 'base64');
+      const le = xdr.LedgerEntry.fromXdr(L.getEntry(key.toXdr('base64'))!, 'base64');
       expect(
-        le.lastModifiedLedgerSeq(),
+        le.lastModifiedLedgerSeq,
         'HARNESS GAP: merged LedgerEntryChanges keep the host\'s placeholder 0 for ' +
         'lastModifiedLedgerSeq; stellar-core stamps the current ledgerSeq on commit.',
       ).toBe(L.ledgerSeq);
@@ -1243,7 +1257,7 @@ describe('HARNESS GAP: establishTrustline() does not charge the sub-entry reserv
 
     establishTrustline(L, holder, token.asset);
     expect(
-      loadAccount(L, holder.accountId)!.numSubEntries(),
+      loadAccount(L, holder.accountId)!.numSubEntries,
       'HARNESS GAP: establishTrustline() leaves numSubEntries at 0, a ledger ' +
       'state no ChangeTrust operation can produce.',
     ).toBe(1);

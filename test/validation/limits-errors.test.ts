@@ -175,22 +175,20 @@ const fmt = (e: HostErr) => `Error(${e.type}, ${e.code})`;
 // resource helpers
 // ---------------------------------------------------------------------------
 
-const decodeResources = (b64: string) => xdr.SorobanResources.fromXDR(b64, 'base64');
+const decodeResources = (b64: string) => xdr.SorobanResources.fromXdr(b64, 'base64');
 
 function withResources(
   b64: string,
-  mutate: (r: xdr.SorobanResources) => void,
+  rebuild: (r: xdr.SorobanResources) => xdr.SorobanResources,
 ): string {
-  const r = decodeResources(b64);
-  mutate(r);
-  return r.toXDR('base64');
+  return rebuild(decodeResources(b64)).toXdr('base64');
 }
 
 function sorobanData(resources: xdr.SorobanResources, resourceFee: bigint) {
   return new xdr.SorobanTransactionData({
-    ext: new xdr.SorobanTransactionDataExt(0),
+    ext: xdr.SorobanTransactionDataExt.v0(),
     resources,
-    resourceFee: new xdr.Int64(resourceFee),
+    resourceFee,
   });
 }
 
@@ -203,7 +201,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
     L = new Ledger();
     kp = Keypair.random();
     L.fund(kp.publicKey());
-    source = accountIdFromPublicKey(kp.publicKey()).toXDR('base64');
+    source = accountIdFromPublicKey(kp.publicKey()).toXdr('base64');
   });
 
   /** Upload + deploy, returning the contract address. */
@@ -214,7 +212,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       source,
     );
     expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-    return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   }
 
   // =========================================================================
@@ -292,7 +290,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.ok, sim.error).toBe(true);
       expect(sim.instructions).toBeGreaterThan(1_000_000);
 
-      const starved = withResources(sim.resourcesXdr, (r) => r.instructions(1_000));
+      const starved = withResources(sim.resourcesXdr, (r) => new xdr.SorobanResources({ ...r, instructions: 1_000 }));
       const sent = L.send(hostFn, source, starved, sim.authXdr, []);
 
       const err = returnedError(sent, 'upload declaring 1000 instructions');
@@ -310,7 +308,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.ok, sim.error).toBe(true);
       expect(sim.writeBytes).toBeGreaterThan(0);
 
-      const starved = withResources(sim.resourcesXdr, (r) => r.writeBytes(0));
+      const starved = withResources(sim.resourcesXdr, (r) => new xdr.SorobanResources({ ...r, writeBytes: 0 }));
       const sent = L.send(hostFn, source, starved, sim.authXdr, []);
       expect(sent.ok, 'declaring writeBytes=0 while writing an entry must fail').toBe(false);
     });
@@ -324,7 +322,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       const sim = L.simulate(hostFn, source);
       expect(sim.ok, sim.error).toBe(true);
 
-      const starved = withResources(sim.resourcesXdr, (r) => r.diskReadBytes(0));
+      const starved = withResources(sim.resourcesXdr, (r) => new xdr.SorobanResources({ ...r, diskReadBytes: 0 }));
       const sent = L.send(hostFn, source, starved, sim.authXdr, []);
       expect(sent.ok, 'declaring diskReadBytes=0 while reading entries must fail').toBe(false);
     });
@@ -422,8 +420,8 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(cheap.ok, cheap.error).toBe(true);
 
       const before = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
-      const balanceBefore = BigInt(before.balance().toString());
-      const seqBefore = BigInt(before.seqNum().toString());
+      const balanceBefore = BigInt(before.balance.toString());
+      const seqBefore = BigInt(before.seqNum.toString());
 
       const account = { accountId: () => kp.publicKey(), sequenceNumber: () => seqBefore.toString(), incrementSequenceNumber: () => {} } as any;
       const resources = decodeResources(cheap.resourcesXdr);
@@ -443,7 +441,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
         .build();
       tx.sign(kp);
 
-      const out = L.sendTransaction(tx.toEnvelope().toXDR('base64'));
+      const out = L.sendTransaction(tx.toEnvelope().toXdr('base64'));
 
       // stellar-core: INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED -> the operation
       // fails, the transaction is txFAILED, the fee is charged, the seqnum burned.
@@ -454,8 +452,8 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       );
 
       const after = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
-      expect(BigInt(after.seqNum().toString())).toBe(seqBefore + 1n);
-      expect(BigInt(after.balance().toString())).toBeLessThan(balanceBefore);
+      expect(BigInt(after.seqNum.toString())).toBe(seqBefore + 1n);
+      expect(BigInt(after.balance.toString())).toBeLessThan(balanceBefore);
     });
 
     it('GAP: no SorobanResources validation — an absurd instruction count is accepted', () => {
@@ -469,8 +467,10 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       const sim = L.simulate(hostFn, source);
       expect(sim.ok, sim.error).toBe(true);
 
-      const resources = decodeResources(sim.resourcesXdr);
-      resources.instructions(0xffff_ffff);
+      const resources = new xdr.SorobanResources({
+        ...decodeResources(sim.resourcesXdr),
+        instructions: 0xffff_ffff,
+      });
 
       const account = { accountId: () => kp.publicKey(), sequenceNumber: () => '0', incrementSequenceNumber: () => {} } as any;
       const resourceFee = 2_000_000n;
@@ -478,13 +478,13 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
         fee: String(resourceFee + 100n),
         networkPassphrase: Networks.TESTNET,
       })
-        .addOperation(Operation.invokeHostFunction({ func: hostFn, auth: sim.authXdr.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, 'base64')) }))
+        .addOperation(Operation.invokeHostFunction({ func: hostFn, auth: sim.authXdr.map((a) => xdr.SorobanAuthorizationEntry.fromXdr(a, 'base64')) }))
         .setSorobanData(sorobanData(resources, resourceFee))
         .setTimeout(300)
         .build();
       tx.sign(kp);
 
-      const out = L.sendTransaction(tx.toEnvelope().toXDR('base64'));
+      const out = L.sendTransaction(tx.toEnvelope().toXdr('base64'));
       expect(out.code).toBe('txSOROBAN_INVALID');
     });
   });
@@ -501,13 +501,14 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.readWriteKeys.length).toBeGreaterThan(0);
 
       const demoted = withResources(sim.resourcesXdr, (r) => {
-        const fp = r.footprint();
-        r.footprint(
-          new xdr.LedgerFootprint({
-            readOnly: [...fp.readOnly(), ...fp.readWrite()],
+        const fp = r.footprint;
+        return new xdr.SorobanResources({
+          ...r,
+          footprint: new xdr.LedgerFootprint({
+            readOnly: [...fp.readOnly, ...fp.readWrite],
             readWrite: [],
           }),
-        );
+        });
       });
 
       const sent = L.send(hostFn, source, demoted, sim.authXdr, []);
@@ -523,7 +524,10 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.ok, sim.error).toBe(true);
 
       const empty = withResources(sim.resourcesXdr, (r) =>
-        r.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] })),
+        new xdr.SorobanResources({
+          ...r,
+          footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+        }),
       );
       const sent = L.send(hostFn, source, empty, sim.authXdr, []);
       const err = returnedError(sent, 'upload with an empty footprint');
@@ -537,8 +541,11 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.ok, sim.error).toBe(true);
 
       const flipped = withResources(sim.resourcesXdr, (r) => {
-        const rw = r.footprint().readWrite();
-        r.footprint(new xdr.LedgerFootprint({ readOnly: rw, readWrite: [] }));
+        const rw = r.footprint.readWrite;
+        return new xdr.SorobanResources({
+          ...r,
+          footprint: new xdr.LedgerFootprint({ readOnly: rw, readWrite: [] }),
+        });
       });
       const sent = L.send(hostFn, source, flipped, sim.authXdr, []);
       const err = returnedError(sent, 'upload with RO instead of RW');
@@ -569,9 +576,12 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sim.ok, sim.error).toBe(true);
 
       const overlapped = withResources(sim.resourcesXdr, (r) => {
-        const fp = r.footprint();
-        const rw = fp.readWrite();
-        r.footprint(new xdr.LedgerFootprint({ readOnly: [...fp.readOnly(), ...rw], readWrite: rw }));
+        const fp = r.footprint;
+        const rw = fp.readWrite;
+        return new xdr.SorobanResources({
+          ...r,
+          footprint: new xdr.LedgerFootprint({ readOnly: [...fp.readOnly, ...rw], readWrite: rw }),
+        });
       });
       const sent = L.send(hostFn, source, overlapped, sim.authXdr, []);
       const err = returnedError(sent, 'RO/RW overlap');
@@ -589,12 +599,13 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       const sim = L.simulate(hostFn, source);
       expect(sim.ok, sim.error).toBe(true);
 
-      const resources = decodeResources(sim.resourcesXdr);
-      const fp = resources.footprint();
-      const rw = fp.readWrite();
-      resources.footprint(
-        new xdr.LedgerFootprint({ readOnly: [...fp.readOnly(), ...rw], readWrite: rw }),
-      );
+      const decoded = decodeResources(sim.resourcesXdr);
+      const fp = decoded.footprint;
+      const rw = fp.readWrite;
+      const resources = new xdr.SorobanResources({
+        ...decoded,
+        footprint: new xdr.LedgerFootprint({ readOnly: [...fp.readOnly, ...rw], readWrite: rw }),
+      });
 
       const account = { accountId: () => kp.publicKey(), sequenceNumber: () => '0', incrementSequenceNumber: () => {} } as any;
       const resourceFee = 2_000_000n;
@@ -608,7 +619,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
         .build();
       tx.sign(kp);
 
-      const out = L.sendTransaction(tx.toEnvelope().toXDR('base64'));
+      const out = L.sendTransaction(tx.toEnvelope().toXdr('base64'));
       expect(out.code).toBe('txSOROBAN_INVALID');
     });
   });
@@ -650,7 +661,10 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
         const hostFn = uploadWasmHostFn(LINEAR_MEMORY);
         const sim = L.simulate(hostFn, source);
         const flipped = withResources(sim.resourcesXdr, (r) =>
-          r.footprint(new xdr.LedgerFootprint({ readOnly: r.footprint().readWrite(), readWrite: [] })),
+          new xdr.SorobanResources({
+            ...r,
+            footprint: new xdr.LedgerFootprint({ readOnly: r.footprint.readWrite, readWrite: [] }),
+          }),
         );
         record('footprint violation', returnedError(L.send(hostFn, source, flipped, [], []), 'footprint'));
       }
@@ -907,7 +921,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       // Valid base64, wrong XDR type entirely.
       const wrongType = xdr.LedgerKey.account(
         new xdr.LedgerKeyAccount({ accountId: accountIdFromPublicKey(kp.publicKey()) }),
-      ).toXDR('base64');
+      ).toXdr('base64');
       expect(() => L.send(hostFn, source, wrongType, [], [])).toThrow(/xdr:/);
 
       // None of these carry a host error code.

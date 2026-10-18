@@ -137,7 +137,7 @@ describe('rpc facade: simulateTransaction and supplied auth entries', () => {
    * and at :751 returns those entries unchanged instead of re-recording.
    *
    * src/fake-rpc.ts `case 'simulateTransaction'` reads
-   * `op.body().invokeHostFunctionOp().hostFunction()` and never reads `.auth()`,
+   * `op.body.invokeHostFunctionOp.hostFunction` and never reads `.auth`,
    * so it always calls `ledger.simulate(...)` — recording mode. The harness owns
    * a correct `ledger.simulateWithAuth()` (GUIDE.md documents it under "Dropping
    * to the low level"); the RPC adapter simply never calls it.
@@ -265,13 +265,13 @@ describe('rpc facade: the four-step custom-account round trip', () => {
 
     // step 2 — sign with the passkey
     const signed = signAuthEntriesSync(
-      recorded.map((e) => e.toXDR('base64')),
+      recorded.map((e) => e.toXdr('base64')),
       {
         sign: smartAccountSecp256r1(w.passkey) as (p: Buffer) => xdr.ScVal,
         networkPassphrase: w.svm.networkPassphrase,
         validUntilLedgerSeq: w.svm.ledgerSequence + 100,
       },
-    ).map((b) => xdr.SorobanAuthorizationEntry.fromXDR(b, 'base64'));
+    ).map((b) => xdr.SorobanAuthorizationEntry.fromXdr(b, 'base64'));
 
     // step 3 — re-simulate WITH the signed entries
     const tx3 = await build(signed);
@@ -280,7 +280,7 @@ describe('rpc facade: the four-step custom-account round trip', () => {
 
     const back = (sim3 as rpc.Api.SimulateTransactionSuccessResponse).result!.auth;
     expect(
-      back[0].credentials().address().signature().switch().name,
+      xdr.expectUnionVariant(back[0].credentials, 'sorobanCredentialsAddress').address.signature.type,
       'step 3 must return the SIGNED entries back (the live node does); this ' +
         'harness returns them with the signature stripped to scvVoid, proving ' +
         'it re-recorded instead of enforcing',

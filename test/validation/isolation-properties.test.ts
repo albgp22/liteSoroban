@@ -154,18 +154,23 @@ function freshWorld(): World {
   const wasmHash = L.seedWasm(CONTRACT_DATA);
 
   const seen = new KeySet();
-  seen.add(accountKey(xdr.AccountId.fromXDR(source, 'base64')).toXDR('base64'));
+  seen.add(accountKey(xdr.AccountId.fromXdr(source, 'base64')).toXdr('base64'));
   seen.add(
     xdr.LedgerKey.contractCode(
       new xdr.LedgerKeyContractCode({ hash: Buffer.from(wasmHash, 'base64') }),
-    ).toXDR('base64'),
+    ).toXdr('base64'),
   );
 
   const { sent } = L.simulateAndSend(createContractHostFn(source, wasmHash), source);
   expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
   seen.observe(sent);
 
-  return { L, source, addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(), seen };
+  return {
+    L,
+    source,
+    addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
+    seen,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +266,7 @@ function runOps(w: World, rng: ReturnType<typeof makeRng>, m: Model, n: number):
 function readPersistent(w: World, key: string): bigint | undefined {
   const r = w.L.simulate(invokeHostFn(w.addr, 'get_persistent', [sym(key)]), w.source);
   if (!r.ok) return undefined;
-  return scValToNative(xdr.ScVal.fromXDR(r.returnValueXdr!, 'base64')) as bigint;
+  return scValToNative(xdr.ScVal.fromXdr(r.returnValueXdr!, 'base64')) as bigint;
 }
 
 /** Trustline LedgerKey for a <=4-character credit asset. */
@@ -278,7 +283,7 @@ function trustlineKey(holder: { accountId: xdr.AccountId }, asset: Asset): strin
         }),
       ),
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function contractDataKey(
@@ -288,7 +293,7 @@ function contractDataKey(
 ): string {
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({ contract: addr, key, durability }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 // ===========================================================================
@@ -380,7 +385,7 @@ describe('property: snapshot/restore is exact', () => {
     const rawKey = contractDataKey(
       w.addr,
       sym(leakKey),
-      xdr.ContractDataDurability.persistent(),
+      xdr.ContractDataDurability.persistent,
     );
     expect(w.L.getEntry(rawKey)).toBeDefined();
     expect(readPersistent(w, leakKey)).toBe(777n);
@@ -397,7 +402,7 @@ describe('property: snapshot/restore is exact', () => {
       w.source,
     );
     expect(has.ok, has.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(false);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(false);
   });
 
   it('restore() rolls back ledgerSeq and timestamp, not just the entry map', () => {
@@ -430,14 +435,14 @@ describe('property: snapshot/restore is exact', () => {
     // host still considers it expired, because the clock stayed in the future.
     const w = freshWorld();
     w.L.simulateAndSend(invokeHostFn(w.addr, 'put_temporary', [sym('t'), u64(42n)]), w.source);
-    const tKey = contractDataKey(w.addr, sym('t'), xdr.ContractDataDurability.temporary());
+    const tKey = contractDataKey(w.addr, sym('t'), xdr.ContractDataDurability.temporary);
 
     const snap = w.L.snapshot();
     const liveAtSnapshot = w.L.simulate(
       invokeHostFn(w.addr, 'has_temporary', [sym('t')]),
       w.source,
     );
-    expect(scValToNative(xdr.ScVal.fromXDR(liveAtSnapshot.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(liveAtSnapshot.returnValueXdr!, 'base64'))).toBe(true);
 
     w.L.advanceLedgers(1_000); // past MIN_TEMP_ENTRY_TTL
     w.L.restore(snap);
@@ -452,7 +457,7 @@ describe('property: snapshot/restore is exact', () => {
     );
     expect(afterRestore.ok, afterRestore.error).toBe(true);
     expect(
-      scValToNative(xdr.ScVal.fromXDR(afterRestore.returnValueXdr!, 'base64')),
+      scValToNative(xdr.ScVal.fromXdr(afterRestore.returnValueXdr!, 'base64')),
       'a live temporary entry read back as expired after restore',
     ).toBe(true);
   });
@@ -488,7 +493,7 @@ describe('property: snapshot/restore is exact', () => {
     expectSameState(before, w.seen.capture(w.L), 'after a batch of simulate() calls');
     expect(
       w.L.getEntry(
-        contractDataKey(w.addr, sym('phantom'), xdr.ContractDataDurability.persistent()),
+        contractDataKey(w.addr, sym('phantom'), xdr.ContractDataDurability.persistent),
       ),
       'a simulated write reached the store',
     ).toBeUndefined();
@@ -583,7 +588,7 @@ describe('property: two Ledger instances in one process share nothing', () => {
 
     // Same deterministic inputs => literally the same addresses in both.
     expect(b.source).toBe(a.source);
-    expect(b.addr.toXDR('base64')).toBe(a.addr.toXDR('base64'));
+    expect(b.addr.toXdr('base64')).toBe(a.addr.toXdr('base64'));
     expect(b.L.entryCount()).toBe(a.L.entryCount());
 
     a.L.simulateAndSend(invokeHostFn(a.addr, 'put_persistent', [sym('only_a'), u64(1n)]), a.source);
@@ -701,11 +706,10 @@ describe('property: recording-auth nonces', () => {
   }
 
   const nonceOf = (authB64: string) =>
-    xdr.SorobanAuthorizationEntry.fromXDR(authB64, 'base64')
-      .credentials()
-      .address()
-      .nonce()
-      .toString();
+    xdr.expectUnionVariant(
+      xdr.SorobanAuthorizationEntry.fromXdr(authB64, 'base64').credentials,
+      'sorobanCredentialsAddress',
+    ).address.nonce.toString();
 
   it('two consecutive simulate() calls produce DIFFERENT nonces', () => {
     const { L, fn, source } = transferNeedingAuth();
@@ -718,9 +722,7 @@ describe('property: recording-auth nonces', () => {
     expect(second.authXdr).toHaveLength(1);
 
     expect(
-      xdr.SorobanAuthorizationEntry.fromXDR(first.authXdr[0], 'base64')
-        .credentials()
-        .switch().name,
+      xdr.SorobanAuthorizationEntry.fromXdr(first.authXdr[0], 'base64').credentials.type,
     ).toBe('sorobanCredentialsAddress');
 
     // A fixed base seed made the second simulation reuse the first nonce and
@@ -807,8 +809,8 @@ describe('property: ledgerSeq and timestamp drive TTL and timebounds', () => {
     w.L.simulateAndSend(invokeHostFn(w.addr, 'put_persistent', [sym('p'), u64(1n)]), w.source);
     w.L.simulateAndSend(invokeHostFn(w.addr, 'put_temporary', [sym('t'), u64(1n)]), w.source);
 
-    const pKey = contractDataKey(w.addr, sym('p'), xdr.ContractDataDurability.persistent());
-    const tKey = contractDataKey(w.addr, sym('t'), xdr.ContractDataDurability.temporary());
+    const pKey = contractDataKey(w.addr, sym('p'), xdr.ContractDataDurability.persistent);
+    const tKey = contractDataKey(w.addr, sym('t'), xdr.ContractDataDurability.temporary);
 
     expect(w.L.getEntryTtl(pKey)).toBe(START_SEQ + MIN_PERSISTENT_ENTRY_TTL - 1);
     expect(w.L.getEntryTtl(tKey)).toBe(START_SEQ + MIN_TEMP_ENTRY_TTL - 1);
@@ -816,7 +818,7 @@ describe('property: ledgerSeq and timestamp drive TTL and timebounds', () => {
     // Move the clock; a new entry must be dated from the NEW sequence number.
     w.L.advanceLedgers(1_234);
     w.L.simulateAndSend(invokeHostFn(w.addr, 'put_persistent', [sym('p2'), u64(2n)]), w.source);
-    const p2Key = contractDataKey(w.addr, sym('p2'), xdr.ContractDataDurability.persistent());
+    const p2Key = contractDataKey(w.addr, sym('p2'), xdr.ContractDataDurability.persistent);
     expect(w.L.getEntryTtl(p2Key)).toBe(START_SEQ + 1_234 + MIN_PERSISTENT_ENTRY_TTL - 1);
     // ...while the old entry keeps the TTL it was born with.
     expect(w.L.getEntryTtl(pKey)).toBe(START_SEQ + MIN_PERSISTENT_ENTRY_TTL - 1);
@@ -830,21 +832,21 @@ describe('property: ledgerSeq and timestamp drive TTL and timebounds', () => {
 
     const live = w.L.simulate(invokeHostFn(w.addr, 'get_temporary', [sym('t')]), w.source);
     expect(live.ok, live.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(live.returnValueXdr!, 'base64'))).toBe(42n);
+    expect(scValToNative(xdr.ScVal.fromXdr(live.returnValueXdr!, 'base64'))).toBe(42n);
 
     // One ledger before expiry it is still there...
     w.L.advanceLedgers(MIN_TEMP_ENTRY_TTL - 1);
     expect(w.L.ledgerSeq).toBe(START_SEQ + MIN_TEMP_ENTRY_TTL - 1);
     const stillLive = w.L.simulate(invokeHostFn(w.addr, 'has_temporary', [sym('t')]), w.source);
     expect(stillLive.ok, stillLive.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(stillLive.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(stillLive.returnValueXdr!, 'base64'))).toBe(true);
 
     // ...one ledger later it is gone.
     w.L.advanceLedgers(1);
     const expired = w.L.simulate(invokeHostFn(w.addr, 'has_temporary', [sym('t')]), w.source);
     expect(expired.ok, expired.error).toBe(true);
     expect(
-      scValToNative(xdr.ScVal.fromXDR(expired.returnValueXdr!, 'base64')),
+      scValToNative(xdr.ScVal.fromXdr(expired.returnValueXdr!, 'base64')),
       'expired temporary entry is still visible',
     ).toBe(false);
   });
@@ -857,9 +859,9 @@ describe('property: ledgerSeq and timestamp drive TTL and timebounds', () => {
     attachInProcessRpc(server, L);
 
     const wasmHash = L.seedWasm(CONTRACT_DATA);
-    const srcB64 = accountIdFromPublicKey(kp.publicKey()).toXDR('base64');
+    const srcB64 = accountIdFromPublicKey(kp.publicKey()).toXdr('base64');
     const { sent } = L.simulateAndSend(createContractHostFn(srcB64, wasmHash), srcB64);
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     const buildAt = async (minTime: number, maxTime: number) => {
       const account = await server.getAccount(kp.publicKey());
@@ -884,17 +886,17 @@ describe('property: ledgerSeq and timestamp drive TTL and timebounds', () => {
       const now = L.timestamp;
 
       const tooEarly = await buildAt(now + 100, now + 200);
-      expect(L.sendTransaction(tooEarly.toEnvelope().toXDR('base64')).code).toBe('txTOO_EARLY');
+      expect(L.sendTransaction(tooEarly.toEnvelope().toXdr('base64')).code).toBe('txTOO_EARLY');
 
       const tooLate = await buildAt(now - 200, now - 100);
-      expect(L.sendTransaction(tooLate.toEnvelope().toXDR('base64')).code).toBe('txTOO_LATE');
+      expect(L.sendTransaction(tooLate.toEnvelope().toXdr('base64')).code).toBe('txTOO_LATE');
 
       // Advancing the ledger moves the clock into the first window.
       const inWindow = await buildAt(now + 100, now + 100_000);
       // 100 seconds / 5 s per ledger = 20 ledgers.
       L.advanceLedgers(100 / SECONDS_PER_LEDGER);
       expect(L.timestamp).toBe(now + 100);
-      const out = L.sendTransaction(inWindow.toEnvelope().toXDR('base64'));
+      const out = L.sendTransaction(inWindow.toEnvelope().toXdr('base64'));
       expect(out.code, out.detail ?? out.error).toBe('txSUCCESS');
     })();
   });
@@ -924,12 +926,14 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
     const fn = invokeHostFn(w.addr, 'put_persistent', [sym('never'), u64(1n)]);
     const sim = w.L.simulate(fn, w.source);
     expect(sim.ok).toBe(true);
-    const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    resources.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+    const resources = new xdr.SorobanResources({
+      ...xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+      footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+    });
 
     let applied = false;
     try {
-      applied = w.L.send(fn, w.source, resources.toXDR('base64'), sim.authXdr, []).ok;
+      applied = w.L.send(fn, w.source, resources.toXdr('base64'), sim.authXdr, []).ok;
     } catch {
       applied = false;
     }
@@ -937,7 +941,7 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
 
     expectSameState(before, w.seen.capture(w.L), 'after a footprint-rejected send');
     expect(
-      w.L.getEntry(contractDataKey(w.addr, sym('never'), xdr.ContractDataDurability.persistent())),
+      w.L.getEntry(contractDataKey(w.addr, sym('never'), xdr.ContractDataDurability.persistent)),
       'a rejected send wrote its entry anyway',
     ).toBeUndefined();
   });
@@ -963,7 +967,7 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
         diskReadBytes: 10_000,
         writeBytes: 10_000,
       });
-      applied = w.L.send(fn, w.source, resources.toXDR('base64'), [], []).ok;
+      applied = w.L.send(fn, w.source, resources.toXdr('base64'), [], []).ok;
     } catch {
       applied = false;
     }
@@ -1003,8 +1007,8 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
     seen.add(
       aliceTl,
       bobTl,
-      accountKey(alice.accountId).toXDR('base64'),
-      accountKey(bob.accountId).toXDR('base64'),
+      accountKey(alice.accountId).toXdr('base64'),
+      accountKey(bob.accountId).toXdr('base64'),
     );
     const before = seen.capture(L);
     const beforeCount = L.entryCount();
@@ -1064,7 +1068,7 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
     const L = new Ledger();
     const deployer = Keypair.random();
     L.fund(deployer.publicKey());
-    const source = accountIdFromPublicKey(deployer.publicKey()).toXDR('base64');
+    const source = accountIdFromPublicKey(deployer.publicKey()).toXdr('base64');
 
     const admin = Keypair.random();
     const wasmHash = L.seedWasm(SMART_ACCOUNT);
@@ -1086,10 +1090,13 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
       source,
     );
     expect(deployed.sent.ok, deployed.sent.error).toBe(true);
-    const addr = xdr.ScVal.fromXDR(deployed.sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(
+      xdr.ScVal.fromXdr(deployed.sent.returnValueXdr!, 'base64'),
+      'scvAddress',
+    ).address;
 
     const seen = new KeySet();
-    seen.add(accountKey(accountIdFromPublicKey(deployer.publicKey())).toXDR('base64'));
+    seen.add(accountKey(accountIdFromPublicKey(deployer.publicKey())).toXdr('base64'));
     seen.observe(deployed.sent);
 
     const newSigner = Keypair.random();
@@ -1146,6 +1153,6 @@ describe('property: a failed or trapped send leaves the ledger unchanged', () =>
       source,
     );
     expect(has.ok, has.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(false);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(false);
   });
 });

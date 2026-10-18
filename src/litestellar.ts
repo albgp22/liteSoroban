@@ -130,9 +130,9 @@ function hostFailure(prefix: string, raw: string | undefined): HostFailure {
  * callback. Rebuilding the preimage is a dozen lines, and keeping the whole API
  * synchronous is worth it — LiteSVM's ergonomics depend on it.
  *
- * Mirrors base/auth.js:115: legacy `Address` credentials use the plain
- * SorobanAuthorization preimage; `AddressV2` and `AddressWithDelegates` (CAP-71)
- * bind the address in via the WithAddress preimage.
+ * Mirrors base/auth.js:165 (buildAuthorizationEntryPreimage): legacy `Address`
+ * credentials use the plain SorobanAuthorization preimage; `AddressV2` and
+ * `AddressWithDelegates` (CAP-71) bind the address in via the WithAddress preimage.
  */
 export function signAuthEntriesSync(
   entriesB64: string[],
@@ -141,38 +141,48 @@ export function signAuthEntriesSync(
   const networkId = sha256(Buffer.from(opts.networkPassphrase));
 
   return entriesB64.map((b64) => {
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(b64, 'base64');
-    const credentials = entry.credentials();
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(b64, 'base64');
+    const credentials = entry.credentials;
     // Source-account credentials carry no signature at all.
-    if (credentials.switch().name === 'sorobanCredentialsSourceAccount') return b64;
+    if (credentials.type === 'sorobanCredentialsSourceAccount') return b64;
 
-    const addr = credentials.address();
-    addr.signatureExpirationLedger(opts.validUntilLedgerSeq);
+    // Read whatever the arm, as js-xdr v4's `credentials.address()` was: only
+    // legacy Address credentials get past it (test/validation/facade-api DEFECT 6).
+    const addr = (credentials as xdr.SorobanCredentialsAddress).address;
 
     let preimage: xdr.HashIdPreimage;
-    if (credentials.switch().name === 'sorobanCredentialsAddress') {
+    if (credentials.type === 'sorobanCredentialsAddress') {
       preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
         new xdr.HashIdPreimageSorobanAuthorization({
           networkId,
-          nonce: addr.nonce(),
+          nonce: addr.nonce,
           signatureExpirationLedger: opts.validUntilLedgerSeq,
-          invocation: entry.rootInvocation(),
+          invocation: entry.rootInvocation,
         }),
       );
     } else {
       preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorizationWithAddress(
-        new (xdr as any).HashIdPreimageSorobanAuthorizationWithAddress({
+        new xdr.HashIdPreimageSorobanAuthorizationWithAddress({
           networkId,
-          address: addr.address(),
-          nonce: addr.nonce(),
+          address: addr.address,
+          nonce: addr.nonce,
           signatureExpirationLedger: opts.validUntilLedgerSeq,
-          invocation: entry.rootInvocation(),
+          invocation: entry.rootInvocation,
         }),
       );
     }
 
-    addr.signature(opts.sign(sha256(preimage.toXDR())));
-    return entry.toXDR('base64');
+    const signature = opts.sign(Buffer.from(sha256(preimage.toXdr())));
+    return new xdr.SorobanAuthorizationEntry({
+      rootInvocation: entry.rootInvocation,
+      credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
+        new xdr.SorobanAddressCredentials({
+          ...addr,
+          signatureExpirationLedger: opts.validUntilLedgerSeq,
+          signature,
+        }),
+      ),
+    }).toXdr('base64');
   });
 }
 
@@ -256,7 +266,7 @@ export class Contract {
   view(fn: string, args: xdr.ScVal[] = [], opts: InvokeOptions = {}): any {
     const sim = this.simulate(fn, args, opts);
     if (!sim.ok) throw hostFailure(`${fn} failed`, sim.error);
-    return scValToNative(xdr.ScVal.fromXDR(sim.returnValueXdr!, 'base64'));
+    return scValToNative(xdr.ScVal.fromXdr(sim.returnValueXdr!, 'base64'));
   }
 }
 
@@ -429,7 +439,7 @@ export class LiteStellar {
 
   getBalance(publicKey: string): bigint {
     const a = this.getAccount(publicKey);
-    return a ? BigInt(a.balance().toString()) : 0n;
+    return a ? a.balance : 0n;
   }
 
   /** Write any ledger entry directly — the set_account escape hatch. */
@@ -478,7 +488,7 @@ export class LiteStellar {
     );
     const result = this.applyHostFn(hostFn, source, opts);
     if (!result.ok) throw result.error;
-    return new Contract(this, xdr.ScVal.fromXDR(result.rawReturn!, 'base64').address());
+    return new Contract(this, xdr.expectUnionVariant(xdr.ScVal.fromXdr(result.rawReturn!, 'base64'), 'scvAddress').address);
   }
 
   /** A handle for a contract that is already deployed. */
@@ -535,10 +545,10 @@ export class LiteStellar {
     const r = this.applyHostFn(invokeHostFn(address, fn, args), source, opts);
     return {
       ok: r.ok,
-      value: r.ok && r.rawReturn ? scValToNative(xdr.ScVal.fromXDR(r.rawReturn, 'base64')) : undefined,
+      value: r.ok && r.rawReturn ? scValToNative(xdr.ScVal.fromXdr(r.rawReturn, 'base64')) : undefined,
       error: r.error,
-      events: (r.events ?? []).map((e) => xdr.ContractEvent.fromXDR(e, 'base64')),
-      diagnostics: (r.diagnostics ?? []).map((e) => xdr.DiagnosticEvent.fromXDR(e, 'base64')),
+      events: (r.events ?? []).map((e) => xdr.ContractEvent.fromXdr(e, 'base64')),
+      diagnostics: (r.diagnostics ?? []).map((e) => xdr.DiagnosticEvent.fromXdr(e, 'base64')),
       instructions: r.sim?.instructions ?? 0,
       readBytes: r.sim?.readBytes ?? 0,
       writeBytes: r.sim?.writeBytes ?? 0,

@@ -19,7 +19,7 @@ const CODE = new Uint8Array(
 const NETWORK_ID = sha256(Networks.TESTNET);
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) => xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 const RESOURCE_FEE = 2_000_000n;
 
@@ -31,17 +31,17 @@ function scaffold(L: Ledger) {
     createContractHostFn(accB64(deployer.publicKey()), wasmHash),
     accB64(deployer.publicKey()),
   );
-  const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+  const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   const hostFn = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
   const sim = L.simulate(hostFn, accB64(deployer.publicKey()));
-  return { addr, hostFn, resources: xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64') };
+  return { addr, hostFn, resources: xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64') };
 }
 
 function rawFor(kp: Keypair, seqNum: bigint, hostFn: xdr.HostFunction, resources: xdr.SorobanResources) {
   return new xdr.Transaction({
     sourceAccount: plain(kp.publicKey()),
     fee: Number(RESOURCE_FEE + BigInt(BASE_FEE)),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(seqNum)),
+    seqNum,
     cond: xdr.Preconditions.precondNone(),
     memo: xdr.Memo.memoNone(),
     operations: [
@@ -52,12 +52,11 @@ function rawFor(kp: Keypair, seqNum: bigint, hostFn: xdr.HostFunction, resources
         ),
       }),
     ],
-    ext: new xdr.TransactionExt(
-      1,
+    ext: xdr.TransactionExt.sorobanData(
       new xdr.SorobanTransactionData({
-        ext: new xdr.SorobanTransactionDataExt(0),
+        ext: xdr.SorobanTransactionDataExt.v0(),
         resources,
-        resourceFee: new xdr.Int64(RESOURCE_FEE),
+        resourceFee: RESOURCE_FEE,
       }),
     ),
   });
@@ -67,30 +66,33 @@ const txHash = (raw: xdr.Transaction) =>
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 const signed = (raw: xdr.Transaction, kps: Keypair[]) =>
   xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: kps.map((k) => k.signDecorated(txHash(raw))) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 function feeBump(feeSource: Keypair, fee: bigint, innerB64: string, kps: Keypair[]): string {
-  const innerV1 = xdr.TransactionEnvelope.fromXDR(innerB64, 'base64').v1();
+  const innerV1 = xdr.expectUnionVariant(
+    xdr.TransactionEnvelope.fromXdr(innerB64, 'base64'),
+    'envelopeTypeTx',
+  ).v1;
   const fbTx = new xdr.FeeBumpTransaction({
     feeSource: plain(feeSource.publicKey()),
-    fee: new xdr.Int64(fee),
+    fee,
     innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(innerV1),
-    ext: new xdr.FeeBumpTransactionExt(0),
+    ext: xdr.FeeBumpTransactionExt.v0(),
   });
   const h = sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTxFeeBump(fbTx),
-    }).toXDR(),
+    }).toXdr(),
   );
   return xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
     new xdr.FeeBumpTransactionEnvelope({ tx: fbTx, signatures: kps.map((k) => k.signDecorated(h)) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 // ===========================================================================
@@ -201,7 +203,7 @@ describe('ROUND 2 — fix 7: snapshot/restore covers the clock and the PRNG', ()
     const dep = Keypair.random();
     L.fund(dep.publicKey());
     const { sent } = L.simulateAndSend(createContractHostFn(accB64(dep.publicKey()), wasmHash), accB64(dep.publicKey()));
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     const other = Keypair.random();
     L.fund(other.publicKey());
@@ -232,7 +234,7 @@ describe('ROUND 2 — fix 8: isWallet() and contract recipients', () => {
 
     // ...and no trustline was fabricated for the contract, nor a sub-entry.
     const acct = svm.getAccount(token.issuer.publicKey)!;
-    expect(acct.numSubEntries()).toBe(0);
+    expect(acct.numSubEntries).toBe(0);
 
     token.mint(alice, 500n);
     token.transfer(alice, c.address, 200n);
@@ -241,15 +243,18 @@ describe('ROUND 2 — fix 8: isWallet() and contract recipients', () => {
   });
 
   it('HOLDS: xdr.ScAddress really lacks the two probed properties', () => {
-    const contractAddr = xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 3));
+    const contractAddr = xdr.ScAddress.scAddressTypeContract(new xdr.ContractId(Buffer.alloc(32, 3)));
     const accountAddr = xdr.ScAddress.scAddressTypeAccount(
       accountIdFromPublicKey(Keypair.random().publicKey()),
     );
     for (const a of [contractAddr, accountAddr]) {
       expect('address' in (a as any)).toBe(false);
       expect('accountIdB64' in (a as any)).toBe(false);
-      // the old, broken probe would have returned true for BOTH arms:
-      expect('accountId' in (a as any)).toBe(true);
+      // the old, broken probe ('accountId' in who) is true for an account
+      // ScAddress. Through SDK 16.2.0 it was true for BOTH arms (js-xdr v4 put
+      // every arm's accessor on the prototype); from 17.0.0 an instance carries
+      // only its own arm's field.
+      expect('accountId' in (a as any)).toBe(a === accountAddr);
     }
   });
 });
@@ -262,13 +267,13 @@ describe('ROUND 2 — fix 9: establishTrustline and numSubEntries', () => {
     const token = svm.deployToken({ code: 'TST' });
 
     const before = svm.getAccount(holder.publicKey)!;
-    expect(before.numSubEntries()).toBe(0);
+    expect(before.numSubEntries).toBe(0);
     const availBefore = availableBalance(before);
 
     svm.trust(holder, token.asset);
 
     const after = svm.getAccount(holder.publicKey)!;
-    expect(after.numSubEntries()).toBe(1);
+    expect(after.numSubEntries).toBe(1);
     expect(availableBalance(after)).toBe(availBefore - BigInt(BASE_RESERVE));
   });
 
@@ -286,7 +291,7 @@ describe('ROUND 2 — fix 9: establishTrustline and numSubEntries', () => {
     svm.trust(holder, token.asset);
     svm.trust(holder, token.asset);
 
-    expect(svm.getAccount(holder.publicKey)!.numSubEntries()).toBe(1);
+    expect(svm.getAccount(holder.publicKey)!.numSubEntries).toBe(1);
   });
 
   it('DEFECT (corollary): the phantom sub-entries lock real balance', () => {
@@ -313,9 +318,9 @@ describe('ROUND 2 — fix 6: expired TEMPORARY entries skipped from host inputs'
       new xdr.LedgerKeyContractData({
         contract: c,
         key: sym(k),
-        durability: xdr.ContractDataDurability.temporary(),
+        durability: xdr.ContractDataDurability.temporary,
       }),
-    ).toXDR('base64');
+    ).toXdr('base64');
 
   function callTx(L: Ledger, addr: xdr.ScAddress, fn: string, args: xdr.ScVal[], src: string) {
     const h = invokeHostFn(addr, fn, args);
@@ -334,7 +339,7 @@ describe('ROUND 2 — fix 6: expired TEMPORARY entries skipped from host inputs'
       createContractHostFn(accB64(dep.publicKey()), wasmHash),
       accB64(dep.publicKey()),
     );
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
     const src = accB64(dep.publicKey());
 
     callTx(L, addr, 'put_temporary', [sym('t'), u64(7n)], src);
@@ -370,11 +375,11 @@ describe('ROUND 2 — fix 10: getNetwork', () => {
         new xdr.TransactionSignaturePayload({
           networkId: sha256(net.passphrase),
           taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-        }).toXDR(),
+        }).toXdr(),
       );
       const env = xdr.TransactionEnvelope.envelopeTypeTx(
         new xdr.TransactionV1Envelope({ tx: raw, signatures: [a.signDecorated(h)] }),
-      ).toXDR('base64');
+      ).toXdr('base64');
       expect(svm.sendTransaction(env).code, `passphrase ${pass}`).toBe('txSUCCESS');
     }
   });

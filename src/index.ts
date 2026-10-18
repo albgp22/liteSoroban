@@ -154,7 +154,7 @@ export class Ledger {
     isRestore = false,
   ): { nonRefundable: bigint; refundable: bigint } {
     const [nonRefundable, refundable] = this.env.computeResourceFee(
-      sorobanData.toXDR('base64'),
+      sorobanData.toXdr('base64'),
       txSize,
       eventsSize,
       isRestore,
@@ -351,7 +351,7 @@ export class Ledger {
     instructionLeeway?: number,
     ledgerSeq?: number,
   ): SimulateResult {
-    return this.env.simulate(hostFn.toXDR('base64'), sourceB64, instructionLeeway, ledgerSeq);
+    return this.env.simulate(hostFn.toXdr('base64'), sourceB64, instructionLeeway, ledgerSeq);
   }
 
   /**
@@ -366,7 +366,7 @@ export class Ledger {
     instructionLeeway?: number,
     ledgerSeq?: number,
   ): SimulateResult {
-    return this.env.simulateWithAuth(hostFn.toXDR('base64'), sourceB64, authB64, instructionLeeway, ledgerSeq);
+    return this.env.simulateWithAuth(hostFn.toXdr('base64'), sourceB64, authB64, instructionLeeway, ledgerSeq);
   }
 
   /**
@@ -383,7 +383,7 @@ export class Ledger {
     maxRefundableFee?: bigint,
   ): SendResult {
     return this.env.send(
-      hostFn.toXDR('base64'),
+      hostFn.toXdr('base64'),
       sourceB64,
       resourcesB64,
       authB64,
@@ -404,7 +404,7 @@ export class Ledger {
 // -- host function builders -------------------------------------------------
 
 export function accountScAddress(accountIdB64: string): xdr.ScAddress {
-  return xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXDR(accountIdB64, 'base64'));
+  return xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXdr(accountIdB64, 'base64'));
 }
 
 export function uploadWasmHostFn(code: Uint8Array): xdr.HostFunction {

@@ -46,7 +46,7 @@ describe('custom account: signing auth entries for __check_auth', () => {
     L = new Ledger();
     const deployer = Keypair.random();
     L.fund(deployer.publicKey());
-    source = accountIdFromPublicKey(deployer.publicKey()).toXDR('base64');
+    source = accountIdFromPublicKey(deployer.publicKey()).toXdr('base64');
 
     admin = Keypair.random();
     const wasmHash = L.seedWasm(SMART);
@@ -58,7 +58,7 @@ describe('custom account: signing auth entries for __check_auth', () => {
       source,
     );
     expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   });
 
   it('deploys the smart account and registers the admin signer', () => {
@@ -67,7 +67,7 @@ describe('custom account: signing auth entries for __check_auth', () => {
       source,
     );
     expect(has.ok, has.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(true);
   });
 
   it('simulation records an address credential without running __check_auth', () => {
@@ -76,8 +76,8 @@ describe('custom account: signing auth entries for __check_auth', () => {
 
     expect(sim.ok).toBe(true); // green, despite no signature existing yet
     expect(sim.authXdr).toHaveLength(1);
-    const cred = xdr.SorobanAuthorizationEntry.fromXDR(sim.authXdr[0], 'base64').credentials();
-    expect(cred.switch().name).toBe('sorobanCredentialsAddress');
+    const cred = xdr.SorobanAuthorizationEntry.fromXdr(sim.authXdr[0], 'base64').credentials;
+    expect(cred.type).toBe('sorobanCredentialsAddress');
   });
 
   it('sending the recorded (unsigned) auth entry is rejected by __check_auth', () => {
@@ -143,7 +143,7 @@ describe('custom account: signing auth entries for __check_auth', () => {
       invokeHostFn(addr, 'has_signer', [ed25519SignerKey(newSigner.rawPublicKey())]),
       source,
     );
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(true);
   });
 
   it('a proof from the WRONG key is rejected', async () => {

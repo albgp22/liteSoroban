@@ -54,7 +54,7 @@ describe('GUIDE.md', () => {
     expect(alice.sequence()).toBe(0n);
     expect(alice.publicKey.startsWith('G')).toBe(true);
     expect(alice.scAddress).toBeInstanceOf(xdr.ScVal);
-    expect(svm.getAccount(multi.publicKey)!.thresholds()[2]).toBe(2);
+    expect(svm.getAccount(multi.publicKey)!.thresholds.toBytes()[2]).toBe(2);
 
     // svm.fund wraps a keypair you already hold
     const kp = Keypair.random();
@@ -276,7 +276,7 @@ describe('GUIDE.md', () => {
   describe('Gotchas', () => {
     it('an unsigned transaction is rejected even at medium threshold 0', async () => {
       const alice = svm.airdrop();
-      expect(svm.getAccount(alice.publicKey)!.thresholds()[2]).toBe(0);
+      expect(svm.getAccount(alice.publicKey)!.thresholds.toBytes()[2]).toBe(0);
 
       const c = svm.deployContract(CONTRACT_DATA, { as: alice });
       const server = svm.rpcServer();

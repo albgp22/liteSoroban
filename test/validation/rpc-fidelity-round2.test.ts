@@ -103,7 +103,7 @@ describe('requestAirdrop on an ALREADY-FUNDED account', () => {
     // silently succeeds here.
     await submit(alice, cd, 'put_persistent', [sc.sym('k'), sc.u64(1n)]);
     const before = svm.getAccount(alice.publicKey)!;
-    const seqBefore = BigInt(before.seqNum().toString());
+    const seqBefore = BigInt(before.seqNum.toString());
     expect(seqBefore, 'fixture must have moved the sequence').toBeGreaterThan(0n);
 
     let refused = false;
@@ -154,7 +154,7 @@ describe('requestAirdrop on an ALREADY-FUNDED account', () => {
 
     const after = svm.getAccount(multisig.publicKey)!;
     expect(
-      { signers: after.signers().length, thresholds: [...after.thresholds()] },
+      { signers: after.signers.length, thresholds: [...after.thresholds.toBytes()] },
       'requestAirdrop downgraded a 2-of-2 account to 1-of-1',
     ).toEqual({ signers: 1, thresholds: [1, 1, 2, 2] });
   });
@@ -227,32 +227,36 @@ describe('fee-bump transaction results', () => {
     // may already have persisted, so this substitutes an id that matches
     // nothing the app knows.
     const { inner, bump } = await feeBumped();
-    const sent = await jsonRpc('sendTransaction', { transaction: bump.toXDR() });
+    const sent = await jsonRpc('sendTransaction', { transaction: bump.toXdr() });
     expect(sent.status, JSON.stringify(sent)).toBe('PENDING');
 
     const got = await jsonRpc('getTransaction', { hash: sent.hash });
-    const result = xdr.TransactionResult.fromXDR(got.resultXdr, 'base64');
-    expect(result.result().switch().name).toBe('txFeeBumpInnerSuccess');
+    const result = xdr.TransactionResult.fromXdr(got.resultXdr, 'base64');
+    expect(result.result.type).toBe('txFeeBumpInnerSuccess');
 
-    const carried = result.result().innerResultPair().transactionHash().toString('hex');
-    expect(carried, `carried the fee-bump hash ${bump.hash().toString('hex')}`).toBe(
-      inner.hash().toString('hex'),
+    const carried = Buffer.from(
+      xdr.expectUnionVariant(result.result, 'txFeeBumpInnerSuccess').innerResultPair.transactionHash.toBytes(),
+    ).toString('hex');
+    expect(carried, `carried the fee-bump hash ${Buffer.from(bump.hash()).toString('hex')}`).toBe(
+      Buffer.from(inner.hash()).toString('hex'),
     );
   });
 
   it('the inner result reports the fee that was charged', async () => {
     // GROUND TRUTH, MutableTransactionResult.cpp:335
     //   innerResult.feeCharged = innerFeeCharged;
-    // fake-rpc.ts:86 hardcodes `feeCharged: new xdr.Int64(0n)`, so an app
-    // reconciling what a sponsored transaction cost reads 0 for every fee bump.
+    // fake-rpc.ts:86 hardcodes `feeCharged: 0n`, so an app reconciling what a
+    // sponsored transaction cost reads 0 for every fee bump.
     const { bump } = await feeBumped();
-    const sent = await jsonRpc('sendTransaction', { transaction: bump.toXDR() });
+    const sent = await jsonRpc('sendTransaction', { transaction: bump.toXdr() });
     const got = await jsonRpc('getTransaction', { hash: sent.hash });
-    const inner = xdr.TransactionResult.fromXDR(got.resultXdr, 'base64')
-      .result()
-      .innerResultPair()
-      .result();
-    expect(inner.feeCharged().toBigInt(), 'inner feeCharged is hardcoded 0').toBeGreaterThan(0n);
+    const inner = xdr.expectUnionVariant(
+      xdr.TransactionResult.fromXdr(got.resultXdr, 'base64').result,
+      'txFeeBumpInnerSuccess',
+    )
+      .innerResultPair
+      .result;
+    expect(inner.feeCharged, 'inner feeCharged is hardcoded 0').toBeGreaterThan(0n);
   });
 });
 
@@ -266,7 +270,7 @@ describe('simulateTransaction envelope coverage', () => {
       new xdr.LedgerKeyContractData({
         contract: cd.address,
         key: xdr.ScVal.scvLedgerKeyContractInstance(),
-        durability: xdr.ContractDataDurability.persistent(),
+        durability: xdr.ContractDataDurability.persistent,
       }),
     );
 
@@ -274,9 +278,10 @@ describe('simulateTransaction envelope coverage', () => {
     // LIVE, same op against the standalone node:
     //   {"transactionData":"AAAAAAAA...tug=","minResourceFee":"46824",
     //    "latestLedger":17117}
-    // fake-rpc.ts:452 does `op.body().invokeHostFunctionOp()` unconditionally,
-    // so the union accessor throws for any other Soroban op. Every state-archival
-    // flow starts by simulating exactly this transaction to price it.
+    // fake-rpc.ts:452 does `expectUnionVariant(body, 'invokeHostFunction')`
+    // unconditionally, so the union accessor throws for any other Soroban op.
+    // Every state-archival flow starts by simulating exactly this transaction to
+    // price it.
     const account = await server.getAccount(alice.publicKey);
     const tx = new TransactionBuilder(account, {
       fee: '100000',
@@ -312,9 +317,10 @@ describe('simulateTransaction envelope coverage', () => {
     // LIVE: a fee bump wrapping the ExtendFootprintTTL above simulated fine and
     // returned the INNER transaction's numbers — minResourceFee "46824",
     // identical to simulating the inner tx alone.
-    // fake-rpc.ts:449-450 does `env.v1()` on the envelope union, which throws
-    // for ENVELOPE_TYPE_TX_FEE_BUMP. `rpc.Server.simulateTransaction` accepts
-    // `Transaction | FeeBumpTransaction` in its own signature.
+    // fake-rpc.ts:449-450 does `expectUnionVariant(env, 'envelopeTypeTx').v1` on
+    // the envelope union, which throws for ENVELOPE_TYPE_TX_FEE_BUMP.
+    // `rpc.Server.simulateTransaction` accepts `Transaction | FeeBumpTransaction`
+    // in its own signature.
     const account = await server.getAccount(alice.publicKey);
     const inner = new TransactionBuilder(account, {
       fee: '100000',
@@ -437,7 +443,7 @@ describe('getTransaction NOT_FOUND', () => {
     // fake-rpc.ts:564 returns the four retention fields plus `status` and
     // nothing else.
     //
-    // NOTE, verified in the SDK rather than assumed: server.js:756 sets
+    // NOTE, verified in the SDK rather than assumed: server.js:876 sets
     // `txHash: hash` from the ARGUMENT, so `server.getTransaction()` masks this
     // particular omission. The divergence is real only for a consumer reading
     // the JSON-RPC payload directly — another SDK, a proxy, a recorded fixture
@@ -452,7 +458,7 @@ describe('getTransaction NOT_FOUND', () => {
   it('carries the placeholder ledger/createdAt/events fields', async () => {
     // Same LIVE payload as above: `events` is `{}`, not absent, and `ledger`
     // and `createdAt` are present as 0 / "0". Unlike `txHash`, the SDK does NOT
-    // backfill these — server.js:751 skips parseTransactionInfo entirely for
+    // backfill these — server.js:871 skips parseTransactionInfo entirely for
     // NOT_FOUND — so `resp.events` is `undefined` here and `{}` on a real node,
     // and `const { contractEventsXdr = [] } = resp.events` throws while the
     // transaction is still pending.
@@ -481,12 +487,12 @@ describe('the transaction meta a successful submit produces', () => {
     // transactionMeta() never produces one.
     const sent = await submit(alice, cd, 'put_persistent', [sc.sym('meta'), sc.u64(1n)]);
     const got = await jsonRpc('getTransaction', { hash: sent.hash });
-    const meta = xdr.TransactionMeta.fromXDR(got.resultMetaXdr, 'base64');
-    expect(meta.switch()).toBe(4);
-    const changes = meta
-      .v4()
-      .operations()
-      .flatMap((o) => o.changes());
+    const meta = xdr.TransactionMeta.fromXdr(got.resultMetaXdr, 'base64');
+    expect(meta.toXdrObject().v).toBe(4);
+    const changes = xdr.expectUnionVariant(meta, 'v4')
+      .v4
+      .operations
+      .flatMap((o) => o.changes);
     expect(changes.length, 'the meta records no ledger changes at all').toBeGreaterThan(0);
   });
 
@@ -501,11 +507,11 @@ describe('the transaction meta a successful submit produces', () => {
     const got = await jsonRpc('getTransaction', { hash: sent.hash });
 
     const viaEventsField = (got.events?.contractEventsXdr ?? []).flat().length;
-    const meta = xdr.TransactionMeta.fromXDR(got.resultMetaXdr, 'base64');
-    const viaMeta = meta
-      .v4()
-      .operations()
-      .flatMap((o) => o.events()).length;
+    const meta = xdr.TransactionMeta.fromXdr(got.resultMetaXdr, 'base64');
+    const viaMeta = xdr.expectUnionVariant(meta, 'v4')
+      .v4
+      .operations
+      .flatMap((o) => o.events).length;
 
     expect(
       { viaMeta, viaEventsField },

@@ -107,17 +107,17 @@ export const TESTNET_FEE_SETTINGS: NetworkFeeSettings = {
 
 const ID = xdr.ConfigSettingId;
 const SETTINGS = [
-  ID.configSettingContractComputeV0(),
-  ID.configSettingContractLedgerCostV0(),
-  ID.configSettingContractLedgerCostExtV0(),
-  ID.configSettingContractHistoricalDataV0(),
-  ID.configSettingContractEventsV0(),
-  ID.configSettingContractBandwidthV0(),
-  ID.configSettingContractMaxSizeBytes(),
-  ID.configSettingContractDataKeySizeBytes(),
-  ID.configSettingContractDataEntrySizeBytes(),
-  ID.configSettingStateArchival(),
-  ID.configSettingLiveSorobanStateSizeWindow(),
+  ID.configSettingContractComputeV0,
+  ID.configSettingContractLedgerCostV0,
+  ID.configSettingContractLedgerCostExtV0,
+  ID.configSettingContractHistoricalDataV0,
+  ID.configSettingContractEventsV0,
+  ID.configSettingContractBandwidthV0,
+  ID.configSettingContractMaxSizeBytes,
+  ID.configSettingContractDataKeySizeBytes,
+  ID.configSettingContractDataEntrySizeBytes,
+  ID.configSettingStateArchival,
+  ID.configSettingLiveSorobanStateSizeWindow,
 ];
 
 /**
@@ -130,44 +130,44 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
       xdr.LedgerKey.configSetting(new xdr.LedgerKeyConfigSetting({ configSettingId })),
     ),
   );
-  const n = (v: { toString(): string } | number) => Number(v.toString());
+  const n = (v: bigint | number) => Number(v);
   const out: Partial<NetworkFeeSettings> = {};
   for (const e of res.entries) {
-    const cs = e.val.configSetting();
-    const v: any = cs.value();
-    switch (cs.switch().name) {
+    const cs = xdr.expectUnionVariant(e.val, 'configSetting').configSetting;
+    const v: any = cs.value;
+    switch (cs.type) {
       case 'configSettingContractComputeV0':
-        out.feeRatePerInstructionsIncrement = n(v.feeRatePerInstructionsIncrement());
-        out.txMaxInstructions = n(v.txMaxInstructions());
-        out.txMemoryLimit = n(v.txMemoryLimit());
+        out.feeRatePerInstructionsIncrement = n(v.feeRatePerInstructionsIncrement);
+        out.txMaxInstructions = n(v.txMaxInstructions);
+        out.txMemoryLimit = n(v.txMemoryLimit);
         break;
       case 'configSettingContractLedgerCostV0':
-        out.txMaxDiskReadEntries = n(v.txMaxDiskReadEntries());
-        out.txMaxDiskReadBytes = n(v.txMaxDiskReadBytes());
-        out.txMaxWriteLedgerEntries = n(v.txMaxWriteLedgerEntries());
-        out.txMaxWriteBytes = n(v.txMaxWriteBytes());
-        out.feeDiskReadLedgerEntry = n(v.feeDiskReadLedgerEntry());
-        out.feeWriteLedgerEntry = n(v.feeWriteLedgerEntry());
-        out.feeDiskRead1kb = n(v.feeDiskRead1Kb());
-        out.sorobanStateTargetSizeBytes = n(v.sorobanStateTargetSizeBytes());
-        out.rentFee1kbSorobanStateSizeLow = n(v.rentFee1KbSorobanStateSizeLow());
-        out.rentFee1kbSorobanStateSizeHigh = n(v.rentFee1KbSorobanStateSizeHigh());
-        out.sorobanStateRentFeeGrowthFactor = n(v.sorobanStateRentFeeGrowthFactor());
+        out.txMaxDiskReadEntries = n(v.txMaxDiskReadEntries);
+        out.txMaxDiskReadBytes = n(v.txMaxDiskReadBytes);
+        out.txMaxWriteLedgerEntries = n(v.txMaxWriteLedgerEntries);
+        out.txMaxWriteBytes = n(v.txMaxWriteBytes);
+        out.feeDiskReadLedgerEntry = n(v.feeDiskReadLedgerEntry);
+        out.feeWriteLedgerEntry = n(v.feeWriteLedgerEntry);
+        out.feeDiskRead1kb = n(v.feeDiskRead1Kb);
+        out.sorobanStateTargetSizeBytes = n(v.sorobanStateTargetSizeBytes);
+        out.rentFee1kbSorobanStateSizeLow = n(v.rentFee1KbSorobanStateSizeLow);
+        out.rentFee1kbSorobanStateSizeHigh = n(v.rentFee1KbSorobanStateSizeHigh);
+        out.sorobanStateRentFeeGrowthFactor = n(v.sorobanStateRentFeeGrowthFactor);
         break;
       case 'configSettingContractLedgerCostExtV0':
-        out.txMaxFootprintEntries = n(v.txMaxFootprintEntries());
-        out.feeWrite1kb = n(v.feeWrite1Kb());
+        out.txMaxFootprintEntries = n(v.txMaxFootprintEntries);
+        out.feeWrite1kb = n(v.feeWrite1Kb);
         break;
       case 'configSettingContractHistoricalDataV0':
-        out.feeHistorical1kb = n(v.feeHistorical1Kb());
+        out.feeHistorical1kb = n(v.feeHistorical1Kb);
         break;
       case 'configSettingContractEventsV0':
-        out.txMaxContractEventsSizeBytes = n(v.txMaxContractEventsSizeBytes());
-        out.feeContractEvents1kb = n(v.feeContractEvents1Kb());
+        out.txMaxContractEventsSizeBytes = n(v.txMaxContractEventsSizeBytes);
+        out.feeContractEvents1kb = n(v.feeContractEvents1Kb);
         break;
       case 'configSettingContractBandwidthV0':
-        out.txMaxSizeBytes = n(v.txMaxSizeBytes());
-        out.feeTxSize1kb = n(v.feeTxSize1Kb());
+        out.txMaxSizeBytes = n(v.txMaxSizeBytes);
+        out.feeTxSize1kb = n(v.feeTxSize1Kb);
         break;
       case 'configSettingContractMaxSizeBytes':
         out.maxContractSizeBytes = n(v);
@@ -179,11 +179,11 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
         out.maxContractDataEntrySizeBytes = n(v);
         break;
       case 'configSettingStateArchival':
-        out.persistentRentRateDenominator = n(v.persistentRentRateDenominator());
-        out.tempRentRateDenominator = n(v.tempRentRateDenominator());
+        out.persistentRentRateDenominator = n(v.persistentRentRateDenominator);
+        out.tempRentRateDenominator = n(v.tempRentRateDenominator);
         break;
       case 'configSettingLiveSorobanStateSizeWindow': {
-        const sizes = (v as { toString(): string }[]).map((s) => BigInt(s.toString()));
+        const sizes = v as bigint[];
         if (sizes.length === 0) throw new Error('live Soroban state size window is empty');
         out.averageSorobanStateSize = Number(sizes.reduce((a, b) => a + b, 0n) / BigInt(sizes.length));
         break;

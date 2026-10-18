@@ -92,18 +92,18 @@ export function wrapWallet(ledger: Ledger, keypair: Keypair): Wallet {
     keypair,
     publicKey,
     accountId,
-    accountIdB64: accountId.toXDR('base64'),
+    accountIdB64: accountId.toXdr('base64'),
     address,
     scAddress: xdr.ScVal.scvAddress(address),
     balance: () => {
       const a = loadAccount(ledger, accountId);
       if (!a) throw new Error(`account ${publicKey} not found in ledger`);
-      return BigInt(a.balance().toString());
+      return a.balance;
     },
     sequence: () => {
       const a = loadAccount(ledger, accountId);
       if (!a) throw new Error(`account ${publicKey} not found in ledger`);
-      return BigInt(a.seqNum().toString());
+      return a.seqNum;
     },
   };
 }
@@ -136,9 +136,8 @@ export interface Token {
 
 const i128 = (n: bigint) => nativeToScVal(n, { type: 'i128' });
 /**
- * NOTE: do NOT test `'accountId' in who`. js-xdr unions expose an accessor for
- * EVERY arm on the prototype, so that is true for a contract ScAddress too.
- * `address` only exists on Wallet.
+ * NOTE: do NOT test `'accountId' in who`: an account ScAddress carries that
+ * field too. `address` and `accountIdB64` only exist together on Wallet.
  */
 const isWallet = (who: Wallet | xdr.ScAddress): who is Wallet =>
   'address' in who && 'accountIdB64' in who;
@@ -148,7 +147,7 @@ const addrOf = (who: Wallet | xdr.ScAddress): xdr.ScAddress =>
 function sacCreateHostFn(asset: Asset): xdr.HostFunction {
   return xdr.HostFunction.hostFunctionTypeCreateContract(
     new xdr.CreateContractArgs({
-      contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(asset.toXDRObject()),
+      contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(asset.toXdrObject()),
       // The Stellar Asset Contract is a BUILTIN host contract: nothing to upload.
       executable: xdr.ContractExecutable.contractExecutableStellarAsset(),
     }),
@@ -207,10 +206,10 @@ export function establishTrustline(
   const entry = new xdr.TrustLineEntry({
     accountId: holder.accountId,
     asset: trustLineAsset,
-    balance: new xdr.Int64(opts.balance ?? 0n),
-    limit: new xdr.Int64(opts.limit ?? 9_223_372_036_854_775_807n),
-    flags: (opts.authorized ?? true) ? xdr.TrustLineFlags.authorizedFlag().value : 0,
-    ext: new xdr.TrustLineEntryExt(0),
+    balance: opts.balance ?? 0n,
+    limit: opts.limit ?? 9_223_372_036_854_775_807n,
+    flags: (opts.authorized ?? true) ? xdr.TrustLineFlags.authorizedFlag.value : 0,
+    ext: xdr.TrustLineEntryExt.v0(),
   });
 
   // Only a CREATE charges a sub-entry and initialises the balance. core's
@@ -218,26 +217,25 @@ export function establishTrustline(
   // and leaves it alone on modify; doing it unconditionally both double-counts
   // (permanently locking 5 XLM per extra call out of availableBalance) and
   // silently zeroes an existing balance.
-  const existingRaw = ledger.getEntry(trustlineKey(holder, asset).toXDR('base64'));
-  if (existingRaw) {
-    const existing = xdr.LedgerEntry.fromXDR(existingRaw, 'base64').data().trustLine();
-    // Preserve the balance unless the caller explicitly set one.
-    if (opts.balance === undefined) entry.balance(existing.balance());
-  }
+  const existingRaw = ledger.getEntry(trustlineKey(holder, asset).toXdr('base64'));
+  // Preserve the balance unless the caller explicitly set one.
+  const balance =
+    existingRaw && opts.balance === undefined
+      ? xdr.expectUnionVariant(xdr.LedgerEntry.fromXdr(existingRaw, 'base64').data, 'trustline').trustLine.balance
+      : entry.balance;
 
   ledger.putEntry(
     new xdr.LedgerEntry({
       lastModifiedLedgerSeq: ledger.ledgerSeq,
-      data: xdr.LedgerEntryData.trustline(entry),
-      ext: new xdr.LedgerEntryExt(0),
-    }).toXDR('base64'),
+      data: xdr.LedgerEntryData.trustline(new xdr.TrustLineEntry({ ...entry, balance })),
+      ext: xdr.LedgerEntryExt.v0(),
+    }).toXdr('base64'),
   );
 
   if (!existingRaw) {
     const account = loadAccount(ledger, holder.accountId);
     if (account) {
-      account.numSubEntries(account.numSubEntries() + 1);
-      storeAccount(ledger, account);
+      storeAccount(ledger, new xdr.AccountEntry({ ...account, numSubEntries: account.numSubEntries + 1 }));
     }
   }
 }
@@ -268,7 +266,7 @@ export function trustlineKey(holder: Wallet, asset: Asset): xdr.LedgerKey {
 /** Idempotent: only writes a trustline if the holder has none for this asset. */
 function establishTrustlineIfMissing(ledger: Ledger, holder: Wallet, asset: Asset): void {
   if (asset.isNative()) return;
-  if (ledger.getEntry(trustlineKey(holder, asset).toXDR('base64'))) return;
+  if (ledger.getEntry(trustlineKey(holder, asset).toXdr('base64'))) return;
   establishTrustline(ledger, holder, asset);
 }
 
@@ -313,7 +311,7 @@ function buildToken(ledger: Ledger, asset: Asset, issuer: Wallet): Token & { iss
   const read = (fn: string, args: xdr.ScVal[], sourceB64: string) => {
     const sim = ledger.simulate(invokeHostFn(address, fn, args), sourceB64);
     if (!sim.ok) throw new Error(`${fn} failed: ${sim.error}`);
-    return scValToNative(xdr.ScVal.fromXDR(sim.returnValueXdr!, 'base64'));
+    return scValToNative(xdr.ScVal.fromXdr(sim.returnValueXdr!, 'base64'));
   };
 
   return {
@@ -367,7 +365,7 @@ export function nativeToken(ledger: Ledger, deployer: Wallet): Omit<Token, 'mint
   const read = (fn: string, args: xdr.ScVal[]) => {
     const sim = ledger.simulate(invokeHostFn(address, fn, args), deployer.accountIdB64);
     if (!sim.ok) throw new Error(`${fn} failed: ${sim.error}`);
-    return scValToNative(xdr.ScVal.fromXDR(sim.returnValueXdr!, 'base64'));
+    return scValToNative(xdr.ScVal.fromXdr(sim.returnValueXdr!, 'base64'));
   };
 
   return {

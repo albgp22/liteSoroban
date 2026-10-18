@@ -28,7 +28,7 @@ describe('observability', () => {
       expect(r.ok).toBe(true);
       expect(r.diagnostics.length).toBeGreaterThan(0);
       const topics = r.diagnostics.flatMap((d) =>
-        d.event().body().v0().topics().map((t) => scValToNative(t)),
+        d.event.body.v0.topics.map((t) => scValToNative(t)),
       );
       expect(topics).toContain('fn_call');
       expect(topics).toContain('fn_return');
@@ -41,7 +41,7 @@ describe('observability', () => {
       expect(r.ok).toBe(false);
       expect(r.diagnostics.length).toBeGreaterThan(0);
       const topics = r.diagnostics.flatMap((d) =>
-        d.event().body().v0().topics().map((t) => {
+        d.event.body.v0.topics.map((t) => {
           try {
             return scValToNative(t);
           } catch {
@@ -57,7 +57,7 @@ describe('observability', () => {
       const r = c.tryInvoke('put_persistent', [sc.sym('k'), sc.u64(1n)]);
       for (const d of r.diagnostics) {
         expect(d).toBeInstanceOf(xdr.DiagnosticEvent);
-        expect(typeof d.inSuccessfulContractCall()).toBe('boolean');
+        expect(typeof d.inSuccessfulContractCall).toBe('boolean');
       }
     });
   });
@@ -123,7 +123,7 @@ describe('observability', () => {
       expect(after.length).toBeGreaterThan(before.length);
       expect(after.length).toBe(svm.entryCount);
       // Every key decodes.
-      for (const k of after) expect(() => xdr.LedgerKey.fromXDR(k, 'base64')).not.toThrow();
+      for (const k of after) expect(() => xdr.LedgerKey.fromXdr(k, 'base64')).not.toThrow();
     });
   });
 
@@ -138,13 +138,15 @@ describe('observability', () => {
       // Strip the footprint the simulation computed. This used to escape as a
       // JsError out of wasm, which no caller could observe as a failed
       // transaction — strictly worse than a wrong answer.
-      const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-      resources.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+      const resources = new xdr.SorobanResources({
+        ...xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+      });
 
       const sent = svm.ledger.send(
         hostFn,
         svm.payer.accountIdB64,
-        resources.toXDR('base64'),
+        resources.toXdr('base64'),
         sim.authXdr,
         [],
       );

@@ -8,8 +8,8 @@
  *
  * The heavy lifting is the SDK's own `authorizeEntry`, which builds the
  * `HashIDPreimage::SorobanAuthorization` preimage (network id, nonce,
- * signatureExpirationLedger, invocation) and hashes it. v16.2.0 accepts a signer
- * callback returning `{ signatureScVal }` (base/auth.js:40-42), which is the
+ * signatureExpirationLedger, invocation) and hashes it. v17.2.1 accepts a signer
+ * callback returning `{ signatureScVal }` (base/auth.js:59-67), which is the
  * escape hatch custom accounts need — the default path assumes a raw ed25519
  * signature over the payload and verifies it against the entry's address.
  */
@@ -40,16 +40,16 @@ export async function signAuthEntries(
   const validUntil = opts.validUntilLedgerSeq ?? ledger.ledgerSeq + 100;
   const signed: string[] = [];
   for (const b64 of authXdr) {
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(b64, 'base64');
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(b64, 'base64');
     const result = await authorizeEntry(
       entry,
-      async (_preimage: xdr.HashIdPreimage, payload: Buffer) => ({
-        signatureScVal: await opts.sign(payload),
+      async (_preimage: xdr.HashIdPreimage, payload: Uint8Array) => ({
+        signatureScVal: await opts.sign(Buffer.from(payload)),
       }),
       validUntil,
       ledger.networkPassphrase,
     );
-    signed.push(result.toXDR('base64'));
+    signed.push(result.toXdr('base64'));
   }
   return signed;
 }
@@ -89,7 +89,7 @@ export function ed25519SignerProof(signature: Buffer | Uint8Array): xdr.ScVal {
  */
 export function signatureProofs(entries: { key: xdr.ScVal; proof: xdr.ScVal }[]): xdr.ScVal {
   const sorted = [...entries].sort((a, b) =>
-    Buffer.compare(a.key.toXDR(), b.key.toXDR()),
+    Buffer.compare(a.key.toXdr(), b.key.toXdr()),
   );
   const map = xdr.ScVal.scvMap(
     sorted.map((e) => new xdr.ScMapEntry({ key: e.key, val: e.proof })),

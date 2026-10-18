@@ -31,12 +31,12 @@ const CONTRACT_DATA = new Uint8Array(
 );
 
 const topicsOf = (d: xdr.DiagnosticEvent): string[] =>
-  d.event().body().v0().topics().map((t: any) => {
+  d.event.body.v0.topics.map((t: any) => {
     try {
       const n = scValToNative(t);
-      return typeof n === 'string' ? n : t.switch().name;
+      return typeof n === 'string' ? n : t.type;
     } catch {
-      return t.switch().name;
+      return t.type;
     }
   });
 
@@ -111,10 +111,12 @@ describe('send: the top-level-host-error path', () => {
     const c = svm.deployContract(CONTRACT_DATA);
     const hostFn = invokeHostFn(c.address, 'put_persistent', [sc.sym('k'), sc.u64(1n)]);
     const sim = svm.ledger.simulate(hostFn, svm.payer.accountIdB64);
-    const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    res.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+    const res = new xdr.SorobanResources({
+      ...xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+      footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+    });
     const stripped = svm.ledger.send(
-      hostFn, svm.payer.accountIdB64, res.toXDR('base64'), sim.authXdr, [],
+      hostFn, svm.payer.accountIdB64, res.toXdr('base64'), sim.authXdr, [],
     );
     expect(stripped.ok).toBe(false);
     expect(stripped.diagnosticEventsXdr.length)
@@ -183,9 +185,9 @@ describe('stateHash: what it actually covers', () => {
 
     const keys = svm.allKeys();
     const instanceKey = keys.find((k) => {
-      const lk = xdr.LedgerKey.fromXDR(k, 'base64');
-      return lk.switch().name === 'contractData'
-        && lk.contractData().key().switch().name === 'scvLedgerKeyContractInstance';
+      const lk = xdr.LedgerKey.fromXdr(k, 'base64');
+      return lk.type === 'contractData'
+        && lk.contractData.key.type === 'scvLedgerKeyContractInstance';
     })!;
 
     const clone = (instanceTtl: number | undefined) => {
@@ -217,9 +219,9 @@ describe('stateHash: what it actually covers', () => {
     c.invoke('put_persistent', [sc.sym('k'), sc.u64(1n)]);
     const keys = svm.allKeys();
     const instanceKey = keys.find((k) => {
-      const lk = xdr.LedgerKey.fromXDR(k, 'base64');
-      return lk.switch().name === 'contractData'
-        && lk.contractData().key().switch().name === 'scvLedgerKeyContractInstance';
+      const lk = xdr.LedgerKey.fromXdr(k, 'base64');
+      return lk.type === 'contractData'
+        && lk.contractData.key.type === 'scvLedgerKeyContractInstance';
     })!;
     const clone = (instanceTtl: number | undefined) => {
       const l = new Ledger();
@@ -262,10 +264,10 @@ describe('verified against the host', () => {
     );
     expect(sent.ok).toBe(true);
 
-    const diags = sent.diagnosticEventsXdr.map((b) => xdr.DiagnosticEvent.fromXDR(b, 'base64'));
+    const diags = sent.diagnosticEventsXdr.map((b) => xdr.DiagnosticEvent.fromXdr(b, 'base64'));
     // extract_diagnostic_events pushes EVERY host event, contract events
     // included, in chronological order — same as core's TransactionMeta.
-    expect(diags.map((d) => d.event().type().name)).toEqual([
+    expect(diags.map((d) => d.event.type.name)).toEqual([
       'diagnostic', 'contract', 'diagnostic',
     ]);
     expect(topicsOf(diags[0])[0]).toBe('fn_call');
@@ -273,7 +275,7 @@ describe('verified against the host', () => {
     expect(topicsOf(diags[2])[0]).toBe('fn_return');
     // The contract event is ALSO in eventsXdr, exactly once.
     expect(sent.eventsXdr.length).toBe(1);
-    expect(diags.every((d) => d.inSuccessfulContractCall())).toBe(true);
+    expect(diags.every((d) => d.inSuccessfulContractCall)).toBe(true);
   });
 
   it('ttlChangedKeys reports a read-only TTL bump that changedKeys cannot show', () => {
@@ -281,9 +283,9 @@ describe('verified against the host', () => {
     const c = svm.deployContract(CONTRACT_DATA);
     c.invoke('put_persistent', [sc.sym('k'), sc.u64(1n)]);
     const dataKey = svm.allKeys().find((k) => {
-      const lk = xdr.LedgerKey.fromXDR(k, 'base64');
-      return lk.switch().name === 'contractData'
-        && lk.contractData().key().switch().name === 'scvSymbol';
+      const lk = xdr.LedgerKey.fromXdr(k, 'base64');
+      return lk.type === 'contractData'
+        && lk.contractData.key.type === 'scvSymbol';
     })!;
     const ttlBefore = svm.ledger.getEntryTtl(dataKey)!;
 

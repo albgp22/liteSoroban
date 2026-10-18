@@ -181,11 +181,11 @@ describe('LiteStellar', () => {
     };
 
     // Unsigned, thresholds raised: rejected by default.
-    expect(strict.sendTransaction((await build(strict)).toXDR()).code).toBe('txBAD_AUTH');
+    expect(strict.sendTransaction((await build(strict)).toXdr()).code).toBe('txBAD_AUTH');
 
     // Same envelope, sigverify off: accepted.
     strict.withSigverify(false);
-    expect(strict.sendTransaction((await build(strict)).toXDR()).ok).toBe(true);
+    expect(strict.sendTransaction((await build(strict)).toXdr()).ok).toBe(true);
   });
 
   it('the low-level Ledger is still reachable for plumbing tests', () => {

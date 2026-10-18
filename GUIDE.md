@@ -377,10 +377,10 @@ reports it from then on. Bounds a client writes from `latest` mean what they
 would on a network.
 
 `contract.Client` works the same way — pass `server` in `ClientOptions`; the
-constructor, `Client.from` and `Client.fromWasmHash` all honour it.
-`Client.deploy` is the one exception: it builds its own `RpcServer` at
-`client.js:36-38` and reaches the network. There is a test pinning that, so if
-upstream fixes the leak we find out.
+constructor, `Client.from`, `Client.fromWasmHash` and, since SDK 17.0.0,
+`Client.deploy` (`client.js:71`) all honour it. Through 16.2.0 `Client.deploy`
+built its own `RpcServer` and reached the network; `test/contract-client.test.ts`
+pins the fix.
 
 Fees are charged as stellar-core charges them: what leaves the account is the
 non-refundable resource fee, the rent and events the call consumed, and the base

@@ -59,24 +59,24 @@ const CONTRACT_DATA = fixture('contract_data.wasm');
 const E2E_ADD_I32 = fixture('e2e_add_i32.wasm');
 
 const topicsOf = (d: xdr.DiagnosticEvent): string[] =>
-  d.event().body().v0().topics().map((t: any) => {
-    switch (t.switch().name) {
-      case 'scvSymbol': return t.sym().toString();
-      case 'scvError': return `Error(${t.error().switch().name})`;
-      default: return t.switch().name;
+  d.event.body.v0.topics.map((t: any) => {
+    switch (t.type) {
+      case 'scvSymbol': return t.sym.toString();
+      case 'scvError': return `Error(${t.error.type})`;
+      default: return t.type;
     }
   });
 
 const firstTopic = (d: xdr.DiagnosticEvent) => topicsOf(d)[0];
 
 const keyLabel = (k: string): string => {
-  const lk = xdr.LedgerKey.fromXDR(k, 'base64');
-  if (lk.switch().name === 'contractData') {
-    const kk = lk.contractData().key();
-    const name = kk.switch().name === 'scvSymbol' ? kk.sym().toString() : kk.switch().name;
+  const lk = xdr.LedgerKey.fromXdr(k, 'base64');
+  if (lk.type === 'contractData') {
+    const kk = lk.contractData.key;
+    const name = kk.type === 'scvSymbol' ? kk.sym.toString() : kk.type;
     return `data:${name}`;
   }
-  return lk.switch().name;
+  return lk.type;
 };
 
 let svm: LiteStellar;
@@ -144,7 +144,7 @@ describe('enable_diagnostics is hardcoded true — does that cost budget?', () =
   it('no: the harness reproduces upstream numbers produced with diagnostics OFF', () => {
     const L = new Ledger({ ledgerSeq: 1_000_000 });
     L.setTimestamp(12_345_678); // default_ledger_info()
-    const source = xdr.AccountId.publicKeyTypeEd25519(Buffer.alloc(32, 123)).toXDR('base64');
+    const source = xdr.AccountId.publicKeyTypeEd25519(Buffer.alloc(32, 123)).toXdr('base64');
 
     const sim = L.simulate(uploadWasmHostFn(E2E_ADD_I32), source);
 
@@ -222,18 +222,18 @@ describe('changedKeys / removedKeys / ttlChangedKeys vs get_ledger_changes', () 
     // Recording mode puts a rent extension in the READ-ONLY footprint. Move it
     // to read-write, which any submitter may legitimately do (read-write is a
     // superset of the permission read-only grants) and which the host accepts.
-    const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    const ro = res.footprint().readOnly();
-    const i = ro.findIndex((k) => keyLabel(k.toXDR('base64')) === 'data:k');
-    const dataKey = ro[i].toXDR('base64');
-    res.footprint(new xdr.LedgerFootprint({
+    let res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
+    const ro = res.footprint.readOnly;
+    const i = ro.findIndex((k) => keyLabel(k.toXdr('base64')) === 'data:k');
+    const dataKey = ro[i].toXdr('base64');
+    res = new xdr.SorobanResources({ ...res, footprint: new xdr.LedgerFootprint({
       readOnly: ro.filter((_, j) => j !== i),
       readWrite: [ro[i]],
-    }));
+    }) });
 
     const ttlBefore = svm.ledger.getEntryTtl(dataKey)!;
     const sent = svm.ledger.send(
-      hostFn, svm.payer.accountIdB64, res.toXDR('base64'), sim.authXdr, [],
+      hostFn, svm.payer.accountIdB64, res.toXdr('base64'), sim.authXdr, [],
     );
     const ttlAfter = svm.ledger.getEntryTtl(dataKey)!;
 
@@ -255,18 +255,18 @@ describe('changedKeys / removedKeys / ttlChangedKeys vs get_ledger_changes', () 
       sc.sym('k'), sc.u32(300_000), sc.u32(600_000),
     ]);
     const sim = svm.ledger.simulate(hostFn, svm.payer.accountIdB64);
-    const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    const ro = res.footprint().readOnly();
-    const i = ro.findIndex((k) => keyLabel(k.toXDR('base64')) === 'data:k');
-    const dataKey = ro[i].toXDR('base64');
-    res.footprint(new xdr.LedgerFootprint({
+    let res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
+    const ro = res.footprint.readOnly;
+    const i = ro.findIndex((k) => keyLabel(k.toXdr('base64')) === 'data:k');
+    const dataKey = ro[i].toXdr('base64');
+    res = new xdr.SorobanResources({ ...res, footprint: new xdr.LedgerFootprint({
       readOnly: ro.filter((_, j) => j !== i),
       readWrite: [ro[i]],
-    }));
+    }) });
 
     const entryBefore = svm.ledger.getEntry(dataKey);
     const sent = svm.ledger.send(
-      hostFn, svm.payer.accountIdB64, res.toXDR('base64'), sim.authXdr, [],
+      hostFn, svm.payer.accountIdB64, res.toXdr('base64'), sim.authXdr, [],
     );
 
     expect(sent.ok).toBe(true);
@@ -309,7 +309,7 @@ describe('diagnostics vs a live protocol-27 node', () => {
     const sent = svm.ledger.send(badFn, svm.payer.accountIdB64, sim.resourcesXdr, sim.authXdr, []);
 
     expect(sent.ok).toBe(false);
-    const diags = sent.diagnosticEventsXdr.map((b) => xdr.DiagnosticEvent.fromXDR(b, 'base64'));
+    const diags = sent.diagnosticEventsXdr.map((b) => xdr.DiagnosticEvent.fromXdr(b, 'base64'));
 
     // The host's own four, in the node's order — this part is faithful.
     expect(diags.map(firstTopic)).toEqual(['fn_call', 'error', 'error', 'log']);
@@ -356,7 +356,7 @@ describe('diagnostics vs a live protocol-27 node', () => {
       return {
         sent,
         topics: sent.diagnosticEventsXdr
-          .map((b) => xdr.DiagnosticEvent.fromXDR(b, 'base64'))
+          .map((b) => xdr.DiagnosticEvent.fromXdr(b, 'base64'))
           .flatMap(topicsOf),
       };
     };
@@ -480,7 +480,7 @@ describe('stateHash: the "restore is exact" claim', () => {
     // The envelope that was valid a moment ago is now rejected.
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txTooLate');
+    expect(sent.errorResult!.result.type).toBe('txTooLate');
 
     // So: equal stateHash + equal ledgerSequence, different behaviour. A digest
     // that claims "equal hashes mean byte-identical state" must cover the

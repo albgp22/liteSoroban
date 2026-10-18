@@ -50,7 +50,7 @@ describe('the enforcing path has a module cache', () => {
     const sent = L.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
     expect(sent.ok, `deploy: ${sent.error}`).toBe(true);
     return {
-      addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(),
+      addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
       hash,
       deployRatio: ratio(sim, sent),
     };
@@ -157,7 +157,7 @@ describe('the enforcing path has a module cache', () => {
 
       const codeKey = xdr.LedgerKey.contractCode(
         new xdr.LedgerKeyContractCode({ hash: Buffer.from(hash, 'base64') }),
-      ).toXDR('base64');
+      ).toXdr('base64');
       expect(L.removeEntry(codeKey)).toBe(true);
 
       const sent = L.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
@@ -175,7 +175,7 @@ describe('the enforcing path has a module cache', () => {
 
       // Same bytes, same salt, same address: a redeploy must work and cost the same.
       const again = deploy(CONTRACT_DATA, 8);
-      expect(again.addr.toXDR('base64')).toBe(addr.toXDR('base64'));
+      expect(again.addr.toXdr('base64')).toBe(addr.toXdr('base64'));
       expect(again.deployRatio).toBeGreaterThan(0.97);
       expect(again.deployRatio).toBeLessThan(1.03);
       const { sent } = call(again.addr, 'put_persistent', [sym('k'), u64(2n)]);
@@ -195,18 +195,18 @@ describe('the enforcing path has a module cache', () => {
       const garbage = Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 0xff, 0xff]);
       const L2 = new Ledger();
       for (const key of L.allKeys()) {
-        let entry = xdr.LedgerEntry.fromXDR(L.getEntry(key)!, 'base64');
-        if (entry.data().switch().name === 'contractCode') {
-          const code = entry.data().contractCode();
+        let entry = xdr.LedgerEntry.fromXdr(L.getEntry(key)!, 'base64');
+        if (entry.data.type === 'contractCode') {
+          const code = entry.data.contractCode;
           entry = new xdr.LedgerEntry({
-            lastModifiedLedgerSeq: entry.lastModifiedLedgerSeq(),
+            lastModifiedLedgerSeq: entry.lastModifiedLedgerSeq,
             data: xdr.LedgerEntryData.contractCode(
-              new xdr.ContractCodeEntry({ ext: new xdr.ContractCodeEntryExt(0), hash: code.hash(), code: garbage }),
+              new xdr.ContractCodeEntry({ ext: xdr.ContractCodeEntryExt.v0(), hash: code.hash, code: garbage }),
             ),
-            ext: entry.ext(),
+            ext: entry.ext,
           });
         }
-        L2.putEntry(entry.toXDR('base64'), L.getEntryTtl(key));
+        L2.putEntry(entry.toXdr('base64'), L.getEntryTtl(key));
       }
 
       // The parse of these bytes is not in the declared count, which was recorded
@@ -235,9 +235,8 @@ describe('the declared instruction count is enforced by default', () => {
   });
 
   const withInstructions = (resourcesXdr: string, n: number) => {
-    const r = xdr.SorobanResources.fromXDR(resourcesXdr, 'base64');
-    r.instructions(n);
-    return r.toXDR('base64');
+    const r = xdr.SorobanResources.fromXdr(resourcesXdr, 'base64');
+    return new xdr.SorobanResources({ ...r, instructions: n }).toXdr('base64');
   };
 
   function deployData() {
@@ -247,7 +246,7 @@ describe('the declared instruction count is enforced by default', () => {
     expect(sent.ok, `deploy under the declared count: ${sent.error}`).toBe(true);
     return {
       sim, sent,
-      addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(),
+      addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
     };
   }
 

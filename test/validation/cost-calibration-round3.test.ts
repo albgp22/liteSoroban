@@ -176,7 +176,7 @@ async function build() {
     const h = L.seedWasm(code);
     const { sent } = L.simulateAndSend(createContractHostFn(SRC, h, Buffer.alloc(32, salt), ctor), SRC);
     expect(sent.ok, `deploy ${salt}: ${sent.error}`).toBe(true);
-    return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   };
 
   // a blob no ledger on either side has ever stored (valid 18-byte custom section)
@@ -201,7 +201,10 @@ async function build() {
   const c1 = deploy(INVOKE_CONTRACT, 43);
   const c2 = deploy(INVOKE_CONTRACT, 44);
   const [caller, callee] =
-    Buffer.compare(Buffer.from(c1.contractId()), Buffer.from(c2.contractId())) < 0
+    Buffer.compare(
+      Buffer.from(xdr.expectUnionVariant(c1, 'scAddressTypeContract').contractId.toBytes()),
+      Buffer.from(xdr.expectUnionVariant(c2, 'scAddressTypeContract').contractId.toBytes()),
+    ) < 0
       ? [c2, c1] : [c1, c2];
   both('crossContract', invokeHostFn(caller, 'add_with', [i32(3), i32(4), A(callee)]));
 
@@ -311,17 +314,17 @@ describe('GREEN: the preflight claim, verified beyond the four tuned scenarios',
     expect(live.cpuLimit).toBe(NODE_CPU_LIMIT);
     expect(live.memLimit).toBe(NODE_MEM_LIMIT);
 
-    const dec = (b: string) => xdr.ContractCostParams.fromXDR(Buffer.from(b, 'base64'));
+    const dec = (b: string) => xdr.decodeArray(xdr.ContractCostParamEntry, Buffer.from(b, 'base64'));
     for (const [name, a, b] of [
       ['cpu', dec(live.cpuInstructions), dec(PROTOCOL_27_COST_PARAMS.cpuInstructions)],
       ['mem', dec(live.memoryBytes), dec(PROTOCOL_27_COST_PARAMS.memoryBytes)],
     ] as const) {
       expect((a as any).length, `${name} entry count`).toBe(86);
       for (let i = 0; i < (a as any).length; i++) {
-        expect((a as any)[i].constTerm().toString(), `${name}[${i}] const`)
-          .toBe((b as any)[i].constTerm().toString());
-        expect((a as any)[i].linearTerm().toString(), `${name}[${i}] linear`)
-          .toBe((b as any)[i].linearTerm().toString());
+        expect((a as any)[i].constTerm.toString(), `${name}[${i}] const`)
+          .toBe((b as any)[i].constTerm.toString());
+        expect((a as any)[i].linearTerm.toString(), `${name}[${i}] linear`)
+          .toBe((b as any)[i].linearTerm.toString());
       }
     }
   });
@@ -435,7 +438,7 @@ describe('RED 3 (fixed): the RPC facade honours instructionLeeway', () => {
     const seen: Record<string, number> = {};
     for (const leeway of [0, 100_000, 1_000_000, 20_000_000]) {
       const sim: any = await S.simulateTransaction(tx(), { cpuInstructions: leeway });
-      seen[leeway] = sim.transactionData.build().resources().instructions();
+      seen[leeway] = sim.transactionData.build().resources.instructions;
     }
     console.log('\n  harness leeway ->', JSON.stringify(seen));
     console.log('  node    leeway -> {"0":325616,"100000":375616,"1000000":1275616,"20000000":20275616}');

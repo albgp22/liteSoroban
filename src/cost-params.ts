@@ -59,14 +59,9 @@ function configSettingKey(id: xdr.ConfigSettingId): xdr.LedgerKey {
   return xdr.LedgerKey.configSetting(new xdr.LedgerKeyConfigSetting({ configSettingId: id }));
 }
 
-/**
- * js-xdr cannot serialise the `ContractCostParams` typedef on its own
- * ("value is not array"), so wrap it back into its `ConfigSettingEntry` arm and
- * drop the 4-byte union discriminant.
- */
-function encodeParams(arm: string, params: unknown): string {
-  const entry = (xdr.ConfigSettingEntry as any)[arm](params) as xdr.ConfigSettingEntry;
-  return Buffer.from(entry.toXDR().subarray(4)).toString('base64');
+/** The `ContractCostParams` typedef: a length-prefixed `ContractCostParamEntry` array. */
+function encodeParams(params: readonly xdr.ContractCostParamEntry[]): string {
+  return xdr.encodeArray(xdr.ContractCostParamEntry, params, 'base64');
 }
 
 /**
@@ -74,14 +69,10 @@ function encodeParams(arm: string, params: unknown): string {
  * local quickstart — whichever network the numbers need to match.
  */
 export async function loadCostParamsFromRpc(server: rpc.Server): Promise<CostParams> {
-  const CPU = 'configSettingContractCostParamsCpuInstructions';
-  const MEM = 'configSettingContractCostParamsMemoryBytes';
-  const COMPUTE = 'configSettingContractComputeV0';
-
   const res = await server.getLedgerEntries(
-    configSettingKey(xdr.ConfigSettingId.configSettingContractCostParamsCpuInstructions()),
-    configSettingKey(xdr.ConfigSettingId.configSettingContractCostParamsMemoryBytes()),
-    configSettingKey(xdr.ConfigSettingId.configSettingContractComputeV0()),
+    configSettingKey(xdr.ConfigSettingId.configSettingContractCostParamsCpuInstructions),
+    configSettingKey(xdr.ConfigSettingId.configSettingContractCostParamsMemoryBytes),
+    configSettingKey(xdr.ConfigSettingId.configSettingContractComputeV0),
   );
 
   let cpuInstructions: string | undefined;
@@ -90,14 +81,14 @@ export async function loadCostParamsFromRpc(server: rpc.Server): Promise<CostPar
   let memLimit: bigint | undefined;
 
   for (const e of res.entries) {
-    const cs = e.val.configSetting();
-    const arm = cs.switch().name;
-    if (arm === CPU) cpuInstructions = encodeParams(CPU, cs.value());
-    else if (arm === MEM) memoryBytes = encodeParams(MEM, cs.value());
-    else if (arm === COMPUTE) {
-      const c: any = cs.value();
-      cpuLimit = BigInt(c.txMaxInstructions().toString());
-      memLimit = BigInt(c.txMemoryLimit().toString());
+    const cs = xdr.expectUnionVariant(e.val, 'configSetting').configSetting;
+    if (cs.type === 'configSettingContractCostParamsCpuInstructions') {
+      cpuInstructions = encodeParams(cs.contractCostParamsCpuInsns);
+    } else if (cs.type === 'configSettingContractCostParamsMemoryBytes') {
+      memoryBytes = encodeParams(cs.contractCostParamsMemBytes);
+    } else if (cs.type === 'configSettingContractComputeV0') {
+      cpuLimit = cs.contractCompute.txMaxInstructions;
+      memLimit = BigInt(cs.contractCompute.txMemoryLimit);
     }
   }
 

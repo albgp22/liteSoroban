@@ -21,7 +21,7 @@ const CODE = new Uint8Array(
 );
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 
 function build(account: any, func: xdr.HostFunction, fee = '1000') {
   return new TransactionBuilder(account, { fee, networkPassphrase: Networks.TESTNET })
@@ -47,7 +47,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     // Deploy once, out of band, through the raw ledger API.
     const wasmHash = L.seedWasm(CODE);
     const { sent } = L.simulateAndSend(createContractHostFn(accB64(kp.publicKey()), wasmHash), accB64(kp.publicKey()));
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   });
 
   it('runs the full submit-then-poll cycle through rpc.Server', async () => {
@@ -68,13 +68,13 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     // The value really landed in the ledger.
     const read = L.simulate(invokeHostFn(addr, 'get_persistent', [sym('ctr')]), accB64(kp.publicKey()));
-    expect(scValToNative(xdr.ScVal.fromXDR(read.returnValueXdr!, 'base64'))).toBe(42n);
+    expect(scValToNative(xdr.ScVal.fromXdr(read.returnValueXdr!, 'base64'))).toBe(42n);
   });
 
   it('consumes the sequence number and charges what core charges, not the bid', async () => {
     const before = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
-    expect(before.seqNum().toString()).toBe('0');
-    const balanceBefore = BigInt(before.balance().toString());
+    expect(before.seqNum.toString()).toBe('0');
+    const balanceBefore = BigInt(before.balance.toString());
 
     const account = await server.getAccount(kp.publicKey());
     const tx = build(account, invokeHostFn(addr, 'put_persistent', [sym('a'), u64(1n)]));
@@ -84,20 +84,20 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const got = (await server.pollTransaction(sent.hash)) as rpc.Api.GetSuccessfulTransactionResponse;
 
     const after = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
-    expect(after.seqNum().toString()).toBe('1');
-    const debited = balanceBefore - BigInt(after.balance().toString());
+    expect(after.seqNum.toString()).toBe('1');
+    const debited = balanceBefore - BigInt(after.balance.toString());
     // What leaves the account is what the result reports: the non-refundable
     // resource fee, the rent and events fee the call consumed, and the
     // 1000-stroop inclusion bid capped at the 100-stroop base fee. The rest of
     // the declared resource fee comes back.
-    expect(debited).toBe(BigInt(got.resultXdr.feeCharged().toString()));
-    const fee = got.resultMetaXdr.v4().sorobanMeta()!.ext().v1();
+    expect(debited).toBe(BigInt(got.resultXdr.feeCharged.toString()));
+    const fee = xdr.expectUnionVariant(xdr.expectUnionVariant(got.resultMetaXdr, 'v4').v4.sorobanMeta!.ext, 'v1').v1;
     expect(debited).toBe(
-      BigInt(fee.totalNonRefundableResourceFeeCharged().toString()) +
-        BigInt(fee.totalRefundableResourceFeeCharged().toString()) +
+      BigInt(fee.totalNonRefundableResourceFeeCharged.toString()) +
+        BigInt(fee.totalRefundableResourceFeeCharged.toString()) +
         100n,
     );
-    expect(BigInt(fee.rentFeeCharged().toString())).toBeGreaterThan(0n);
+    expect(BigInt(fee.rentFeeCharged.toString())).toBeGreaterThan(0n);
     expect(debited).toBeLessThan(BigInt(assembled.fee) - 900n);
   });
 
@@ -113,8 +113,8 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     // Same envelope again: the sequence number is already consumed.
     const replay = await server.sendTransaction(assembled);
     expect(replay.status).toBe('ERROR');
-    const err = xdr.TransactionResult.fromXDR(replay.errorResult!.toXDR());
-    expect(err.result().switch().name).toBe('txBadSeq');
+    const err = xdr.TransactionResult.fromXdr(replay.errorResult!.toXdr());
+    expect(err.result.type).toBe('txBadSeq');
   });
 
   // A freshly created account has thresholds [1,0,0,0], so getNeededThreshold
@@ -126,7 +126,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
   // valid signer suffices". Core pins it in
   // TxEnvelopeTests.cpp SECTION("no signature").
   it('an unsigned transaction is rejected even when the medium threshold is 0', async () => {
-    expect(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.thresholds()[2]).toBe(0);
+    expect(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.thresholds.toBytes()[2]).toBe(0);
 
     const account = await server.getAccount(kp.publicKey());
     const tx = build(account, invokeHostFn(addr, 'put_persistent', [sym('a'), u64(1n)]));
@@ -134,7 +134,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     // deliberately not signed
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txBadAuth');
+    expect(sent.errorResult!.result.type).toBe('txBadAuth');
   });
 
   it('rejects an unsigned transaction with txBAD_AUTH once thresholds are raised', async () => {
@@ -148,7 +148,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txBadAuth');
+    expect(sent.errorResult!.result.type).toBe('txBadAuth');
   });
 
   it('rejects a signature from the wrong key', async () => {
@@ -162,7 +162,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txBadAuth');
+    expect(sent.errorResult!.result.type).toBe('txBadAuth');
   });
 
   it('honours multisig weights against the medium threshold', async () => {
@@ -188,12 +188,12 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const before = loadAccount(L, accountIdFromPublicKey(multi.publicKey()))!;
     const under = await server.sendTransaction(assembled);
     expect(under.status).toBe('ERROR');
-    const result = under.errorResult!.result();
-    expect(result.switch().name).toBe('txFailed');
-    expect(result.results()[0].switch().name).toBe('opBadAuth');
+    const result = under.errorResult!.result;
+    expect(result.type).toBe('txFailed');
+    expect(xdr.expectUnionVariant(result, 'txFailed').results[0].type).toBe('opBadAuth');
     const after = loadAccount(L, accountIdFromPublicKey(multi.publicKey()))!;
-    expect(after.seqNum().toString()).toBe(before.seqNum().toString());
-    expect(after.balance().toString()).toBe(before.balance().toString());
+    expect(after.seqNum.toString()).toBe(before.seqNum.toString());
+    expect(after.balance.toString()).toBe(before.balance.toString());
 
     const account2 = await server.getAccount(multi.publicKey());
     const tx2 = build(account2, invokeHostFn(addr, 'put_persistent', [sym('m'), u64(9n)]));
@@ -216,7 +216,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txTooLate');
+    expect(sent.errorResult!.result.type).toBe('txTooLate');
   });
 
   it('rejects a memo on a Soroban transaction (P25+)', async () => {
@@ -238,7 +238,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txSorobanInvalid');
+    expect(sent.errorResult!.result.type).toBe('txSorobanInvalid');
   });
 
   // REGRESSION (round 2). stellar-core authenticates BOTH the transaction source
@@ -270,16 +270,16 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
     assembled.sign(operator); // ONLY the operation source signs
 
-    const balBefore = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance().toString();
+    const balBefore = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance.toString();
 
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txBadAuth');
+    expect(sent.errorResult!.result.type).toBe('txBadAuth');
 
     // ...and nothing was taken from the account that never signed.
     const after = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!;
-    expect(after.balance().toString()).toBe(balBefore);
-    expect(after.seqNum().toString()).toBe('0');
+    expect(after.balance.toString()).toBe(balBefore);
+    expect(after.seqNum.toString()).toBe('0');
   });
 
   it('an operation source that DOES sign, alongside the tx source, succeeds', async () => {
@@ -325,8 +325,8 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     );
     bump.sign(sponsor);
 
-    const sponsorBefore = BigInt(loadAccount(L, accountIdFromPublicKey(sponsor.publicKey()))!.balance().toString());
-    const senderBefore = BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance().toString());
+    const sponsorBefore = BigInt(loadAccount(L, accountIdFromPublicKey(sponsor.publicKey()))!.balance.toString());
+    const senderBefore = BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance.toString());
 
     const sent = await server.sendTransaction(bump);
     expect(sent.status).toBe('PENDING');
@@ -334,12 +334,12 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     expect(got.status).toBe('SUCCESS');
 
     // The sponsor paid; the sender did not.
-    const sponsorAfter = BigInt(loadAccount(L, accountIdFromPublicKey(sponsor.publicKey()))!.balance().toString());
-    const senderAfter = BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance().toString());
+    const sponsorAfter = BigInt(loadAccount(L, accountIdFromPublicKey(sponsor.publicKey()))!.balance.toString());
+    const senderAfter = BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance.toString());
     expect(sponsorAfter).toBeLessThan(sponsorBefore);
     expect(senderAfter).toBe(senderBefore);
     // ...and the inner transaction still consumed the sender's sequence number.
-    expect(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum().toString()).toBe('1');
+    expect(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum.toString()).toBe('1');
   });
 
   it('CHANNEL ACCOUNTS: N sources submit concurrently without seqnum contention', async () => {
@@ -365,11 +365,11 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
 
     // Every channel advanced exactly once, and every write landed.
     for (const c of channels) {
-      expect(loadAccount(L, accountIdFromPublicKey(c.publicKey()))!.seqNum().toString()).toBe('1');
+      expect(loadAccount(L, accountIdFromPublicKey(c.publicKey()))!.seqNum.toString()).toBe('1');
     }
     for (let i = 0; i < N; i++) {
       const read = L.simulate(invokeHostFn(addr, 'get_persistent', [sym(`k${i}`)]), accB64(kp.publicKey()));
-      expect(scValToNative(xdr.ScVal.fromXDR(read.returnValueXdr!, 'base64'))).toBe(BigInt(i));
+      expect(scValToNative(xdr.ScVal.fromXdr(read.returnValueXdr!, 'base64'))).toBe(BigInt(i));
     }
   });
 });

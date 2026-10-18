@@ -15,30 +15,30 @@ const f = (n) => new URL(`./fixtures/${n}`, import.meta.url);
 const SMART = new Uint8Array(readFileSync(f('smart_account.wasm')));
 const TOY = new Uint8Array(readFileSync(f('contract_data.wasm')));
 
-const sv = (b64) => xdr.ScVal.fromXDR(b64, 'base64');
+const sv = (b64) => xdr.ScVal.fromXdr(b64, 'base64');
 const sym = (s) => nativeToScVal(s, { type: 'symbol' });
 
 function uploadFn(code) {
-  return xdr.HostFunction.hostFunctionTypeUploadContractWasm(Buffer.from(code)).toXDR('base64');
+  return xdr.HostFunction.hostFunctionTypeUploadContractWasm(Buffer.from(code)).toXdr('base64');
 }
 function createFn(deployerB64, hashB64, args = [], salt = Buffer.alloc(32)) {
   return xdr.HostFunction.hostFunctionTypeCreateContractV2(
     new xdr.CreateContractArgsV2({
       contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
         new xdr.ContractIdPreimageFromAddress({
-          address: xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXDR(deployerB64, 'base64')),
+          address: xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXdr(deployerB64, 'base64')),
           salt,
         }),
       ),
       executable: xdr.ContractExecutable.contractExecutableWasm(Buffer.from(hashB64, 'base64')),
       constructorArgs: args,
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 function invokeFn(addr, fn, args = []) {
   return xdr.HostFunction.hostFunctionTypeInvokeContract(
     new xdr.InvokeContractArgs({ contractAddress: addr, functionName: fn, args }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 /** Signer::Ed25519(Ed25519Signer { public_key }, SignerRole::Admin) */
@@ -102,12 +102,12 @@ function deploySmart() {
     env, src,
     createFn(src, hash, [xdr.ScVal.scvVec([adminSigner(rawPk)]), xdr.ScVal.scvVec([])]),
   );
-  return { env, src, addr: sv(sent.returnValueXdr).address() };
+  return { env, src, addr: sv(sent.returnValueXdr).address };
 }
 time('deploy smart account + run __constructor', 50, () => deploySmart());
 
 const { env, src, addr } = deploySmart();
-console.log(`  deployed OK -> ${addr.switch().name}`);
+console.log(`  deployed OK -> ${addr.type}`);
 
 // ---- invoke ---------------------------------------------------------------
 console.log('\nINVOKE (real contract methods)');
@@ -130,8 +130,8 @@ const addSim = env.simulate(addFn, src);
 console.log(`  add_signer simulate (records auth, does NOT run __check_auth) -> ok=${addSim.ok}`);
 console.log(`  recorded auth entries: ${addSim.authXdr.length}`);
 if (addSim.authXdr.length) {
-  const cred = xdr.SorobanAuthorizationEntry.fromXDR(addSim.authXdr[0], 'base64').credentials();
-  console.log(`  credential type: ${cred.switch().name}`);
+  const cred = xdr.SorobanAuthorizationEntry.fromXdr(addSim.authXdr[0], 'base64').credentials;
+  console.log(`  credential type: ${cred.type}`);
 }
 time('simulate add_signer() (auth recording)', 100, () => env.simulate(addFn, src));
 

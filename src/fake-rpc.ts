@@ -30,7 +30,7 @@ export interface AdapterStats {
   networkAttempts: number;
 }
 
-/** Our result codes -> the XDR union arm names (all confirmed present in v16.2.0). */
+/** Our result codes -> the XDR union arm names (all confirmed present in v17.2.1). */
 const CODE_ARM: Record<TxResultCode, string> = {
   txSUCCESS: 'txSuccess',
   txFAILED: 'txFailed',
@@ -90,7 +90,7 @@ function operationResults(outcome: TxOutcome): xdr.OperationResult[] {
 }
 
 /** `innerHash`: for a fee bump, the InnerTransactionResultPair names the INNER tx. */
-function transactionResult(outcome: TxOutcome, innerHash: Buffer): xdr.TransactionResult {
+function transactionResult(outcome: TxOutcome, innerHash: Uint8Array): xdr.TransactionResult {
   const arm = CODE_ARM[outcome.code];
   const R: any = xdr.TransactionResultResult;
 
@@ -109,9 +109,9 @@ function transactionResult(outcome: TxOutcome, innerHash: Buffer): xdr.Transacti
       new xdr.InnerTransactionResultPair({
         transactionHash: innerHash,
         result: new xdr.InnerTransactionResult({
-          feeCharged: new xdr.Int64(0n),
+          feeCharged: 0n,
           result: innerResult,
-          ext: new xdr.InnerTransactionResultExt(0),
+          ext: xdr.InnerTransactionResultExt.v0(),
         }),
       }),
     );
@@ -120,16 +120,16 @@ function transactionResult(outcome: TxOutcome, innerHash: Buffer): xdr.Transacti
   }
 
   return new xdr.TransactionResult({
-    feeCharged: new xdr.Int64(outcome.feeCharged),
+    feeCharged: outcome.feeCharged,
     result,
-    ext: new xdr.TransactionResultExt(0),
+    ext: xdr.TransactionResultExt.v0(),
   });
 }
 
 /** TransactionMetaV4 carrying the return value, which is what the SDK reads. */
 function transactionMeta(outcome: TxOutcome): xdr.TransactionMeta {
   const returnValue = outcome.returnValueXdr
-    ? xdr.ScVal.fromXDR(outcome.returnValueXdr, 'base64')
+    ? xdr.ScVal.fromXdr(outcome.returnValueXdr, 'base64')
     : xdr.ScVal.scvVoid();
   // Core's fee breakdown (TransactionMetaBuilder::setNonRefundableResourceFee
   // and maybeSetRefundableFeeMeta), which is where an app reads what the
@@ -137,22 +137,20 @@ function transactionMeta(outcome: TxOutcome): xdr.TransactionMeta {
   const fee = outcome.sorobanFee;
   const sorobanMeta = new xdr.SorobanTransactionMetaV2({
     ext: fee
-      ? new xdr.SorobanTransactionMetaExt(
-          1,
+      ? xdr.SorobanTransactionMetaExt.v1(
           new xdr.SorobanTransactionMetaExtV1({
-            ext: new xdr.ExtensionPoint(0),
-            totalNonRefundableResourceFeeCharged: new xdr.Int64(fee.nonRefundable),
-            totalRefundableResourceFeeCharged: new xdr.Int64(fee.refundable),
-            rentFeeCharged: new xdr.Int64(fee.rent),
+            ext: xdr.ExtensionPoint.v0(),
+            totalNonRefundableResourceFeeCharged: fee.nonRefundable,
+            totalRefundableResourceFeeCharged: fee.refundable,
+            rentFeeCharged: fee.rent,
           }),
         )
-      : new xdr.SorobanTransactionMetaExt(0),
+      : xdr.SorobanTransactionMetaExt.v0(),
     returnValue,
   });
-  return new xdr.TransactionMeta(
-    4,
+  return xdr.TransactionMeta.v4(
     new xdr.TransactionMetaV4({
-      ext: new xdr.ExtensionPoint(0),
+      ext: xdr.ExtensionPoint.v0(),
       txChangesBefore: [],
       operations: [],
       txChangesAfter: [],
@@ -175,40 +173,39 @@ function ledgerHeaderXdr(seq: number, closeTime: number): string {
     previousLedgerHash: zero32,
     scpValue: new xdr.StellarValue({
       txSetHash: zero32,
-      closeTime: new xdr.TimePoint(xdr.Uint64.fromString(String(closeTime))),
+      closeTime: BigInt(closeTime),
       upgrades: [],
-      ext: new xdr.StellarValueExt(xdr.StellarValueType.stellarValueBasic()),
+      ext: xdr.StellarValueExt.stellarValueBasic(),
     }),
     txSetResultHash: zero32,
     bucketListHash: zero32,
     ledgerSeq: seq,
-    totalCoins: new xdr.Int64(0n),
-    feePool: new xdr.Int64(0n),
+    totalCoins: 0n,
+    feePool: 0n,
     inflationSeq: 0,
-    idPool: new xdr.Uint64(0n),
+    idPool: 0n,
     baseFee: 100,
     baseReserve: 5_000_000,
     maxTxSetSize: 1000,
     skipList: [zero32, zero32, zero32, zero32],
-    ext: new xdr.LedgerHeaderExt(0),
-  }).toXDR('base64');
+    ext: xdr.LedgerHeaderExt.v0(),
+  }).toXdr('base64');
 }
 
 function ledgerCloseMetaXdr(seq: number, closeTime: number): string {
-  return new xdr.LedgerCloseMeta(
-    0,
+  return xdr.LedgerCloseMeta.v0(
     new xdr.LedgerCloseMetaV0({
       ledgerHeader: new xdr.LedgerHeaderHistoryEntry({
         hash: Buffer.alloc(32),
-        header: xdr.LedgerHeader.fromXDR(ledgerHeaderXdr(seq, closeTime), 'base64'),
-        ext: new xdr.LedgerHeaderHistoryEntryExt(0),
+        header: xdr.LedgerHeader.fromXdr(ledgerHeaderXdr(seq, closeTime), 'base64'),
+        ext: xdr.LedgerHeaderHistoryEntryExt.v0(),
       }),
-      txSet: new xdr.TransactionSet({ previousLedgerHash: Buffer.alloc(32), txes: [] }),
+      txSet: new xdr.TransactionSet({ previousLedgerHash: Buffer.alloc(32), txs: [] }),
       txProcessing: [],
       upgradesProcessing: [],
       scpInfo: [],
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function rawTransaction(tx: SubmittedTx, latestLedger: number) {
@@ -235,9 +232,9 @@ function rawTransaction(tx: SubmittedTx, latestLedger: number) {
 function ledgerHeaderHistoryEntryXdr(seq: number, closeTime: number): string {
   return new xdr.LedgerHeaderHistoryEntry({
     hash: Buffer.alloc(32),
-    header: xdr.LedgerHeader.fromXDR(ledgerHeaderXdr(seq, closeTime), 'base64'),
-    ext: new xdr.LedgerHeaderHistoryEntryExt(0),
-  }).toXDR('base64');
+    header: xdr.LedgerHeader.fromXdr(ledgerHeaderXdr(seq, closeTime), 'base64'),
+    ext: xdr.LedgerHeaderHistoryEntryExt.v0(),
+  }).toXdr('base64');
 }
 
 /** One buffered contract event, in the shape getEvents returns. */
@@ -269,7 +266,9 @@ interface SubmittedTx {
 
 function accountLedgerKey(accountId: string): xdr.LedgerKey {
   return xdr.LedgerKey.account(
-    new xdr.LedgerKeyAccount({ accountId: Address.fromString(accountId).toScAddress().accountId() }),
+    new xdr.LedgerKeyAccount({
+      accountId: xdr.expectUnionVariant(Address.fromString(accountId).toScAddress(), 'scAddressTypeAccount').accountId,
+    }),
   );
 }
 
@@ -325,7 +324,7 @@ export function attachInProcessRpc(
         new xdr.LedgerKeyAccount({
           accountId: xdr.AccountId.publicKeyTypeEd25519(StrKey.decodeEd25519PublicKey(addr)),
         }),
-      ).toXDR('base64');
+      ).toXdr('base64');
 
       // Friendbot creates NEW accounts and refuses an existing one. Observed
       // live: HTTP 400, "account already funded to starting balance". Funding
@@ -345,19 +344,18 @@ export function attachInProcessRpc(
       // (findCreatedAccountSequenceInTransactionMeta), so the meta has to carry
       // a ledgerEntryCreated change for the AccountEntry — funding alone is not
       // enough to make requestAirdrop work.
-      const created = xdr.LedgerEntry.fromXDR(ledger.getEntry(accountKey)!, 'base64');
+      const created = xdr.LedgerEntry.fromXdr(ledger.getEntry(accountKey)!, 'base64');
 
       return {
         data: {
           hash: '0'.repeat(64),
-          result_meta_xdr: new xdr.TransactionMeta(
-            4,
+          result_meta_xdr: xdr.TransactionMeta.v4(
             new xdr.TransactionMetaV4({
-              ext: new xdr.ExtensionPoint(0),
+              ext: xdr.ExtensionPoint.v0(),
               txChangesBefore: [],
               operations: [
                 new xdr.OperationMetaV2({
-                  ext: new xdr.ExtensionPoint(0),
+                  ext: xdr.ExtensionPoint.v0(),
                   changes: [xdr.LedgerEntryChange.ledgerEntryCreated(created)],
                   events: [],
                 }),
@@ -367,7 +365,7 @@ export function attachInProcessRpc(
               events: [],
               diagnosticEvents: [],
             }),
-          ).toXDR('base64'),
+          ).toXdr('base64'),
         },
         status: 200,
         statusText: 'OK',
@@ -529,11 +527,11 @@ export function attachInProcessRpc(
             if (!entryXdr) return null;
             // The RPC wire format carries LedgerEntryData (the inner union),
             // NOT the full LedgerEntry -- see the SDK's parseRawLedgerEntries,
-            // which does xdr.LedgerEntryData.fromXDR(rawEntry.xdr).
-            const data = xdr.LedgerEntry.fromXDR(entryXdr, 'base64').data();
+            // which does xdr.LedgerEntryData.fromXdr(rawEntry.xdr).
+            const data = xdr.LedgerEntry.fromXdr(entryXdr, 'base64').data;
             return {
               key: k,
-              xdr: data.toXDR('base64'),
+              xdr: data.toXdr('base64'),
               // Not tracked per entry; the latest ledger at least never
               // names one that has not closed.
               lastModifiedLedgerSeq: lastClosed(),
@@ -545,51 +543,49 @@ export function attachInProcessRpc(
       }
 
       case 'simulateTransaction': {
-        const env = xdr.TransactionEnvelope.fromXDR(params.transaction, 'base64');
-        const tx = env.v1().tx();
-        const op = tx.operations()[0];
+        const env = xdr.TransactionEnvelope.fromXdr(params.transaction, 'base64');
+        const tx = xdr.expectUnionVariant(env, 'envelopeTypeTx').v1.tx;
+        const body = tx.operations[0].body;
 
         // ExtendFootprintTTL / RestoreFootprint: soroban-simulation's
         // simulate_extend_ttl_op / simulate_restore_op over the transaction's
         // own footprint, read-only and read-write respectively (stellar-rpc
         // lib/preflight/src/shared.rs).
-        const opName = op.body().switch().name;
-        if (opName === 'extendFootprintTtl' || opName === 'restoreFootprint') {
-          const fp = tx.ext().switch() === 1 ? tx.ext().sorobanData().resources().footprint() : null;
-          const keys = (fp ? (opName === 'extendFootprintTtl' ? fp.readOnly() : fp.readWrite()) : []).map(
-            (k) => k.toXDR('base64'),
+        if (body.type === 'extendFootprintTtl' || body.type === 'restoreFootprint') {
+          const fp = tx.ext.type === 'sorobanData' ? tx.ext.sorobanData.resources.footprint : null;
+          const keys = (fp ? (body.type === 'extendFootprintTtl' ? fp.readOnly : fp.readWrite) : []).map(
+            (k) => k.toXdr('base64'),
           );
           const footprintSim =
-            opName === 'extendFootprintTtl'
-              ? ledger.simulateExtendTtl(keys, op.body().extendFootprintTtlOp().extendTo(), lastClosed())
+            body.type === 'extendFootprintTtl'
+              ? ledger.simulateExtendTtl(keys, body.extendFootprintTtlOp.extendTo, lastClosed())
               : ledger.simulateRestore(keys, lastClosed());
           if (!footprintSim.ok) return ok({ error: footprintSim.error, latestLedger: lastClosed() });
-          const resources = xdr.SorobanResources.fromXDR(footprintSim.resourcesXdr!, 'base64');
+          const resources = xdr.SorobanResources.fromXdr(footprintSim.resourcesXdr!, 'base64');
           const fee = String(footprintSim.minResourceFee);
           const txData = new xdr.SorobanTransactionData({
-            ext: new (xdr as any).SorobanTransactionDataExt(0),
+            ext: xdr.SorobanTransactionDataExt.v0(),
             resources,
-            resourceFee: (xdr as any).Int64.fromString(fee),
+            resourceFee: xdr.Int64.fromString(fee),
           });
           return ok({
             latestLedger: lastClosed(),
             minResourceFee: fee,
-            transactionData: txData.toXDR('base64'),
+            transactionData: txData.toXdr('base64'),
           });
         }
 
-        const hostFn = op.body().invokeHostFunctionOp().hostFunction();
+        const invokeOp = xdr.expectUnionVariant(body, 'invokeHostFunction').invokeHostFunctionOp;
+        const hostFn = invokeOp.hostFunction;
 
-        const muxed: any = tx.sourceAccount();
-        const ed: Buffer = muxed.switch().name === 'keyTypeMuxedEd25519'
-          ? muxed.med25519().ed25519()
-          : muxed.ed25519();
+        const muxed = tx.sourceAccount;
+        const ed = muxed.type === 'keyTypeMuxedEd25519' ? muxed.med25519.ed25519 : muxed.ed25519;
         const sourceAccountId = xdr.AccountId.publicKeyTypeEd25519(ed);
 
         // The envelope's auth entries are the whole point of a re-simulation:
         // ignoring them means an INVALID signature simulates green, because
         // plain recording mode never runs __check_auth. Honour them when present.
-        const suppliedAuth = op.body().invokeHostFunctionOp().auth();
+        const suppliedAuth = invokeOp.auth;
 
         // resourceConfig.instructionLeeway (the SDK's `cpuInstructions`) raises
         // the +50_000 instruction padding to max(50_000, leeway). stellar-rpc
@@ -613,44 +609,44 @@ export function attachInProcessRpc(
           suppliedAuth.length > 0
             ? ledger.simulateWithAuth(
                 hostFn,
-                sourceAccountId.toXDR('base64'),
-                suppliedAuth.map((a) => a.toXDR('base64')),
+                sourceAccountId.toXdr('base64'),
+                suppliedAuth.map((a) => a.toXdr('base64')),
                 leeway,
                 lastClosed(),
               )
-            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'), leeway, lastClosed());
+            : ledger.simulate(hostFn, sourceAccountId.toXdr('base64'), leeway, lastClosed());
         if (!sim.ok) {
           return ok({ error: sim.error, latestLedger: lastClosed() });
         }
 
-        const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+        const resources = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
         // soroban-simulation's own fee for these resources, priced with the
         // ledger's fee settings (see Ledger.setFeeSettings).
         const resourceFee = String(sim.minResourceFee);
         const txData = new xdr.SorobanTransactionData({
-          ext: new (xdr as any).SorobanTransactionDataExt(0),
+          ext: xdr.SorobanTransactionDataExt.v0(),
           resources,
-          resourceFee: (xdr as any).Int64.fromString(resourceFee),
+          resourceFee: xdr.Int64.fromString(resourceFee),
         });
 
         return ok({
           latestLedger: lastClosed(),
           minResourceFee: resourceFee,
-          transactionData: txData.toXDR('base64'),
+          transactionData: txData.toXdr('base64'),
           // The RPC contract for this field is DiagnosticEvent, not
-          // ContractEvent — the SDK does DiagnosticEvent.fromXDR here, and a
-          // raw ContractEvent makes it die with "Bad union switch: 1".
+          // ContractEvent — the SDK does DiagnosticEvent.fromXdr here, and a
+          // raw ContractEvent makes it throw XdrError "incomplete XDR data".
           events: sim.eventsXdr.map((e: string) =>
             new xdr.DiagnosticEvent({
               inSuccessfulContractCall: true,
-              event: xdr.ContractEvent.fromXDR(e, 'base64'),
-            }).toXDR('base64'),
+              event: xdr.ContractEvent.fromXdr(e, 'base64'),
+            }).toXdr('base64'),
           ),
           results: [
             {
               xdr: sim.returnValueXdr,
               auth: suppliedAuth.length > 0
-                ? suppliedAuth.map((a) => a.toXDR('base64'))
+                ? suppliedAuth.map((a) => a.toXdr('base64'))
                 : sim.authXdr,
             },
           ],
@@ -661,9 +657,9 @@ export function attachInProcessRpc(
 
       case 'sendTransaction': {
         const envelopeB64: string = params.transaction;
-        const tx = TransactionBuilder.fromXDR(envelopeB64, ledger.networkPassphrase);
+        const tx = TransactionBuilder.fromXdr(envelopeB64, ledger.networkPassphrase);
         const txHash = tx.hash();
-        const hashHex = txHash.toString('hex');
+        const hashHex = Buffer.from(txHash).toString('hex');
 
         // The response names the ledger that was latest when the envelope
         // arrived (send_transaction.go reads LastLedger before submitting).
@@ -673,7 +669,7 @@ export function attachInProcessRpc(
         };
         const outcome = submit(envelopeB64);
         const innerHash = tx instanceof FeeBumpTransaction ? tx.innerTransaction.hash() : txHash;
-        const resultXdr = transactionResult(outcome, innerHash).toXDR('base64');
+        const resultXdr = transactionResult(outcome, innerHash).toXdr('base64');
 
         // Classic validation failures come back synchronously as ERROR, exactly
         // as stellar-rpc does -- this is what an app's retry logic keys on. That
@@ -690,18 +686,18 @@ export function attachInProcessRpc(
         // Anything that actually executed is PENDING here and resolved by
         // getTransaction, so the app's submit-then-poll loop runs for real.
         for (const [i, evtB64] of (outcome.eventsXdr ?? []).entries()) {
-          const evt = xdr.ContractEvent.fromXDR(evtB64, 'base64');
-          const cid = evt.contractId();
+          const evt = xdr.ContractEvent.fromXdr(evtB64, 'base64');
+          const cid = evt.contractId;
           eventLog.push({
             type: 'contract',
             ledger: ledger.ledgerSeq,
             ledgerClosedAt: new Date(ledger.timestamp * 1000).toISOString(),
-            contractId: cid ? Address.contract(cid).toString() : '',
+            contractId: cid ? Address.contract(cid.toBytes()).toString() : '',
             id: `${ledger.ledgerSeq}-${eventLog.length}`,
             pagingToken: `${ledger.ledgerSeq}-${eventLog.length}`,
             inSuccessfulContractCall: true,
-            topic: evt.body().v0().topics().map((t) => t.toXDR('base64')),
-            value: evt.body().v0().data().toXDR('base64'),
+            topic: evt.body.v0.topics.map((t) => t.toXdr('base64')),
+            value: evt.body.v0.data.toXdr('base64'),
             txHash: hashHex,
             opIndex: 0,
             txIndex: i,
@@ -713,7 +709,7 @@ export function attachInProcessRpc(
           outcome,
           envelopeB64,
           resultXdr,
-          resultMetaXdr: transactionMeta(outcome).toXDR('base64'),
+          resultMetaXdr: transactionMeta(outcome).toXdr('base64'),
           ledger: ledger.ledgerSeq,
           createdAt: ledger.timestamp,
           feeBump: outcome.code.startsWith('txFEE_BUMP'),

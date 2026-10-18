@@ -51,7 +51,7 @@ let svm: LiteStellar;
 let S: rpc.Server;
 let a: Keypair;
 
-const balance = (k: Keypair) => BigInt(svm.getAccount(k.publicKey())!.balance().toString());
+const balance = (k: Keypair) => BigInt(svm.getAccount(k.publicKey())!.balance.toString());
 const fund = () => {
   const k = Keypair.random();
   svm.ledger.fund(k.publicKey(), { balance: 10_000n * 10_000_000n });
@@ -78,7 +78,8 @@ async function withData(op: xdr.Operation, data: xdr.SorobanTransactionData) {
     .build();
 }
 
-const sorobanData = (tx: Transaction) => tx.toEnvelope().v1().tx().ext().sorobanData();
+const sorobanData = (tx: Transaction) =>
+  xdr.expectUnionVariant(xdr.expectUnionVariant(tx.toEnvelope(), 'envelopeTypeTx').v1.tx.ext, 'sorobanData').sorobanData;
 
 interface Charged {
   status: string;
@@ -96,27 +97,27 @@ async function run(tx: Transaction | ReturnType<typeof TransactionBuilder.buildF
   const sent = await S.sendTransaction(tx);
   if (sent.status === 'ERROR') {
     return {
-      status: `ERROR ${sent.errorResult!.result().switch().name}`,
+      status: `ERROR ${sent.errorResult!.result.type}`,
       debited: before - balance(payer),
-      feeCharged: BigInt(sent.errorResult!.feeCharged().toString()),
+      feeCharged: BigInt(sent.errorResult!.feeCharged.toString()),
       op: '',
     };
   }
   const got: any = await S.pollTransaction(sent.hash);
   const result: xdr.TransactionResult = got.resultXdr;
-  let r: any = result.result();
-  if (r.switch().name.startsWith('txFeeBump')) r = r.innerResultPair().result().result();
-  const op = r.results()[0].tr().value().switch().name;
-  const ext = (got.resultMetaXdr as xdr.TransactionMeta).v4().sorobanMeta()!.ext();
-  const fee = ext.switch() === 1 ? ext.v1() : null;
+  let r: any = result.result;
+  if (r.type.startsWith('txFeeBump')) r = r.innerResultPair.result.result;
+  const op = r.results[0].tr.value.type;
+  const ext = xdr.expectUnionVariant(got.resultMetaXdr as xdr.TransactionMeta, 'v4').v4.sorobanMeta!.ext;
+  const fee = ext.type === 'v1' ? ext.v1 : null;
   return {
     status: got.status,
     debited: before - balance(payer),
-    feeCharged: BigInt(result.feeCharged().toString()),
+    feeCharged: BigInt(result.feeCharged.toString()),
     op,
-    nonRefundable: fee ? BigInt(fee.totalNonRefundableResourceFeeCharged().toString()) : undefined,
-    refundable: fee ? BigInt(fee.totalRefundableResourceFeeCharged().toString()) : undefined,
-    rent: fee ? BigInt(fee.rentFeeCharged().toString()) : undefined,
+    nonRefundable: fee ? BigInt(fee.totalNonRefundableResourceFeeCharged.toString()) : undefined,
+    refundable: fee ? BigInt(fee.totalRefundableResourceFeeCharged.toString()) : undefined,
+    rent: fee ? BigInt(fee.rentFeeCharged.toString()) : undefined,
     returnValue: got.returnValue,
   };
 }
@@ -153,7 +154,7 @@ describe('fee debits match a protocol-29 node', () => {
       new xdr.LedgerKeyContractData({
         contract: new Address(store).toScAddress(),
         key: sym(k),
-        durability: xdr.ContractDataDurability.persistent(),
+        durability: xdr.ContractDataDurability.persistent,
       }),
     );
 
@@ -204,8 +205,14 @@ describe('fee debits match a protocol-29 node', () => {
     // 5,806 non-refundable (of the halved instructions) + 100; refundable 0.
     const op = putOp('k3');
     const p = await prepared(op);
-    const data = sorobanData(p.tx);
-    data.resources().instructions(Math.floor(data.resources().instructions() / 2));
+    const declared = sorobanData(p.tx);
+    const data = new xdr.SorobanTransactionData({
+      ...declared,
+      resources: new xdr.SorobanResources({
+        ...declared.resources,
+        instructions: Math.floor(declared.resources.instructions / 2),
+      }),
+    });
     const tx = await withData(op, data);
     tx.sign(a);
     const r = await run(tx, a);
@@ -220,8 +227,7 @@ describe('fee debits match a protocol-29 node', () => {
     // txSorobanInvalid, feeCharged 6,067 (declared + 100), nothing debited.
     const op = putOp('k4');
     const p = await prepared(op);
-    const data = sorobanData(p.tx);
-    data.resourceFee(new xdr.Int64(5967n));
+    const data = new xdr.SorobanTransactionData({ ...sorobanData(p.tx), resourceFee: 5967n });
     const tx = await withData(op, data);
     tx.sign(a);
     const r = await run(tx, a);
@@ -234,7 +240,7 @@ describe('fee debits match a protocol-29 node', () => {
     // LIVE: k1 extended by 379,050 ledgers (TTL 129,927 -> 508,977) ->
     // charged 29,357 = 2,341 + 26,916 rent + 100; minResourceFee 42,904.
     await send(putOp('k1'));
-    const k = dataKey('k1').toXDR('base64');
+    const k = dataKey('k1').toXdr('base64');
     svm.ledger.putEntry(svm.ledger.getEntry(k)!, svm.ledger.ledgerSeq + 500_000 - 379_050);
     const data = new SorobanDataBuilder().setReadOnly([dataKey('k1')]).build();
     const p = await prepared(Operation.extendFootprintTtl({ extendTo: 500_000 }), '100', data);
@@ -251,12 +257,11 @@ describe('fee debits match a protocol-29 node', () => {
     // LIVE: resourceFee = 2,341 + rent / 2 -> FAILED,
     // extendFootprintTtlInsufficientRefundableFee, charged 2,441.
     await send(putOp('k2'));
-    const k = dataKey('k2').toXDR('base64');
+    const k = dataKey('k2').toXdr('base64');
     const ttl = svm.ledger.getEntryTtl(k);
     const op = Operation.extendFootprintTtl({ extendTo: 500_000 });
     const p = await prepared(op, '100', new SorobanDataBuilder().setReadOnly([dataKey('k2')]).build());
-    const data = sorobanData(p.tx);
-    data.resourceFee(new xdr.Int64(2341n + 13_458n));
+    const data = new xdr.SorobanTransactionData({ ...sorobanData(p.tx), resourceFee: 2341n + 13_458n });
     const tx = await withData(op, data);
     tx.sign(a);
     const r = await run(tx, a);
@@ -271,7 +276,7 @@ describe('fee debits match a protocol-29 node', () => {
     // RestoreFootprintOpFrame.cpp), and a creation gets the same TTL, so
     // restoring k5 costs the rent writing it cost.
     const created = await send(putOp('k5'));
-    const k = dataKey('k5').toXDR('base64');
+    const k = dataKey('k5').toXdr('base64');
     // Archived in the last closed ledger too, which is where stellar-rpc
     // preflights (simulate_transaction.go, LedgerSeq: latestLedger): one
     // ledger past the TTL is still live there, so preflight would skip it.
@@ -287,8 +292,7 @@ describe('fee debits match a protocol-29 node', () => {
     // ...and short of it, fails and leaves the entry archived.
     svm.ledger.advanceLedgers(svm.ledger.getEntryTtl(k)! - svm.ledger.ledgerSeq + 2);
     const q = await prepared(op, '100', new SorobanDataBuilder().setReadWrite([dataKey('k5')]).build());
-    const data = sorobanData(q.tx);
-    data.resourceFee(new xdr.Int64(r.nonRefundable! + r.rent! - 1n));
+    const data = new xdr.SorobanTransactionData({ ...sorobanData(q.tx), resourceFee: r.nonRefundable! + r.rent! - 1n });
     const short = await withData(op, data);
     short.sign(a);
     const s = await run(short, a);
@@ -337,8 +341,7 @@ describe('fee settings', () => {
     svm.withFeeCharging(false);
     const op = Operation.invokeContractFunction({ contract: adder, function: 'add', args: [i32(2), i32(3)] });
     const p = await prepared(op);
-    const data = sorobanData(p.tx);
-    data.resourceFee(new xdr.Int64(0n));
+    const data = new xdr.SorobanTransactionData({ ...sorobanData(p.tx), resourceFee: 0n });
     const tx = await withData(op, data);
     tx.sign(a);
     const r = await run(tx, a);

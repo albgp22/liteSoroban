@@ -83,7 +83,7 @@ function deploy(L: Ledger, source: string, wasm: Uint8Array, salt: number): xdr.
   const wasmHash = L.seedWasm(wasm);
   const { sent } = L.simulateAndSend(createContractHostFn(source, wasmHash, saltOf(salt)), source);
   expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-  return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+  return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 }
 
 /** The persistent instance entry every deployed contract owns. */
@@ -92,15 +92,15 @@ const instanceKey = (a: xdr.ScAddress) =>
     new xdr.LedgerKeyContractData({
       contract: a,
       key: xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: xdr.ContractDataDurability.persistent(),
+      durability: xdr.ContractDataDurability.persistent,
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 /** The ContractCode entry for a wasm blob, keyed by sha256 of the bytes. */
 const codeKey = (wasm: Uint8Array) =>
   xdr.LedgerKey.contractCode(
     new xdr.LedgerKeyContractCode({ hash: sha256(Buffer.from(wasm)) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 /**
  * The contract id a `deployer().with_current_contract(salt)` call produces:
@@ -119,7 +119,7 @@ function derivedContractAddress(
       ),
     }),
   );
-  return xdr.ScAddress.scAddressTypeContract(sha256(preimage.toXDR()));
+  return xdr.ScAddress.scAddressTypeContract(new xdr.ContractId(sha256(preimage.toXdr())));
 }
 
 /**
@@ -149,17 +149,18 @@ interface DecodedEvent {
 }
 
 function decodeEvent(b64: string): DecodedEvent {
-  const ev = xdr.ContractEvent.fromXDR(b64, 'base64');
-  const body = ev.body().v0();
+  const ev = xdr.ContractEvent.fromXdr(b64, 'base64');
+  const body = ev.body.v0;
   return {
-    type: ev.type().name,
-    contract: ev.contractId() ? StrKey.encodeContract(ev.contractId()!) : null,
-    topics: body.topics().map((t) => scValToNative(t)),
-    data: scValToNative(body.data()),
+    type: ev.type.name,
+    contract: ev.contractId ? StrKey.encodeContract(ev.contractId.toBytes()) : null,
+    topics: body.topics.map((t) => scValToNative(t)),
+    data: scValToNative(body.data),
   };
 }
 
-const cid = (a: xdr.ScAddress) => StrKey.encodeContract(a.contractId());
+const cid = (a: xdr.ScAddress) =>
+  StrKey.encodeContract(xdr.expectUnionVariant(a, 'scAddressTypeContract').contractId.toBytes());
 
 /** contracttype struct -> ScMap keyed by symbols, sorted as the host demands. */
 function structVal(fields: Record<string, xdr.ScVal>): xdr.ScVal {
@@ -187,13 +188,13 @@ const treeVal = (t: Tree): xdr.ScVal =>
 
 /** Flatten a recorded auth tree to `[contract, fnName]` pairs, depth-first. */
 function authTree(inv: xdr.SorobanAuthorizedInvocation): any {
-  const f = inv.function();
+  const f = inv.function;
   const label =
-    f.switch().name === 'sorobanAuthorizedFunctionTypeContractFn'
-      ? [StrKey.encodeContract(f.contractFn().contractAddress().contractId()),
-         f.contractFn().functionName().toString()]
-      : [f.switch().name];
-  return { call: label, subs: inv.subInvocations().map(authTree) };
+    f.type === 'sorobanAuthorizedFunctionTypeContractFn'
+      ? [cid(f.contractFn.contractAddress),
+         f.contractFn.functionName.toString()]
+      : [f.type];
+  return { call: label, subs: inv.subInvocations.map(authTree) };
 }
 
 // ===========================================================================
@@ -246,7 +247,7 @@ describe('contract events', () => {
       [cid(A), 'add_with'],
       [cid(B), 'add'],
     ]);
-    expect(scValToNative(xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64'))).toBe(30);
+    expect(scValToNative(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'))).toBe(30);
   });
 
   it('simulate() and send() agree on the events, byte for byte', () => {
@@ -284,7 +285,7 @@ describe('contract events', () => {
     const hf = invokeHostFn(A, 'add_with_try', [i32(I32_MAX), i32(1), addr(B)]);
     const { sim, sent } = L.simulateAndSend(hf, source);
     expect(sent.ok, sent.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64'))).toBe(0);
+    expect(scValToNative(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'))).toBe(0);
 
     expect(sent.eventsXdr).toHaveLength(1);
     const e = decodeEvent(sent.eventsXdr[0]);
@@ -435,13 +436,15 @@ describe('Stellar Asset Contract events', () => {
     const a = preFundedWallet(L);
     const b = preFundedWallet(L);
     const nativeAddress = xdr.ScAddress.scAddressTypeContract(
-      Buffer.from(StrKey.decodeContract(Asset.native().contractId(L.networkPassphrase))),
+      new xdr.ContractId(
+        Buffer.from(StrKey.decodeContract(Asset.native().contractId(L.networkPassphrase))),
+      ),
     );
     // deploy the native SAC
     const create = xdr.HostFunction.hostFunctionTypeCreateContract(
       new xdr.CreateContractArgs({
         contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(
-          Asset.native().toXDRObject(),
+          Asset.native().toXdrObject(),
         ),
         executable: xdr.ContractExecutable.contractExecutableStellarAsset(),
       }),
@@ -494,8 +497,8 @@ describe('events through the rpc.Server facade', () => {
   };
 
   it('simulateTransaction returns DiagnosticEvent XDR in `events`', async () => {
-    // The SDK parses this field with xdr.DiagnosticEvent.fromXDR
-    // (rpc/parsers.js:174) and rpc.Api documents it as xdr.DiagnosticEvent[].
+    // The SDK parses this field with xdr.DiagnosticEvent.fromXdr
+    // (rpc/parsers.js:176) and rpc.Api documents it as xdr.DiagnosticEvent[].
     // fake-rpc.ts:231 puts raw ContractEvent XDR there instead, so the SDK's
     // own parser throws the moment a simulated contract emits anything.
     const tx = await buildInvoke(invokeHostFn(A, 'add_with', [i32(3), i32(4), addr(B)]));
@@ -518,15 +521,15 @@ describe('events through the rpc.Server facade', () => {
     // through the SDK cannot survive an event-emitting call (test above).
     const sim = L.simulate(hf, w.accountIdB64);
     expect(sim.ok, sim.error).toBe(true);
-    const r = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    const r = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     // The declared resource fee must cover the resources, or core refuses the
     // envelope (txSOROBAN_INVALID): declare what preflight quotes.
     const tx = await buildInvoke(
       hf,
       new SorobanDataBuilder()
-        .setResources(r.instructions(), r.diskReadBytes(), r.writeBytes())
-        .setReadOnly(r.footprint().readOnly())
-        .setReadWrite(r.footprint().readWrite())
+        .setResources(r.instructions, r.diskReadBytes, r.writeBytes)
+        .setReadOnly(r.footprint.readOnly)
+        .setReadWrite(r.footprint.readWrite)
         .setResourceFee(sim.minResourceFee)
         .build(),
     );
@@ -547,18 +550,18 @@ describe('events through the rpc.Server facade', () => {
     // so the events exist; only the RPC facade loses them.
     const hf = invokeHostFn(A, 'add_with', [i32(1), i32(1), addr(B)]);
     const sim = L.simulate(hf, w.accountIdB64);
-    const r = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    const r = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     const tx = await buildInvoke(
       hf,
       new SorobanDataBuilder()
-        .setResources(r.instructions(), r.diskReadBytes(), r.writeBytes())
-        .setReadOnly(r.footprint().readOnly())
-        .setReadWrite(r.footprint().readWrite())
+        .setResources(r.instructions, r.diskReadBytes, r.writeBytes)
+        .setReadOnly(r.footprint.readOnly)
+        .setReadWrite(r.footprint.readWrite)
         .setResourceFee(sim.minResourceFee)
         .build(),
     );
     tx.sign(w.keypair);
-    const outcome = L.sendTransaction(tx.toXDR());
+    const outcome = L.sendTransaction(tx.toXdr());
     expect(outcome.ok, outcome.detail ?? outcome.code).toBe(true);
     expect(outcome.eventsXdr).toHaveLength(2);
     expect(decodeEvent(outcome.eventsXdr![1]).topics).toEqual(['add']);
@@ -579,10 +582,10 @@ describe('events through the rpc.Server facade', () => {
     // e2e_invoke.rs:958 records one DiagnosticEvent per host event, including
     // the two `fn_call` events for A.add_with and B.add.
     const diags = (sim.diagnosticEventsXdr as string[]).map((d) =>
-      xdr.DiagnosticEvent.fromXDR(d, 'base64'),
+      xdr.DiagnosticEvent.fromXdr(d, 'base64'),
     );
     const topics = diags.map((d) =>
-      d.event().body().v0().topics().map((t) => scValToNative(t)),
+      d.event.body.v0.topics.map((t) => scValToNative(t)),
     );
     expect(topics.filter((t) => t[0] === 'fn_call')).toHaveLength(2);
   });
@@ -650,15 +653,18 @@ describe('cross-contract invocation', () => {
     const hf = invokeHostFn(A, 'add_with', [i32(2), i32(3), addr(B)]);
     const sim = L.simulate(hf, source);
 
-    const r = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    let r = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     const trimmed = r
-      .footprint()
-      .readOnly()
-      .filter((k) => k.toXDR('base64') !== instanceKey(B));
+      .footprint
+      .readOnly
+      .filter((k) => k.toXdr('base64') !== instanceKey(B));
     expect(trimmed).toHaveLength(2);
-    r.footprint(new xdr.LedgerFootprint({ readOnly: trimmed, readWrite: [] }));
+    r = new xdr.SorobanResources({
+      ...r,
+      footprint: new xdr.LedgerFootprint({ readOnly: trimmed, readWrite: [] }),
+    });
 
-    const sent = L.send(hf, source, r.toXDR('base64'), sim.authXdr, []);
+    const sent = L.send(hf, source, r.toXdr('base64'), sim.authXdr, []);
     expect(sent.ok).toBe(false);
     expect(sent.error).toMatch(/ExceededLimit|outside of the footprint/);
   });
@@ -683,7 +689,7 @@ describe('cross-contract invocation', () => {
       source,
     );
     expect(sent.ok, sent.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64'))).toBe(0);
+    expect(scValToNative(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'))).toBe(0);
   });
 
   it('records sub-invocation auth: the callee sits under the caller', () => {
@@ -707,10 +713,10 @@ describe('cross-contract invocation', () => {
     expect(sim.ok, sim.error).toBe(true);
     expect(sim.authXdr).toHaveLength(1);
 
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(sim.authXdr[0], 'base64');
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(sim.authXdr[0], 'base64');
     // Source-account credentials: the tx source is the address being authorized.
-    expect(entry.credentials().switch().name).toBe('sorobanCredentialsSourceAccount');
-    expect(authTree(entry.rootInvocation())).toEqual({
+    expect(entry.credentials.type).toBe('sorobanCredentialsSourceAccount');
+    expect(authTree(entry.rootInvocation)).toEqual({
       call: [cid(a), 'tree_fn'],
       subs: [{ call: [cid(b), 'tree_fn'], subs: [] }],
     });
@@ -735,11 +741,17 @@ describe('cross-contract invocation', () => {
       }),
     ]);
     const sim = L2.simulate(hf, src);
-    const doctored = xdr.SorobanAuthorizationEntry.fromXDR(sim.authXdr[0], 'base64');
-    doctored.rootInvocation().subInvocations([]);
+    let doctored = xdr.SorobanAuthorizationEntry.fromXdr(sim.authXdr[0], 'base64');
+    doctored = new xdr.SorobanAuthorizationEntry({
+      ...doctored,
+      rootInvocation: new xdr.SorobanAuthorizedInvocation({
+        ...doctored.rootInvocation,
+        subInvocations: [],
+      }),
+    });
 
     const sent = L2.send(
-      hf, src, sim.resourcesXdr, [doctored.toXDR('base64')], sim.restoredRwEntryIndices,
+      hf, src, sim.resourcesXdr, [doctored.toXdr('base64')], sim.restoredRwEntryIndices,
     );
     expect(sent.ok).toBe(false);
     expect(sent.error).toMatch(/Error\(Auth, InvalidAction\)/);
@@ -807,7 +819,7 @@ describe('contract-deployed contracts', () => {
     // The child is live and runs the wasm it was deployed with.
     const call = L.simulate(invokeHostFn(child, 'add', [i32(20), i32(22)]), source);
     expect(call.ok, call.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(call.returnValueXdr!, 'base64'))).toBe(42);
+    expect(scValToNative(xdr.ScVal.fromXdr(call.returnValueXdr!, 'base64'))).toBe(42);
   });
 
   it('replays upstream test_deployer_operations_using_simulation', () => {
@@ -845,6 +857,6 @@ describe('contract-deployed contracts', () => {
     // internally (res2 == 11 / 12 / 13).
     const call = L.simulate(invokeHostFn(child, 'add', [i32(5), i32(6)]), source);
     expect(call.ok, call.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(call.returnValueXdr!, 'base64'))).toBe(11);
+    expect(scValToNative(xdr.ScVal.fromXdr(call.returnValueXdr!, 'base64'))).toBe(11);
   });
 });

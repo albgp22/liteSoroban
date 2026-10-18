@@ -48,22 +48,22 @@ const NET = Networks.TESTNET;
 const NETWORK_ID = sha256(NET);
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) => xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 const RESOURCE_FEE = 500_000n;
 
-function txHash(raw: xdr.Transaction): Buffer {
+function txHash(raw: xdr.Transaction): Uint8Array {
   return sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 }
 const envelope = (raw: xdr.Transaction, sigs: xdr.DecoratedSignature[]) =>
   xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: sigs }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
   let L: Ledger;
@@ -76,7 +76,7 @@ describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
     new xdr.Transaction({
       sourceAccount: plain(source),
       fee: Number(RESOURCE_FEE + BigInt(BASE_FEE)),
-      seqNum: new xdr.SequenceNumber(new xdr.Int64(seqNum)),
+      seqNum,
       cond: xdr.Preconditions.precondNone(),
       memo: xdr.Memo.memoNone(),
       operations: [
@@ -87,12 +87,11 @@ describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
           ),
         }),
       ],
-      ext: new xdr.TransactionExt(
-        1,
+      ext: xdr.TransactionExt.sorobanData(
         new xdr.SorobanTransactionData({
-          ext: new xdr.SorobanTransactionDataExt(0),
+          ext: xdr.SorobanTransactionDataExt.v0(),
           resources: RESOURCES,
-          resourceFee: new xdr.Int64(RESOURCE_FEE),
+          resourceFee: RESOURCE_FEE,
         }),
       ),
     });
@@ -106,9 +105,9 @@ describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
       createContractHostFn(accB64(deployer.publicKey()), wasmHash),
       accB64(deployer.publicKey()),
     );
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
     const sim = L.simulate(hostFn(), accB64(deployer.publicKey()));
-    RESOURCES = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    RESOURCES = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
   });
 
   // -- the part that DID hold ------------------------------------------------
@@ -143,20 +142,24 @@ describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
     const contentsHash = txHash(raw);
 
     // Install the pre-auth signer by rewriting the AccountEntry directly.
-    const acct = loadAccount(L, accountIdFromPublicKey(a.publicKey()))!;
-    acct.signers([
-      new xdr.Signer({
-        key: xdr.SignerKey.signerKeyTypePreAuthTx(contentsHash),
-        weight: 1,
-      }),
-    ]);
+    const acct = new xdr.AccountEntry({
+      ...loadAccount(L, accountIdFromPublicKey(a.publicKey()))!,
+      signers: [
+        new xdr.Signer({
+          key: xdr.SignerKey.signerKeyTypePreAuthTx(contentsHash),
+          weight: 1,
+        }),
+      ],
+    });
     storeAccount(L, acct);
 
     // Sanity: the signer really is in the ledger, keyed by this exact hash.
     const reread = loadAccount(L, accountIdFromPublicKey(a.publicKey()))!;
-    expect(reread.signers()).toHaveLength(1);
-    expect(reread.signers()[0].key().switch().name).toBe('signerKeyTypePreAuthTx');
-    expect(Buffer.from(reread.signers()[0].key().preAuthTx()).equals(contentsHash)).toBe(true);
+    expect(reread.signers).toHaveLength(1);
+    expect(reread.signers[0].key.type).toBe('signerKeyTypePreAuthTx');
+    expect(
+      Buffer.from(xdr.expectUnionVariant(reread.signers[0].key, 'signerKeyTypePreAuthTx').preAuthTx.toBytes()).equals(contentsHash),
+    ).toBe(true);
 
     // core: totalWeight 1 >= neededWeight 1 -> return true, tx applies.
     const out = L.sendTransaction(envelope(raw, []));
@@ -171,10 +174,10 @@ describe('ROUND 2 — checkSignature port vs SignatureChecker.cpp', () => {
 
     const preimage = Buffer.alloc(32, 9);
     const x = sha256(preimage);
-    const acct = loadAccount(L, accountIdFromPublicKey(a.publicKey()))!;
-    acct.signers([
-      new xdr.Signer({ key: xdr.SignerKey.signerKeyTypeHashX(x), weight: 1 }),
-    ]);
+    const acct = new xdr.AccountEntry({
+      ...loadAccount(L, accountIdFromPublicKey(a.publicKey()))!,
+      signers: [new xdr.Signer({ key: xdr.SignerKey.signerKeyTypeHashX(x), weight: 1 })],
+    });
     storeAccount(L, acct);
 
     const raw = rawTx((a.publicKey()), 1n);

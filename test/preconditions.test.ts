@@ -53,14 +53,14 @@ const v2 = (o: V2 = {}) =>
     new xdr.PreconditionsV2({
       timeBounds: o.timeBounds ?? null,
       ledgerBounds: o.ledgerBounds ?? null,
-      minSeqNum: o.minSeqNum === undefined ? null : new xdr.SequenceNumber(new xdr.Int64(o.minSeqNum)),
-      minSeqAge: new xdr.Duration(new xdr.Uint64(o.minSeqAge ?? 0n)),
+      minSeqNum: o.minSeqNum ?? null,
+      minSeqAge: o.minSeqAge ?? 0n,
       minSeqLedgerGap: o.minSeqLedgerGap ?? 0,
       extraSigners: o.extraSigners ?? [],
     }),
   );
 const tb = (min: bigint, max: bigint) =>
-  new xdr.TimeBounds({ minTime: new xdr.Uint64(min), maxTime: new xdr.Uint64(max) });
+  new xdr.TimeBounds({ minTime: min, maxTime: max });
 const lb = (minLedger: number, maxLedger: number) => new xdr.LedgerBounds({ minLedger, maxLedger });
 const ed = (k: Keypair) => xdr.SignerKey.signerKeyTypeEd25519(k.rawPublicKey());
 
@@ -74,7 +74,7 @@ function world(svm = new LiteStellar()) {
   };
   const state = (k: Keypair) => {
     const a = svm.getAccount(k.publicKey())!;
-    return { seq: BigInt(a.seqNum().toString()), balance: BigInt(a.balance().toString()) };
+    return { seq: a.seqNum, balance: a.balance };
   };
   /**
    * A simulated add(2, 3) from `source` with its preconditions and sequence
@@ -94,16 +94,21 @@ function world(svm = new LiteStellar()) {
       )
       .setTimeout(0)
       .build();
-    const env = ((await server.prepareTransaction(built)) as Transaction).toEnvelope();
-    const raw = env.v1().tx();
-    raw.cond(o.cond ?? xdr.Preconditions.precondNone());
-    raw.seqNum(new xdr.SequenceNumber(new xdr.Int64(o.seq ?? state(source).seq + 1n)));
-    if (o.from) raw.sourceAccount(o.from.xdrMuxedAccount());
-    const out = new Transaction(env, svm.networkPassphrase);
+    const env = xdr.expectUnionVariant(((await server.prepareTransaction(built)) as Transaction).toEnvelope(), 'envelopeTypeTx').v1;
+    const raw = new xdr.Transaction({
+      ...env.tx,
+      cond: o.cond ?? xdr.Preconditions.precondNone(),
+      seqNum: o.seq ?? state(source).seq + 1n,
+      sourceAccount: o.from ? o.from.xdrMuxedAccount() : env.tx.sourceAccount,
+    });
+    const out = new Transaction(
+      xdr.TransactionEnvelope.envelopeTypeTx(new xdr.TransactionV1Envelope({ ...env, tx: raw })),
+      svm.networkPassphrase,
+    );
     for (const s of o.signers ?? [o.from ?? source]) out.sign(s);
     return out;
   };
-  const send = (t: Transaction | FeeBumpTransaction) => svm.sendTransaction(t.toXDR());
+  const send = (t: Transaction | FeeBumpTransaction) => svm.sendTransaction(t.toXdr());
   /** Submit, and check the rejection left the source untouched. */
   const rejected = (t: Transaction, source: Keypair) => {
     const before = state(source);
@@ -117,7 +122,8 @@ function world(svm = new LiteStellar()) {
 }
 
 const resourceFee = (t: Transaction) =>
-  BigInt(t.toEnvelope().v1().tx().ext().sorobanData().resourceFee().toString());
+  xdr.expectUnionVariant(xdr.expectUnionVariant(t.toEnvelope(), 'envelopeTypeTx').v1.tx.ext, 'sorobanData').sorobanData
+    .resourceFee;
 
 function bump(inner: Transaction, feeSource: Keypair, passphrase: string) {
   const env = xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
@@ -125,8 +131,8 @@ function bump(inner: Transaction, feeSource: Keypair, passphrase: string) {
       tx: new xdr.FeeBumpTransaction({
         feeSource: feeSource.xdrMuxedAccount(),
         fee: xdr.Int64.fromString(String(resourceFee(inner) + 1000n)),
-        innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(inner.toEnvelope().v1()),
-        ext: new xdr.FeeBumpTransactionExt(0),
+        innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(xdr.expectUnionVariant(inner.toEnvelope(), 'envelopeTypeTx').v1),
+        ext: xdr.FeeBumpTransactionExt.v0(),
       }),
       signatures: [],
     }),
@@ -230,7 +236,7 @@ describe('minSeqAge / minSeqLedgerGap (isTooEarlyForAccount)', () => {
       await w.tx(a, { cond: v2({ minSeqLedgerGap: w.svm.ledger.ledgerSeq + 1 }) }),
     );
     expect(sent.status).toBe('ERROR');
-    expect(sent.errorResult!.result().switch().name).toBe('txBadMinSeqAgeOrGap');
+    expect(sent.errorResult!.result.type).toBe('txBadMinSeqAgeOrGap');
   });
 });
 
@@ -334,7 +340,7 @@ describe('ledger bounds a client writes from getLatestLedger', () => {
     const a = w.account();
     const latest = (await w.server.getLatestLedger()).sequence;
     const sent = await w.server.sendTransaction(await w.tx(a, { cond: v2({ ledgerBounds: lb(0, latest + 1) }) }));
-    expect([sent.status, sent.errorResult?.result().switch().name]).toEqual(['ERROR', 'txTooLate']);
+    expect([sent.status, sent.errorResult?.result.type]).toEqual(['ERROR', 'txTooLate']);
   });
 
   it('minLedger = latest + 1 is met, and the transaction lands in that ledger', async () => {

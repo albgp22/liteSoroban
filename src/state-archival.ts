@@ -41,20 +41,21 @@ export async function loadArchivalSettingsFromRpc(server: rpc.Server): Promise<A
   const res = await server.getLedgerEntries(
     xdr.LedgerKey.configSetting(
       new xdr.LedgerKeyConfigSetting({
-        configSettingId: xdr.ConfigSettingId.configSettingStateArchival(),
+        configSettingId: xdr.ConfigSettingId.configSettingStateArchival,
       }),
     ),
   );
-  const cs = res.entries[0]?.val.configSetting();
-  if (!cs || cs.switch().name !== 'configSettingStateArchival') {
+  const data = res.entries[0]?.val;
+  const cs = data?.type === 'configSetting' ? data.configSetting : null;
+  if (!cs || cs.type !== 'configSettingStateArchival') {
     throw new Error(
       'node returned no ConfigSettingStateArchival entry — is it running Soroban?',
     );
   }
-  const s = cs.stateArchivalSettings();
+  const s = cs.stateArchivalSettings;
   return {
-    minTemporaryTtl: s.minTemporaryTtl(),
-    minPersistentTtl: s.minPersistentTtl(),
-    maxEntryTtl: s.maxEntryTtl(),
+    minTemporaryTtl: s.minTemporaryTtl,
+    minPersistentTtl: s.minPersistentTtl,
+    maxEntryTtl: s.maxEntryTtl,
   };
 }

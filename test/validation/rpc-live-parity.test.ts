@@ -159,7 +159,7 @@ describe('getEvents vs the live node', () => {
     // looks at `contractIds` and `type` only, so `topics` is silently ignored
     // and an app's "only my transfer events" subscription receives everything.
     await emitOne();
-    const NOPE = nativeToScVal('NOPE_NOT_A_REAL_TOPIC', { type: 'symbol' }).toXDR('base64');
+    const NOPE = nativeToScVal('NOPE_NOT_A_REAL_TOPIC', { type: 'symbol' }).toXdr('base64');
     const res = await jsonRpc('getEvents', {
       startLedger: 1,
       filters: [{ type: 'contract', topics: [[NOPE]] }],
@@ -238,8 +238,8 @@ describe('getEvents vs the live node', () => {
     const res = await jsonRpc('getEvents', { startLedger: 1, filters: [] });
     const topics = res.events.flatMap((e: any) =>
       e.topic.map((t: string) => {
-        const v = xdr.ScVal.fromXDR(t, 'base64');
-        return v.switch().name === 'scvSymbol' ? v.sym().toString() : '';
+        const v = xdr.ScVal.fromXdr(t, 'base64');
+        return v.type === 'scvSymbol' ? v.sym.toString() : '';
       }),
     );
     expect(topics, JSON.stringify(topics)).toContain('fee');
@@ -315,16 +315,16 @@ describe('sendTransaction vs the live node', () => {
     const assembled = rpc.assembleTransaction(tx, sim).build();
     assembled.sign(alice.keypair);
 
-    const first = await jsonRpc('sendTransaction', { transaction: assembled.toXDR() });
+    const first = await jsonRpc('sendTransaction', { transaction: assembled.toXdr() });
     expect(first.status).toBe('PENDING');
-    const again = await jsonRpc('sendTransaction', { transaction: assembled.toXDR() });
+    const again = await jsonRpc('sendTransaction', { transaction: assembled.toXdr() });
     expect(again.status, JSON.stringify(again)).toBe('DUPLICATE');
   });
 
   it('the errorResult of a rejected submit carries the fee that was charged', async () => {
     // LIVE txBAD_SEQ: errorResultXdr "AAAAAAABIO7////7AAAAAA==" decodes to
     // feeCharged 73966 / txBadSeq. classic.ts:fail() hardcodes feeCharged 0n,
-    // so `sent.errorResult.feeCharged()` reads 0 for every rejection.
+    // so `sent.errorResult.feeCharged` reads 0 for every rejection.
     const tx = await buildTx(invokeOp(cd, 'put_persistent', [sc.sym('k'), sc.u64(1n)]));
     const sim = await server.simulateTransaction(tx);
     const assembled = rpc.assembleTransaction(tx, sim).build();
@@ -333,15 +333,15 @@ describe('sendTransaction vs the live node', () => {
       (() => {
         const t = rpc.assembleTransaction(tx, sim).build();
         t.sign(alice.keypair);
-        return t.toXDR();
+        return t.toXdr();
       })(),
     );
     assembled.sign(alice.keypair);
     const sent = await server.sendTransaction(assembled);
     expect(sent.status).toBe('ERROR');
     const err = (sent as rpc.Api.SendTransactionResponse).errorResult!;
-    expect(err.result().switch().name).toBe('txBadSeq');
-    expect(err.feeCharged().toBigInt()).toBeGreaterThan(0n);
+    expect(err.result.type).toBe('txBadSeq');
+    expect(err.feeCharged).toBeGreaterThan(0n);
   });
 });
 
@@ -423,23 +423,24 @@ describe('getLedgers vs the live node', () => {
       startLedger: svm.ledgerSequence - 1, // the latest: the open ledger has not closed
       pagination: { limit: 1 },
     });
-    const entry = xdr.LedgerHeaderHistoryEntry.fromXDR(res.ledgers[0].headerXdr, 'base64');
-    const h = entry.header();
+    const entry = xdr.LedgerHeaderHistoryEntry.fromXdr(res.ledgers[0].headerXdr, 'base64');
+    const h = entry.header;
     const zero = Buffer.alloc(32);
-    expect(h.bucketListHash().equals(zero), 'bucketListHash is 32 zero bytes').toBe(false);
-    expect(h.previousLedgerHash().equals(zero), 'previousLedgerHash is 32 zero bytes').toBe(false);
-    expect(h.totalCoins().toBigInt(), 'totalCoins is 0, so supply arithmetic reads as zero')
+    expect(Buffer.from(h.bucketListHash.toBytes()).equals(zero), 'bucketListHash is 32 zero bytes').toBe(false);
+    expect(Buffer.from(h.previousLedgerHash.toBytes()).equals(zero), 'previousLedgerHash is 32 zero bytes').toBe(false);
+    expect(h.totalCoins, 'totalCoins is 0, so supply arithmetic reads as zero')
       .toBeGreaterThan(0n);
   });
 
   it('metadataXdr decodes as the LedgerCloseMeta version protocol 27 emits', async () => {
     // LIVE getLedgers/getLatestLedger metadataXdr both begin "AAAAAg..." — union
     // discriminant 2, LedgerCloseMetaV2. The fake emits V0 (discriminant 0), a
-    // pre-protocol-20 shape: `lcm.v2()` throws on it, and V0 has no
+    // pre-protocol-20 shape: `xdr.expectUnionVariant(lcm, 'v2')` throws on it, and V0 has no
     // `evictedKeys`, no `totalByteSizeOfLiveSorobanState`.
     const latest = await jsonRpc('getLatestLedger');
-    const lcm = xdr.LedgerCloseMeta.fromXDR(latest.metadataXdr, 'base64');
-    expect(lcm.switch()).toBe(2);
+    const lcm = xdr.LedgerCloseMeta.fromXdr(latest.metadataXdr, 'base64');
+    // the numeric discriminant `v` (`lcm.type` is the arm name, 'v0' | 'v1' | 'v2')
+    expect(lcm.toXdrObject().v).toBe(2);
   });
 });
 
@@ -486,7 +487,7 @@ describe('simulateTransaction vs the live node', () => {
     // out of a failed simulation. The fake returns {error, latestLedger} only,
     // so parsers.js coalesces `events` to [] and the code is lost.
     const tx = await buildTx(invokeOp(cd, 'get_persistent', [sc.sym('missing')]));
-    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXDR() });
+    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXdr() });
     expect(typeof simRaw.error).toBe('string');
     expect(Array.isArray(simRaw.events), JSON.stringify(Object.keys(simRaw))).toBe(true);
     expect(simRaw.events.length).toBeGreaterThan(0);
@@ -505,7 +506,7 @@ describe('simulateTransaction vs the live node', () => {
     const tx = await buildTx(invokeOp(cd, 'put_persistent', [sc.sym('k'), sc.u64(9n)]));
     const sim = (await server.simulateTransaction(tx)) as rpc.Api.SimulateTransactionSuccessResponse;
     expect(rpc.Api.isSimulationSuccess(sim), JSON.stringify(sim)).toBe(true);
-    const kinds = sim.events.map((e) => e.event().type().name);
+    const kinds = sim.events.map((e) => e.event.type.name);
     expect(kinds, `event types: ${JSON.stringify(kinds)}`).toContain('diagnostic');
   });
 
@@ -515,7 +516,7 @@ describe('simulateTransaction vs the live node', () => {
     // The fake hardcodes []. `parseSuccessful` therefore never populates
     // SimulateTransactionSuccessResponse.stateChanges.
     const tx = await buildTx(invokeOp(cd, 'put_persistent', [sc.sym('brand_new'), sc.u64(9n)]));
-    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXDR() });
+    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXdr() });
     expect(simRaw.stateChanges.length).toBeGreaterThan(0);
   });
 
@@ -530,13 +531,13 @@ describe('simulateTransaction vs the live node', () => {
     // stamps it straight onto the envelope, so every fee assertion an app makes
     // is off by ~2x and the flat 100_000 floor dwarfs cheap calls.
     const tx = await buildTx(invokeOp(cd, 'put_persistent', [sc.sym('k'), sc.u64(9n)]));
-    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXDR() });
-    const data = xdr.SorobanTransactionData.fromXDR(simRaw.transactionData, 'base64');
+    const simRaw = await jsonRpc('simulateTransaction', { transaction: tx.toXdr() });
+    const data = xdr.SorobanTransactionData.fromXdr(simRaw.transactionData, 'base64');
 
     // Anchor the comparison: the metering must match the live node exactly, or
     // the fee comparison below would be measuring something else.
-    expect(data.resources().instructions()).toBe(599_484);
-    expect(data.resources().writeBytes()).toBe(80);
+    expect(data.resources.instructions).toBe(599_484);
+    expect(data.resources.writeBytes).toBe(80);
 
     const LIVE_MIN_RESOURCE_FEE = 83_183;
     const ratio = Number(simRaw.minResourceFee) / LIVE_MIN_RESOURCE_FEE;
@@ -576,9 +577,11 @@ describe('the in-process friendbot vs a real CreateAccount', () => {
     // minSeqAge / minSeqLedgerGap inputs simply do not exist in this ledger.
     await submit(cd, 'put_persistent', [sc.sym('k'), sc.u64(1n)]);
     const entry = await server.getAccountEntry(alice.publicKey);
-    expect(entry.seqNum().toString()).not.toBe('0');
-    expect(entry.ext().switch(), 'AccountEntry ext is still v0 after a transaction').toBe(1);
-    expect(entry.ext().v1().ext().v2().ext().v3().seqLedger()).toBe(svm.ledgerSequence);
+    expect(entry.seqNum.toString()).not.toBe('0');
+    expect(entry.ext.type, 'AccountEntry ext is still v0 after a transaction').toBe('v1');
+    const v1 = xdr.expectUnionVariant(entry.ext, 'v1').v1;
+    const v2 = xdr.expectUnionVariant(v1.ext, 'v2').v2;
+    expect(xdr.expectUnionVariant(v2.ext, 'v3').v3.seqLedger).toBe(svm.ledgerSequence);
   });
 });
 
@@ -649,10 +652,12 @@ describe('zero sockets', () => {
   });
 
   it('contract.Client.deploy reaches the wire despite options.server', async () => {
-    // client.js:84 calls specFromWasmHash(), and client.js:29-35 builds its OWN
+    // Through SDK 16.2.0 this leaked: Client.deploy built its OWN
     // `new RpcServer(rpcUrl)` with no chance to pass one in — unlike
-    // Client.from / Client.fromWasmHash, which both honour options.server.
-    // With the RPC url pointed at a real host this opens a socket.
+    // Client.from / Client.fromWasmHash, which both honour options.server —
+    // so with the RPC url pointed at a real host it opened a socket. SDK
+    // 17.0.0 routes deploy through options.server too (client.js:71,
+    // `clientOptions.server ?? new RpcServer(...)`); this pins that.
     const require = createRequire(import.meta.url);
     const net = require('node:net');
     const attempts: string[] = [];

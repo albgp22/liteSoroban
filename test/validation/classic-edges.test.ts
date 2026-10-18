@@ -54,7 +54,7 @@ const NETWORK_ID = sha256(NET);
 
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 
 const plain = (pk: string) =>
   xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
@@ -88,31 +88,31 @@ function rawTx(s: Spec): xdr.Transaction {
   return new xdr.Transaction({
     sourceAccount: s.source,
     fee: Number(s.fee),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(s.seqNum)),
+    seqNum: s.seqNum,
     cond: s.cond ?? xdr.Preconditions.precondNone(),
     memo: s.memo ?? xdr.Memo.memoNone(),
     operations: s.ops,
     ext:
       s.sorobanData === null
-        ? new xdr.TransactionExt(0)
-        : new xdr.TransactionExt(1, s.sorobanData!),
+        ? xdr.TransactionExt.v0()
+        : xdr.TransactionExt.sorobanData(s.sorobanData!),
   });
 }
 
-function txHash(raw: xdr.Transaction): Buffer {
+function txHash(raw: xdr.Transaction): Uint8Array {
   return sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 }
 
 function envelope(raw: xdr.Transaction, sigs: xdr.DecoratedSignature[]): string {
   return xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: sigs }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 /** Sign with the given keypairs (duplicates allowed) and encode. */
@@ -127,23 +127,23 @@ function feeBumpEnvelope(
   innerEnvB64: string,
   kps: Keypair[],
 ): string {
-  const innerV1 = xdr.TransactionEnvelope.fromXDR(innerEnvB64, 'base64').v1();
+  const innerV1 = xdr.expectUnionVariant(xdr.TransactionEnvelope.fromXdr(innerEnvB64, 'base64'), 'envelopeTypeTx').v1;
   const fbTx = new xdr.FeeBumpTransaction({
     feeSource,
-    fee: new xdr.Int64(fee),
+    fee,
     innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(innerV1),
-    ext: new xdr.FeeBumpTransactionExt(0),
+    ext: xdr.FeeBumpTransactionExt.v0(),
   });
   const h = sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTxFeeBump(fbTx),
-    }).toXDR(),
+    }).toXdr(),
   );
   return xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
     new xdr.FeeBumpTransactionEnvelope({ tx: fbTx, signatures: kps.map((k) => k.signDecorated(h)) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function ihfOp(fn: xdr.HostFunction, source?: xdr.MuxedAccount): xdr.Operation {
@@ -159,7 +159,7 @@ function extendOp(source?: xdr.MuxedAccount): xdr.Operation {
   return new xdr.Operation({
     sourceAccount: source ?? null,
     body: xdr.OperationBody.extendFootprintTtl(
-      new xdr.ExtendFootprintTtlOp({ ext: new xdr.ExtensionPoint(0), extendTo: 200_000 }),
+      new xdr.ExtendFootprintTtlOp({ ext: xdr.ExtensionPoint.v0(), extendTo: 200_000 }),
     ),
   });
 }
@@ -168,7 +168,7 @@ function restoreOp(source?: xdr.MuxedAccount): xdr.Operation {
   return new xdr.Operation({
     sourceAccount: source ?? null,
     body: xdr.OperationBody.restoreFootprint(
-      new xdr.RestoreFootprintOp({ ext: new xdr.ExtensionPoint(0) }),
+      new xdr.RestoreFootprintOp({ ext: xdr.ExtensionPoint.v0() }),
     ),
   });
 }
@@ -188,9 +188,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
 
   const sorobanData = (resourceFee: bigint = RESOURCE_FEE, res = RESOURCES) =>
     new xdr.SorobanTransactionData({
-      ext: new xdr.SorobanTransactionDataExt(0),
+      ext: xdr.SorobanTransactionDataExt.v0(),
       resources: res,
-      resourceFee: new xdr.Int64(resourceFee),
+      resourceFee,
     });
 
   /**
@@ -209,9 +209,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
   });
 
   const seqOf = (kp: Keypair) =>
-    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum().toString());
+    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum.toString());
   const balOf = (kp: Keypair) =>
-    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance().toString());
+    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance.toString());
 
   /** Write an AccountEntry with an arbitrary numSubEntries. */
   function fundWithSubEntries(
@@ -222,22 +222,22 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
   ): void {
     const entry = new xdr.AccountEntry({
       accountId: accountIdFromPublicKey(pk),
-      balance: new xdr.Int64(balance),
-      seqNum: new xdr.SequenceNumber(new xdr.Int64(0n)),
+      balance,
+      seqNum: 0n,
       numSubEntries,
       inflationDest: null,
       flags: 0,
       homeDomain: '',
       thresholds: Buffer.from(thresholds),
       signers: [],
-      ext: new xdr.AccountEntryExt(0),
+      ext: xdr.AccountEntryExt.v0(),
     });
     L.putEntry(
       new xdr.LedgerEntry({
         lastModifiedLedgerSeq: L.ledgerSeq,
         data: xdr.LedgerEntryData.account(entry),
-        ext: new xdr.LedgerEntryExt(0),
-      }).toXDR('base64'),
+        ext: xdr.LedgerEntryExt.v0(),
+      }).toXdr('base64'),
     );
   }
 
@@ -251,11 +251,11 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       createContractHostFn(accB64(deployer.publicKey()), wasmHash),
       accB64(deployer.publicKey()),
     );
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     const sim = L.simulate(hostFn(), accB64(deployer.publicKey()));
     expect(sim.ok).toBe(true);
-    RESOURCES = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    RESOURCES = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
 
     STARTING_SEQ = BigInt(L.ledgerSeq) * 4_294_967_296n;
   });
@@ -464,7 +464,7 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
           networkId: sha256(Networks.PUBLIC),
           taggedTransaction:
             xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-        }).toXDR(),
+        }).toXdr(),
       );
       const out = L.sendTransaction(envelope(raw, [a.signDecorated(wrongHash)]));
       expect(out.code).toBe('txBAD_AUTH');
@@ -488,7 +488,7 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const h = txHash(raw);
       const sigs = Array.from({ length: 21 }, () => a.signDecorated(h));
 
-      expect(() => envelope(raw, sigs)).toThrow(/max allowed is 20/);
+      expect(() => envelope(raw, sigs)).toThrow(/array length 21 exceeds maximum 20/);
       // 20 is legal XDR and must reach the harness without throwing.
       let outcome: TxOutcome | null = null;
       expect(() => {
@@ -519,8 +519,8 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
     const timed = (min: bigint, max: bigint) =>
       xdr.Preconditions.precondTime(
         new xdr.TimeBounds({
-          minTime: xdr.TimePoint.fromString(min.toString()),
-          maxTime: xdr.TimePoint.fromString(max.toString()),
+          minTime: min,
+          maxTime: max,
         }),
       );
 
@@ -760,7 +760,7 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       L.fund(a.publicKey());
       L.fund(s.publicKey());
       const fbB64 = feeBumpEnvelope(plain(s.publicKey()), RESOURCE_FEE + 200n, inner(a, 100n), [s]);
-      const fbTx = TransactionBuilder.fromXDR(fbB64, NET);
+      const fbTx = TransactionBuilder.fromXdr(fbB64, NET);
       expect(() =>
         TransactionBuilder.buildFeeBumpTransaction(s, '1000', fbTx as any, NET),
       ).toThrow();
@@ -936,16 +936,16 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const v0 = new xdr.TransactionV0({
         sourceAccountEd25519: StrKey.decodeEd25519PublicKey(a.publicKey()),
         fee: Number(RESOURCE_FEE + 100n),
-        seqNum: new xdr.SequenceNumber(new xdr.Int64(1n)),
+        seqNum: 1n,
         timeBounds: null,
         memo: xdr.Memo.memoNone(),
         operations: [ihfOp(hostFn())],
-        ext: new xdr.TransactionV0Ext(0),
+        ext: xdr.TransactionV0Ext.v0(),
       });
       const env = xdr.TransactionEnvelope.envelopeTypeTxV0(
         new xdr.TransactionV0Envelope({ tx: v0, signatures: [] }),
       );
-      const out = L.sendTransaction(env.toXDR('base64'));
+      const out = L.sendTransaction(env.toXdr('base64'));
       expect(out.code).toBe('txMALFORMED');
     });
 
@@ -959,14 +959,14 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       // Write the entry first so there is a real TTL to observe.
       expect(L.sendTransaction(signed(rawTx(spec(a)), [a])).code).toBe('txSUCCESS');
 
-      const dataKey = RESOURCES.footprint().readWrite()[0];
-      const ttlBefore = L.getEntryTtl(dataKey.toXDR('base64'));
+      const dataKey = RESOURCES.footprint.readWrite[0];
+      const ttlBefore = L.getEntryTtl(dataKey.toXdr('base64'));
       expect(ttlBefore).toBeDefined();
 
       const res = new xdr.SorobanResources({
         footprint: new xdr.LedgerFootprint({ readOnly: [dataKey], readWrite: [] }),
         instructions: 0,
-        diskReadBytes: RESOURCES.diskReadBytes(),
+        diskReadBytes: RESOURCES.diskReadBytes,
         writeBytes: 0,
       });
       const out = L.sendTransaction(
@@ -979,24 +979,24 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'extendFootprintTtlSuccess']);
       // extendTo 200_000 from this ledger outlives the TTL the write left
       // (ledger + 120_959: testnet's minPersistentTTL - 1).
-      expect(L.getEntryTtl(dataKey.toXDR('base64'))).toBe(L.ledgerSeq + 200_000);
-      expect(L.getEntryTtl(dataKey.toXDR('base64'))!).toBeGreaterThan(ttlBefore!);
+      expect(L.getEntryTtl(dataKey.toXdr('base64'))).toBe(L.ledgerSeq + 200_000);
+      expect(L.getEntryTtl(dataKey.toXdr('base64'))!).toBeGreaterThan(ttlBefore!);
     });
 
     it('applies RestoreFootprint: a key with nothing to restore is skipped, and it succeeds', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       const res = new xdr.SorobanResources({
-        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: RESOURCES.footprint().readWrite() }),
+        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: RESOURCES.footprint.readWrite }),
         instructions: 0,
-        diskReadBytes: RESOURCES.diskReadBytes(),
-        writeBytes: RESOURCES.writeBytes(),
+        diskReadBytes: RESOURCES.diskReadBytes,
+        writeBytes: RESOURCES.writeBytes,
       });
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { ops: [restoreOp()], sorobanData: sorobanData(RESOURCE_FEE, res) })), [a]),
       );
       expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'restoreFootprintSuccess']);
-      expect(L.getEntry(RESOURCES.footprint().readWrite()[0].toXDR('base64'))).toBeUndefined();
+      expect(L.getEntry(RESOURCES.footprint.readWrite[0].toXdr('base64'))).toBeUndefined();
     });
 
     // GAP CANDIDATE. OperationFrame::checkSignature (:217-256) and
@@ -1054,9 +1054,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       const res = new xdr.SorobanResources({
-        footprint: new xdr.LedgerFootprint({ readOnly: RESOURCES.footprint().readWrite(), readWrite: [] }),
+        footprint: new xdr.LedgerFootprint({ readOnly: RESOURCES.footprint.readWrite, readWrite: [] }),
         instructions: 0,
-        diskReadBytes: RESOURCES.diskReadBytes(),
+        diskReadBytes: RESOURCES.diskReadBytes,
         writeBytes: 0,
       });
       const out = L.sendTransaction(
@@ -1080,10 +1080,10 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       const res = new xdr.SorobanResources({
-        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: RESOURCES.footprint().readWrite() }),
+        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: RESOURCES.footprint.readWrite }),
         instructions: 0,
-        diskReadBytes: RESOURCES.diskReadBytes(),
-        writeBytes: RESOURCES.writeBytes(),
+        diskReadBytes: RESOURCES.diskReadBytes,
+        writeBytes: RESOURCES.writeBytes,
       });
       const out = L.sendTransaction(
         signed(

@@ -55,7 +55,7 @@ const RESOURCE_FEE = 500_000n;
 
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) =>
   xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 
@@ -73,24 +73,24 @@ function rawTx(s: Spec): xdr.Transaction {
   return new xdr.Transaction({
     sourceAccount: s.source,
     fee: Number(s.fee),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(s.seqNum)),
+    seqNum: s.seqNum,
     cond: s.cond ?? xdr.Preconditions.precondNone(),
     memo: s.memo ?? xdr.Memo.memoNone(),
     operations: s.ops,
     ext:
       s.sorobanData === null
-        ? new xdr.TransactionExt(0)
-        : new xdr.TransactionExt(1, s.sorobanData!),
+        ? xdr.TransactionExt.v0()
+        : xdr.TransactionExt.sorobanData(s.sorobanData!),
   });
 }
 
-function txHash(raw: xdr.Transaction): Buffer {
+function txHash(raw: xdr.Transaction): Uint8Array {
   return sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 }
 
@@ -98,7 +98,7 @@ function signed(raw: xdr.Transaction, kps: Keypair[]): string {
   const h = txHash(raw);
   return xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: kps.map((k) => k.signDecorated(h)) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function feeBumpEnvelope(
@@ -107,26 +107,29 @@ function feeBumpEnvelope(
   innerEnvB64: string,
   kps: Keypair[],
 ): string {
-  const innerV1 = xdr.TransactionEnvelope.fromXDR(innerEnvB64, 'base64').v1();
+  const innerV1 = xdr.expectUnionVariant(
+    xdr.TransactionEnvelope.fromXdr(innerEnvB64, 'base64'),
+    'envelopeTypeTx',
+  ).v1;
   const fbTx = new xdr.FeeBumpTransaction({
     feeSource,
-    fee: new xdr.Int64(fee),
+    fee,
     innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(innerV1),
-    ext: new xdr.FeeBumpTransactionExt(0),
+    ext: xdr.FeeBumpTransactionExt.v0(),
   });
   const h = sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTxFeeBump(fbTx),
-    }).toXDR(),
+    }).toXdr(),
   );
   return xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
     new xdr.FeeBumpTransactionEnvelope({
       tx: fbTx,
       signatures: kps.map((k) => k.signDecorated(h)),
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function ihfOp(fn: xdr.HostFunction, source?: xdr.MuxedAccount): xdr.Operation {
@@ -141,7 +144,7 @@ function ihfOp(fn: xdr.HostFunction, source?: xdr.MuxedAccount): xdr.Operation {
 function v2cond(over: Partial<{
   timeBounds: xdr.TimeBounds | null;
   ledgerBounds: xdr.LedgerBounds | null;
-  minSeqNum: xdr.SequenceNumber | null;
+  minSeqNum: bigint | null;
   minSeqAge: bigint;
   minSeqLedgerGap: number;
   extraSigners: xdr.SignerKey[];
@@ -151,7 +154,7 @@ function v2cond(over: Partial<{
       timeBounds: over.timeBounds ?? null,
       ledgerBounds: over.ledgerBounds ?? null,
       minSeqNum: over.minSeqNum ?? null,
-      minSeqAge: new xdr.Duration(new xdr.Uint64(over.minSeqAge ?? 0n)),
+      minSeqAge: over.minSeqAge ?? 0n,
       minSeqLedgerGap: over.minSeqLedgerGap ?? 0,
       extraSigners: over.extraSigners ?? [],
     }),
@@ -168,15 +171,15 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
 
   const sorobanData = (resourceFee: bigint = RESOURCE_FEE, res = RESOURCES) =>
     new xdr.SorobanTransactionData({
-      ext: new xdr.SorobanTransactionDataExt(0),
+      ext: xdr.SorobanTransactionDataExt.v0(),
       resources: res,
-      resourceFee: new xdr.Int64(resourceFee),
+      resourceFee,
     });
 
   const seqOf = (kp: Keypair) =>
-    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum().toString());
+    loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum;
   const balOf = (kp: Keypair) =>
-    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance().toString());
+    loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.balance;
 
   const spec = (source: Keypair, over: Partial<Spec> = {}): Spec => ({
     source: over.source ?? plain(source.publicKey()),
@@ -198,11 +201,11 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
       createContractHostFn(accB64(deployer.publicKey()), wasmHash),
       accB64(deployer.publicKey()),
     );
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     const sim = L.simulate(hostFn(), accB64(deployer.publicKey()));
     expect(sim.ok).toBe(true);
-    RESOURCES = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    RESOURCES = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
   });
 
   // =========================================================================
@@ -439,16 +442,18 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
         createContractHostFn(accB64(d.publicKey()), wasmHash),
         accB64(d.publicKey()),
       );
-      const addr2 = xdr.ScVal.fromXDR(dep.sent.returnValueXdr!, 'base64').address();
+      const addr2 = xdr.expectUnionVariant(
+        xdr.ScVal.fromXdr(dep.sent.returnValueXdr!, 'base64'),
+        'scvAddress',
+      ).address;
       const hostFn = () => invokeHostFn(addr2, 'put_persistent', [sym('k'), u64(1n)]);
       const a = Keypair.random();
       // Exactly the base reserve: available balance is 0.
       svm.ledger.fund(a.publicKey(), { balance: 10_000_000n });
       const L2 = svm.ledger;
-      const seq =
-        BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum().toString()) + 1n;
+      const seq = loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum + 1n;
       const sim = L2.simulate(hostFn(), accB64(a.publicKey()));
-      const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+      const res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
       const env = signed(
         rawTx({
           source: plain(a.publicKey()),
@@ -456,9 +461,9 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
           fee: RESOURCE_FEE + BigInt(BASE_FEE),
           ops: [ihfOp(hostFn())],
           sorobanData: new xdr.SorobanTransactionData({
-            ext: new xdr.SorobanTransactionDataExt(0),
+            ext: xdr.SorobanTransactionDataExt.v0(),
             resources: res,
-            resourceFee: new xdr.Int64(RESOURCE_FEE),
+            resourceFee: RESOURCE_FEE,
           }),
         }),
         [a],
@@ -484,7 +489,7 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
         createContractHostFn(accB64(d.publicKey()), wasmHash),
         accB64(d.publicKey()),
       );
-      const a2 = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+      const a2 = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
       return () => invokeHostFn(a2, 'put_persistent', [sym('k'), u64(1n)]);
     };
 
@@ -496,18 +501,17 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
     ) => {
       const L2 = svm.ledger;
       const sim = L2.simulate(hostFn(), accB64(a.publicKey()));
-      const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-      const seq =
-        BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum().toString()) + 1n;
+      const res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
+      const seq = loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum + 1n;
       return {
         source: plain(a.publicKey()),
         seqNum: over.seqNum ?? seq,
         fee: RESOURCE_FEE,
         ops: [ihfOp(hostFn())],
         sorobanData: new xdr.SorobanTransactionData({
-          ext: new xdr.SorobanTransactionDataExt(0),
+          ext: xdr.SorobanTransactionDataExt.v0(),
           resources: res,
-          resourceFee: new xdr.Int64(RESOURCE_FEE),
+          resourceFee: RESOURCE_FEE,
         }),
         cond: over.cond,
       } as Spec;
@@ -550,7 +554,7 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
       svm.ledger.fund(f.publicKey());
       svm.ledger.setTimestamp(10_000);
       const expired = xdr.Preconditions.precondTime(
-        new xdr.TimeBounds({ minTime: new xdr.Uint64(0n), maxTime: new xdr.Uint64(1_000n) }),
+        new xdr.TimeBounds({ minTime: 0n, maxTime: 1_000n }),
       );
       const inner = signed(rawTx(build(svm, a, hf, { cond: expired })), [a]);
       const out = svm.sendTransaction(
@@ -574,13 +578,13 @@ describe('round-3 classic-layer residue, pinned against a live protocol-27 node'
       new xdr.Operation({
         sourceAccount: source ?? null,
         body: xdr.OperationBody.extendFootprintTtl(
-          new xdr.ExtendFootprintTtlOp({ ext: new xdr.ExtensionPoint(0), extendTo: 100_000 }),
+          new xdr.ExtendFootprintTtlOp({ ext: xdr.ExtensionPoint.v0(), extendTo: 100_000 }),
         ),
       });
     const muxed = (pk: string) =>
       xdr.MuxedAccount.keyTypeMuxedEd25519(
         new xdr.MuxedAccountMed25519({
-          id: new xdr.Uint64(7n),
+          id: 7n,
           ed25519: StrKey.decodeEd25519PublicKey(pk),
         }),
       );

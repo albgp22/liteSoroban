@@ -240,7 +240,6 @@ found by review round 2:
   next transaction is validated and applied at, so once a transaction applies,
   `getLatestLedger` names its ledger with a close time 5 s after its `createdAt`.
   On a node the two are the same.
-- `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
 
 `getLedgerEntries` also serves no `ConfigSetting` entries, so neither the
 state-archival settings nor the cost tables can be read back through
@@ -346,7 +345,7 @@ function`, thrown from a `finally` block.
 **`getLedgerEntries` returns `LedgerEntryData`, not `LedgerEntry`** (SDK
 `parsers.js:121`), and `simulateTransaction`'s `events` field is
 **`DiagnosticEvent`**, not `ContractEvent` — a raw ContractEvent makes the SDK
-die with "Bad union switch: 1".
+throw `XdrError` ("incomplete XDR data").
 
 **secp256r1 signatures are over the payload as a PREHASH**, and the host rejects
 high-S signatures (`crypto/mod.rs:185`). WebCrypto cannot express prehash ECDSA,
@@ -355,12 +354,12 @@ P-256 auth costs ~58% more than ed25519: 7,045,503 vs 4,457,165 instructions on
 the same call.
 
 **`contract.Client` honours `options.server`** in its constructor
-(`client.js:45`), `from` (`:198`) and `fromWasmHash` (`:135`) — but
-`Client.deploy` leaks, building `new RpcServer(rpcUrl)` at `client.js:36-38`.
-There is a regression test pinning this.
+(`client.js:24-31`), `from` (`:204`), `fromWasmHash` (`:136`) and, since SDK
+17.0.0, `deploy` (`:71`). Through 16.2.0 `Client.deploy` leaked, building its
+own `new RpcServer(rpcUrl)`; `test/contract-client.test.ts` pins the fix.
 
-**`'accountId' in someScAddress` is always true.** js-xdr unions expose an
-accessor for every arm on the prototype, so it is not a type guard.
+**`'accountId' in someScAddress` is not a Wallet check.** It is true for an
+account `ScAddress`, so test for `accountIdB64`, which only a `Wallet` has.
 
 ## Layout
 

@@ -40,22 +40,22 @@ const NETWORK_ID = sha256(NET);
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
 const i128 = (n: bigint) => nativeToScVal(n, { type: 'i128' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) => xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 const RESOURCE_FEE = 2_000_000n;
 
-function txHash(raw: xdr.Transaction): Buffer {
+function txHash(raw: xdr.Transaction): Uint8Array {
   return sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 }
 const envelope = (raw: xdr.Transaction, sigs: xdr.DecoratedSignature[]) =>
   xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: sigs }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 const signWith = (raw: xdr.Transaction, kps: Keypair[]) =>
   envelope(raw, kps.map((k) => k.signDecorated(txHash(raw))));
 
@@ -70,7 +70,7 @@ function build(
   return new xdr.Transaction({
     sourceAccount: plain(txSource),
     fee: Number(RESOURCE_FEE + BigInt(BASE_FEE)),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(seqNum)),
+    seqNum,
     cond: xdr.Preconditions.precondNone(),
     memo: xdr.Memo.memoNone(),
     operations: [
@@ -81,12 +81,11 @@ function build(
         ),
       }),
     ],
-    ext: new xdr.TransactionExt(
-      1,
+    ext: xdr.TransactionExt.sorobanData(
       new xdr.SorobanTransactionData({
-        ext: new xdr.SorobanTransactionDataExt(0),
+        ext: xdr.SorobanTransactionDataExt.v0(),
         resources,
-        resourceFee: new xdr.Int64(RESOURCE_FEE),
+        resourceFee: RESOURCE_FEE,
       }),
     ),
   });
@@ -114,7 +113,7 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
     const asset = new Asset('TST', issuer.publicKey());
     const sacFn = xdr.HostFunction.hostFunctionTypeCreateContract(
       new xdr.CreateContractArgs({
-        contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(asset.toXDRObject()),
+        contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(asset.toXdrObject()),
         executable: xdr.ContractExecutable.contractExecutableStellarAsset(),
       }),
     );
@@ -135,14 +134,14 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
           new xdr.TrustLineEntry({
             accountId: accountIdFromPublicKey(holder.publicKey()),
             asset: tlAsset,
-            balance: new xdr.Int64(0n),
-            limit: new xdr.Int64(9_223_372_036_854_775_807n),
-            flags: xdr.TrustLineFlags.authorizedFlag().value,
-            ext: new xdr.TrustLineEntryExt(0),
+            balance: 0n,
+            limit: 9_223_372_036_854_775_807n,
+            flags: xdr.TrustLineFlags.authorizedFlag.value,
+            ext: xdr.TrustLineEntryExt.v0(),
           }),
         ),
-        ext: new xdr.LedgerEntryExt(0),
-      }).toXDR('base64'),
+        ext: xdr.LedgerEntryExt.v0(),
+      }).toXdr('base64'),
     );
 
     const sacAddr = Address.fromString(asset.contractId(L.networkPassphrase)).toScAddress();
@@ -154,13 +153,13 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
     // naming the issuer — exactly what a real client would submit.
     const sim = L.simulate(mintFn, accB64(issuer.publicKey()));
     expect(sim.ok, sim.error).toBe(true);
-    const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    const auth = sim.authXdr.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, 'base64'));
+    const resources = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
+    const auth = sim.authXdr.map((a) => xdr.SorobanAuthorizationEntry.fromXdr(a, 'base64'));
 
     // tx source = payer (pays the fee, bumps its seq), op source = issuer.
     const raw = build(
       payer.publicKey(),
-      BigInt(loadAccount(L, accountIdFromPublicKey(payer.publicKey()))!.seqNum().toString()) + 1n,
+      BigInt(loadAccount(L, accountIdFromPublicKey(payer.publicKey()))!.seqNum.toString()) + 1n,
       mintFn,
       resources,
       issuer.publicKey(),
@@ -170,8 +169,8 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
     expect(out.code, `${out.code} / ${out.error ?? out.detail}`).toBe('txSUCCESS');
 
     // And the classic side-effects went to the TX source, as core does.
-    expect(loadAccount(L, accountIdFromPublicKey(payer.publicKey()))!.seqNum().toString()).toBe('1');
-    expect(loadAccount(L, accountIdFromPublicKey(issuer.publicKey()))!.seqNum().toString()).toBe('0');
+    expect(loadAccount(L, accountIdFromPublicKey(payer.publicKey()))!.seqNum.toString()).toBe('1');
+    expect(loadAccount(L, accountIdFromPublicKey(issuer.publicKey()))!.seqNum.toString()).toBe('0');
   });
 
   it('HOLDS: the op source is checked against ITS OWN medium threshold', () => {
@@ -210,7 +209,7 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
     L.fund(attacker.publicKey(), { thresholds: [1, 1, 1, 1] });
 
     const balanceBefore = BigInt(
-      loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance().toString(),
+      loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance.toString(),
     );
 
     const { hostFn, resources } = fixture(L);
@@ -223,9 +222,9 @@ describe('ROUND 2 — operation source as the Soroban invoker', () => {
     // below is the headline: the fee and the sequence number of the account
     // that signed nothing were both consumed.
     const balanceAfter = BigInt(
-      loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance().toString(),
+      loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.balance.toString(),
     );
-    const seqAfter = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.seqNum().toString();
+    const seqAfter = loadAccount(L, accountIdFromPublicKey(victim.publicKey()))!.seqNum.toString();
     console.log(
       `[r2] tx-source-LOW gap: code=${out.code} victimDebited=${balanceBefore - balanceAfter} victimSeq=${seqAfter}`,
     );
@@ -260,8 +259,8 @@ function fixture(L: Ledger) {
     createContractHostFn(accB64(deployer.publicKey()), wasmHash),
     accB64(deployer.publicKey()),
   );
-  const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+  const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   const hostFn = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
   const sim = L.simulate(hostFn, accB64(deployer.publicKey()));
-  return { hostFn, resources: xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64') };
+  return { hostFn, resources: xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64') };
 }

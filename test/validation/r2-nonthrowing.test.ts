@@ -29,7 +29,7 @@ const CODE = new Uint8Array(
 );
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 
 function scaffold(L: Ledger) {
   const dep = Keypair.random();
@@ -41,7 +41,7 @@ function scaffold(L: Ledger) {
   );
   return {
     src: accB64(dep.publicKey()),
-    addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(),
+    addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
   };
 }
 
@@ -52,16 +52,16 @@ describe('ROUND 2 — fix 11: non-throwing failures', () => {
     const fn = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
     const sim = L.simulate(fn, src);
     // Strip the read-write footprint: the write is now outside it.
-    const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    const res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     const stripped = new xdr.SorobanResources({
-      footprint: new xdr.LedgerFootprint({ readOnly: res.footprint().readOnly(), readWrite: [] }),
-      instructions: res.instructions(),
-      diskReadBytes: res.diskReadBytes(),
-      writeBytes: res.writeBytes(),
+      footprint: new xdr.LedgerFootprint({ readOnly: res.footprint.readOnly, readWrite: [] }),
+      instructions: res.instructions,
+      diskReadBytes: res.diskReadBytes,
+      writeBytes: res.writeBytes,
     });
     let sent: any;
     expect(() => {
-      sent = L.send(fn, src, stripped.toXDR('base64'), sim.authXdr, []);
+      sent = L.send(fn, src, stripped.toXdr('base64'), sim.authXdr, []);
     }).not.toThrow();
     expect(sent.ok).toBe(false);
     expect(sent.error).toBeTruthy();
@@ -75,16 +75,16 @@ describe('ROUND 2 — fix 11: non-throwing failures', () => {
     L.enforceDeclaredResources(true);
     const fn = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
     const sim = L.simulate(fn, src);
-    const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    const res = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     const tiny = new xdr.SorobanResources({
-      footprint: res.footprint(),
+      footprint: res.footprint,
       instructions: 1_000,
-      diskReadBytes: res.diskReadBytes(),
-      writeBytes: res.writeBytes(),
+      diskReadBytes: res.diskReadBytes,
+      writeBytes: res.writeBytes,
     });
     let sent: any;
     expect(() => {
-      sent = L.send(fn, src, tiny.toXDR('base64'), sim.authXdr, sim.restoredRwEntryIndices);
+      sent = L.send(fn, src, tiny.toXdr('base64'), sim.authXdr, sim.restoredRwEntryIndices);
     }).not.toThrow();
     expect(sent.ok).toBe(false);
     expect(sent.error).toMatch(/Budget|ExceededLimit/);

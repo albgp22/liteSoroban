@@ -231,21 +231,21 @@ function fromNode(sim: rpc.Api.SimulateTransactionResponse): Side {
     };
   }
   const ok = sim as rpc.Api.SimulateTransactionSuccessResponse;
-  const res = ok.transactionData.build().resources();
+  const res = ok.transactionData.build().resources;
   return {
     ok: true,
-    readOnly: sorted(res.footprint().readOnly().map((k) => k.toXDR('base64'))),
-    readWrite: sorted(res.footprint().readWrite().map((k) => k.toXDR('base64'))),
-    instructions: res.instructions(),
-    diskReadBytes: res.diskReadBytes(),
-    writeBytes: res.writeBytes(),
-    retval: ok.result?.retval.toXDR('base64'),
+    readOnly: sorted(res.footprint.readOnly.map((k) => k.toXdr('base64'))),
+    readWrite: sorted(res.footprint.readWrite.map((k) => k.toXdr('base64'))),
+    instructions: res.instructions,
+    diskReadBytes: res.diskReadBytes,
+    writeBytes: res.writeBytes,
+    retval: ok.result?.retval.toXdr('base64'),
     // The node returns DIAGNOSTIC events (fn_call / fn_return / contract);
     // the harness's SimulateResult.eventsXdr carries `contract_events` only.
     contractEvents: (ok.events ?? [])
-      .filter((e) => e.event().type().name === 'contract')
-      .map((e) => e.event().toXDR('base64')),
-    auth: (ok.result?.auth ?? []).map((a) => a.toXDR('base64')),
+      .filter((e) => e.event.type.name === 'contract')
+      .map((e) => e.event.toXdr('base64')),
+    auth: (ok.result?.auth ?? []).map((a) => a.toXdr('base64')),
   };
 }
 
@@ -283,16 +283,16 @@ interface NodeApply {
 async function nodeApply(
   kp: Keypair,
   fn: xdr.HostFunction,
-  mutateSorobanData?: (d: xdr.SorobanTransactionData) => void,
+  rebuildSorobanData?: (d: xdr.SorobanTransactionData) => xdr.SorobanTransactionData,
 ): Promise<NodeApply> {
   const { tx, sim } = await nodeSimulate(kp, fn);
   if (!rpc.Api.isSimulationSuccess(sim)) {
     throw new Error(`node simulation failed: ${(sim as any).error}`);
   }
   let prepared = rpc.assembleTransaction(tx, sim).build();
-  if (mutateSorobanData) {
-    const data = prepared.toEnvelope().v1().tx().ext().sorobanData();
-    mutateSorobanData(data);
+  if (rebuildSorobanData) {
+    const env = xdr.expectUnionVariant(prepared.toEnvelope(), 'envelopeTypeTx');
+    const data = rebuildSorobanData(xdr.expectUnionVariant(env.v1.tx.ext, 'sorobanData').sorobanData);
     prepared = TransactionBuilder.cloneFrom(prepared).setSorobanData(data).build();
   }
   prepared.sign(kp);
@@ -301,7 +301,7 @@ async function nodeApply(
   if (sent.status !== 'PENDING') {
     return {
       status: sent.status,
-      opResult: sent.errorResult?.result().switch().name,
+      opResult: sent.errorResult?.result.type,
       scErrors: [],
     };
   }
@@ -312,13 +312,11 @@ async function nodeApply(
   let opResult: string | undefined;
   try {
     const resultXdr: string =
-      typeof got.resultXdr === 'string' ? got.resultXdr : got.resultXdr.toXDR('base64');
-    opResult = xdr.TransactionResult.fromXDR(resultXdr, 'base64')
-      .result()
-      .results()[0]
-      .tr()
-      .invokeHostFunctionResult()
-      .switch().name;
+      typeof got.resultXdr === 'string' ? got.resultXdr : got.resultXdr.toXdr('base64');
+    const res = xdr.TransactionResult.fromXdr(resultXdr, 'base64').result;
+    if (res.type !== 'txSuccess' && res.type !== 'txFailed') throw new Error(res.type);
+    const tr = xdr.expectUnionVariant(res.results[0], 'opInner').tr;
+    opResult = xdr.expectUnionVariant(tr, 'invokeHostFunction').invokeHostFunctionResult.type;
   } catch {
     /* txSUCCESS with a different shape, or a fee-bump; not needed here */
   }
@@ -327,14 +325,9 @@ async function nodeApply(
 
 /** `Error(Storage, ExceededLimit)`-style rendering of an `ScError`. */
 function formatScError(e: any): string {
-  const type = e.switch().name.replace(/^sce/, '');
-  if (type === 'Contract') return `Contract, #${e.contractCode()}`;
-  let code: any;
-  try {
-    code = e.code();
-  } catch {
-    code = e.value();
-  }
+  const type = e.type.replace(/^sce/, '');
+  if (type === 'Contract') return `Contract, #${e.contractCode}`;
+  const code: any = e.code ?? e.value;
   const name = typeof code?.name === 'string' ? code.name : String(code);
   return `${type}, ${name.replace(/^scec/, '').replace(/^./, (c) => c.toUpperCase())}`;
 }
@@ -342,12 +335,12 @@ function formatScError(e: any): string {
 function scErrorsOf(diagnostics: xdr.DiagnosticEvent[] | undefined): string[] {
   const out: string[] = [];
   for (const d of diagnostics ?? []) {
-    const body = d.event().body().v0();
-    for (const t of body.topics()) {
-      if (t.switch().name === 'scvError') out.push(formatScError(t.error()));
+    const body = xdr.expectUnionVariant(d.event.body, 'v0').v0;
+    for (const t of body.topics) {
+      if (t.type === 'scvError') out.push(formatScError(t.error));
     }
-    const data = body.data();
-    if (data.switch().name === 'scvError') out.push(formatScError(data.error()));
+    const data = body.data;
+    if (data.type === 'scvError') out.push(formatScError(data.error));
   }
   return out;
 }
@@ -375,7 +368,7 @@ function instanceKey(contractId: string): xdr.LedgerKey {
     new xdr.LedgerKeyContractData({
       contract: Address.fromString(contractId).toScAddress(),
       key: xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: xdr.ContractDataDurability.persistent(),
+      durability: xdr.ContractDataDurability.persistent,
     }),
   );
 }
@@ -396,8 +389,8 @@ async function mirror(L: Ledger, keys: xdr.LedgerKey[]): Promise<number> {
       new xdr.LedgerEntry({
         lastModifiedLedgerSeq: L.ledgerSeq,
         data: e.val,
-        ext: new xdr.LedgerEntryExt(0),
-      }).toXDR('base64'),
+        ext: xdr.LedgerEntryExt.v0(),
+      }).toXdr('base64'),
       liveUntil,
     );
   }
@@ -587,9 +580,10 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
       );
       expect(uploadSent.ok, `in-process upload failed: ${uploadSent.error}`).toBe(true);
 
-      const wasmHash = xdr.ScVal.fromXDR(inprocUpload.returnValueXdr!, 'base64')
-        .bytes()
-        .toString('base64');
+      const wasmHash = Buffer.from(
+        xdr.expectUnionVariant(xdr.ScVal.fromXdr(inprocUpload.returnValueXdr!, 'base64'), 'scvBytes')
+          .bytes.toBytes(),
+      ).toString('base64');
 
       // -- scenario 2: deploy -------------------------------------------------
       const deployFn = createContractHostFn(wallet.accountIdB64, wasmHash, Buffer.alloc(32, 0x2a));
@@ -609,7 +603,10 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
       );
       expect(deploySent.ok, `in-process deploy failed: ${deploySent.error}`).toBe(true);
 
-      const addContract = xdr.ScVal.fromXDR(inprocDeploy.returnValueXdr!, 'base64').address();
+      const addContract = xdr.expectUnionVariant(
+        xdr.ScVal.fromXdr(inprocDeploy.returnValueXdr!, 'base64'),
+        'scvAddress',
+      ).address;
 
       // -- scenario 3: invoke add(2, 3) --------------------------------------
       const addFn = invokeHostFn(addContract, 'add', [i32(2), i32(3)]);
@@ -633,9 +630,10 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
         inprocDataUpload.authXdr,
         inprocDataUpload.restoredRwEntryIndices,
       );
-      const dataHash = xdr.ScVal.fromXDR(inprocDataUpload.returnValueXdr!, 'base64')
-        .bytes()
-        .toString('base64');
+      const dataHash = Buffer.from(
+        xdr.expectUnionVariant(xdr.ScVal.fromXdr(inprocDataUpload.returnValueXdr!, 'base64'), 'scvBytes')
+          .bytes.toBytes(),
+      ).toString('base64');
 
       const dataDeployFn = createContractHostFn(
         wallet.accountIdB64,
@@ -651,7 +649,10 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
         inprocDataDeploy.authXdr,
         inprocDataDeploy.restoredRwEntryIndices,
       );
-      const dataContract = xdr.ScVal.fromXDR(inprocDataDeploy.returnValueXdr!, 'base64').address();
+      const dataContract = xdr.expectUnionVariant(
+        xdr.ScVal.fromXdr(inprocDataDeploy.returnValueXdr!, 'base64'),
+        'scvAddress',
+      ).address;
 
       const putFn = invokeHostFn(dataContract, 'put_persistent', [sym('ctr'), u64(42n)]);
       await sync();
@@ -683,7 +684,7 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
       const sacCreateFn = xdr.HostFunction.hostFunctionTypeCreateContract(
         new xdr.CreateContractArgs({
           contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAsset(
-            native.toXDRObject(),
+            native.toXdrObject(),
           ),
           executable: xdr.ContractExecutable.contractExecutableStellarAsset(),
         }),
@@ -716,17 +717,17 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
         accountShapes = [];
         for (const ch of changes) {
           if (!ch.before) continue;
-          const key = ch.key.toXDR('base64');
+          const key = ch.key.toXdr('base64');
           // What the node STORES (getLedgerEntries), as opposed to `before`,
           // which is the entry after preflight's account normalisation.
           const stored = (await server.getLedgerEntries(ch.key)).entries[0];
           accountShapes.push({
             key,
-            node: ch.before.toXDR('base64'),
-            nodeStored: stored?.val.toXDR('base64'),
+            node: ch.before.toXdr('base64'),
+            nodeStored: stored?.val.toXdr('base64'),
             inproc: L.getEntry(key),
           });
-          L.putEntry(ch.before.toXDR('base64'));
+          L.putEntry(ch.before.toXdr('base64'));
         }
         const inprocResynced = L.simulate(transferFn, wallet.accountIdB64);
         sacResynced = {
@@ -737,17 +738,25 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
 
       // -- scenario 7: footprint violation (apply path) -----------------------
       const emptyFootprint = (d: xdr.SorobanTransactionData) =>
-        d.resources().footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+        new xdr.SorobanTransactionData({
+          ...d,
+          resources: new xdr.SorobanResources({
+            ...d.resources,
+            footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+          }),
+        });
 
       const nodeFootprint = await nodeApply(kp, addFn, emptyFootprint);
-      const strippedResources = xdr.SorobanResources.fromXDR(inprocAdd.resourcesXdr, 'base64');
-      strippedResources.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+      const strippedResources = new xdr.SorobanResources({
+        ...xdr.SorobanResources.fromXdr(inprocAdd.resourcesXdr, 'base64'),
+        footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+      });
       let inprocFootprint: { ok: boolean; error?: string };
       try {
         inprocFootprint = L.send(
           addFn,
           wallet.accountIdB64,
-          strippedResources.toXDR('base64'),
+          strippedResources.toXdr('base64'),
           inprocAdd.authXdr,
           [],
         );
@@ -764,17 +773,23 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
       // -- scenario 8: budget failure (apply path) ----------------------------
       // A transaction declares its own CPU limit in SorobanResources.instructions;
       // stellar-core builds the budget from it. 1,000 is far below what add() costs.
-      const starveInstructions = (d: xdr.SorobanTransactionData) => d.resources().instructions(1000);
+      const starveInstructions = (d: xdr.SorobanTransactionData) =>
+        new xdr.SorobanTransactionData({
+          ...d,
+          resources: new xdr.SorobanResources({ ...d.resources, instructions: 1000 }),
+        });
 
       const nodeBudget = await nodeApply(kp, addFn, starveInstructions);
-      const starved = xdr.SorobanResources.fromXDR(inprocAdd.resourcesXdr, 'base64');
-      starved.instructions(1000);
+      const starved = new xdr.SorobanResources({
+        ...xdr.SorobanResources.fromXdr(inprocAdd.resourcesXdr, 'base64'),
+        instructions: 1000,
+      });
       let inprocBudget: { ok: boolean; error?: string };
       try {
         inprocBudget = L.send(
           addFn,
           wallet.accountIdB64,
-          starved.toXDR('base64'),
+          starved.toXdr('base64'),
           inprocAdd.authXdr,
           [],
         );
@@ -882,13 +897,17 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
       if (!b64) return { accountBytes: 0, extDepth: -1 };
       const data =
         kind === 'entry'
-          ? xdr.LedgerEntry.fromXDR(b64, 'base64').data()
-          : xdr.LedgerEntryData.fromXDR(b64, 'base64');
-      const acc = data.account();
-      let depth = acc.ext().switch();
-      if (depth === 1) depth = acc.ext().v1().ext().switch() === 2 ? 2 : 1;
-      if (depth === 2) depth = acc.ext().v1().ext().v2().ext().switch() === 3 ? 3 : 2;
-      return { accountBytes: acc.toXDR().length, extDepth: depth };
+          ? xdr.LedgerEntry.fromXdr(b64, 'base64').data
+          : xdr.LedgerEntryData.fromXdr(b64, 'base64');
+      const acc = xdr.expectUnionVariant(data, 'account').account;
+      // AccountEntryExt v0|v1 -> AccountEntryExtensionV1Ext v0|v2 -> AccountEntryExtensionV2Ext v0|v3
+      let depth = 0;
+      if (acc.ext.type === 'v1') {
+        depth = 1;
+        const v1Ext = acc.ext.v1.ext;
+        if (v1Ext.type === 'v2') depth = v1Ext.v2.ext.type === 'v3' ? 3 : 2;
+      }
+      return { accountBytes: acc.toXdr().length, extDepth: depth };
     };
 
     it('the harness stores the same AccountEntry shape the node stores', () => {
@@ -965,18 +984,21 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
   it('the harness meters with the same CPU cost parameters as the live network', async () => {
     const key = xdr.LedgerKey.configSetting(
       new xdr.LedgerKeyConfigSetting({
-        configSettingId: xdr.ConfigSettingId.configSettingContractCostParamsCpuInstructions(),
+        configSettingId: xdr.ConfigSettingId.configSettingContractCostParamsCpuInstructions,
       }),
     );
     const res = await server.getLedgerEntries(key);
     expect(res.entries.length, 'the node must expose its CPU cost params').toBe(1);
-    const live = (res.entries[0].val as any).configSetting().contractCostParamsCpuInsns();
+    const live = xdr.expectUnionVariant(
+      xdr.expectUnionVariant(res.entries[0].val, 'configSetting').configSetting,
+      'configSettingContractCostParamsCpuInstructions',
+    ).contractCostParamsCpuInsns;
 
     const differences: string[] = [];
     for (let i = 0; i < Math.min(live.length, HOST_DEFAULT_CPU_COST_PARAMS.length); i++) {
       const [name, constTerm, linTerm] = HOST_DEFAULT_CPU_COST_PARAMS[i];
-      const liveConst = Number(live[i].constTerm().toString());
-      const liveLin = Number(live[i].linearTerm().toString());
+      const liveConst = Number(live[i].constTerm);
+      const liveLin = Number(live[i].linearTerm);
       if (liveConst !== constTerm || liveLin !== linTerm) {
         differences.push(
           `  [${i}] ${name}: host Budget::default() = (${constTerm}, ${linTerm}), ` +

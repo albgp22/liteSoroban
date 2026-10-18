@@ -21,7 +21,7 @@ function deploy(L: Ledger, source: string): xdr.ScAddress {
   const wasmHash = L.seedWasm(CONTRACT_DATA);
   const { sent } = L.simulateAndSend(createContractHostFn(source, wasmHash), source);
   expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-  return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+  return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 }
 
 describe('in-process Soroban ledger (wasm host)', () => {
@@ -42,13 +42,13 @@ describe('in-process Soroban ledger (wasm host)', () => {
 
   it('req 5: seeds a funded account with no network', () => {
     expect(L.entryCount()).toBe(1);
-    const account = xdr.AccountId.fromXDR(source, 'base64');
-    expect(account.switch().name).toBe('publicKeyTypeEd25519');
+    const account = xdr.AccountId.fromXdr(source, 'base64');
+    expect(account.type).toBe('publicKeyTypeEd25519');
   });
 
   it('req 3: deploys a contract and invokes it', () => {
     const addr = deploy(L, source);
-    expect(addr.switch().name).toBe('scAddressTypeContract');
+    expect(addr.type).toBe('scAddressTypeContract');
 
     const { sim, sent } = L.simulateAndSend(
       invokeHostFn(addr, 'put_persistent', [sym('ctr'), u64(42n)]),
@@ -68,7 +68,7 @@ describe('in-process Soroban ledger (wasm host)', () => {
     // A completely separate transaction, reading through the snapshot source.
     const read = L.simulate(invokeHostFn(addr, 'get_persistent', [sym('ctr')]), source);
     expect(read.ok, read.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(read.returnValueXdr!, 'base64'))).toBe(42n);
+    expect(scValToNative(xdr.ScVal.fromXdr(read.returnValueXdr!, 'base64'))).toBe(42n);
   });
 
   it('req 1: overwriting state through a second transaction works', () => {
@@ -77,7 +77,7 @@ describe('in-process Soroban ledger (wasm host)', () => {
     L.simulateAndSend(invokeHostFn(addr, 'put_persistent', [sym('ctr'), u64(999n)]), source);
 
     const read = L.simulate(invokeHostFn(addr, 'get_persistent', [sym('ctr')]), source);
-    expect(scValToNative(xdr.ScVal.fromXDR(read.returnValueXdr!, 'base64'))).toBe(999n);
+    expect(scValToNative(xdr.ScVal.fromXdr(read.returnValueXdr!, 'base64'))).toBe(999n);
   });
 
   it('the apply path ENFORCES the footprint (not just records it)', () => {
@@ -87,12 +87,14 @@ describe('in-process Soroban ledger (wasm host)', () => {
     expect(sim.ok).toBe(true);
 
     // Strip the footprint that simulation computed. Enforcing mode must refuse.
-    const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-    resources.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+    const resources = new xdr.SorobanResources({
+      ...xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+      footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+    });
 
     let succeeded = false;
     try {
-      const sent = L.send(hostFn, source, resources.toXDR('base64'), sim.authXdr, []);
+      const sent = L.send(hostFn, source, resources.toXdr('base64'), sim.authXdr, []);
       succeeded = sent.ok;
     } catch {
       succeeded = false;
@@ -118,7 +120,7 @@ describe('in-process Soroban ledger (wasm host)', () => {
     expect(gone.ok).toBe(false);
     // ...and the surviving one still reads.
     const kept = L.simulate(invokeHostFn(addr, 'get_persistent', [sym('ctr')]), source);
-    expect(scValToNative(xdr.ScVal.fromXDR(kept.returnValueXdr!, 'base64'))).toBe(1n);
+    expect(scValToNative(xdr.ScVal.fromXdr(kept.returnValueXdr!, 'base64'))).toBe(1n);
   });
 
   it('req 4: each test starts from a clean ledger', () => {
@@ -134,6 +136,6 @@ describe('in-process Soroban ledger (wasm host)', () => {
     // The very same Ledger keeps working afterwards.
     L.simulateAndSend(invokeHostFn(addr, 'put_persistent', [sym('ok'), u64(3n)]), source);
     const after = L.simulate(invokeHostFn(addr, 'get_persistent', [sym('ok')]), source);
-    expect(scValToNative(xdr.ScVal.fromXDR(after.returnValueXdr!, 'base64'))).toBe(3n);
+    expect(scValToNative(xdr.ScVal.fromXdr(after.returnValueXdr!, 'base64'))).toBe(3n);
   });
 });

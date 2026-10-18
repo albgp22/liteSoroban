@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { xdr, rpc, contract, Keypair, Networks, Address } from '@stellar/stellar-sdk';
 import { Ledger, createContractHostFn } from '../src/index.js';
-import { attachInProcessRpc } from '../src/fake-rpc.js';
+import { attachInProcessRpc, type AdapterStats } from '../src/fake-rpc.js';
 import { accountIdFromPublicKey } from '../src/classic.js';
 
 const CODE = new Uint8Array(
@@ -14,6 +14,7 @@ const RPC_URL = 'https://in-process.invalid';
 describe('contract.Client against the in-process ledger', () => {
   let L: Ledger;
   let server: rpc.Server;
+  let stats: AdapterStats;
   let kp: Keypair;
   let contractId: string;
   let spec: contract.Spec;
@@ -24,12 +25,12 @@ describe('contract.Client against the in-process ledger', () => {
     L.fund(kp.publicKey());
 
     server = new rpc.Server(RPC_URL);
-    attachInProcessRpc(server, L);
+    stats = attachInProcessRpc(server, L);
 
-    const sourceB64 = accountIdFromPublicKey(kp.publicKey()).toXDR('base64');
+    const sourceB64 = accountIdFromPublicKey(kp.publicKey()).toXdr('base64');
     const wasmHash = L.seedWasm(CODE);
     const { sent } = L.simulateAndSend(createContractHostFn(sourceB64, wasmHash), sourceB64);
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
     contractId = Address.fromScAddress(addr).toString();
 
     spec = await contract.Spec.fromWasm(Buffer.from(CODE));
@@ -41,14 +42,14 @@ describe('contract.Client against the in-process ledger', () => {
       networkPassphrase: Networks.TESTNET,
       rpcUrl: RPC_URL,
       publicKey: kp.publicKey(),
-      // The DI seam. Honoured by the constructor (client.js:45) and by
-      // Client.from / Client.fromWasmHash (client.js:135, :198).
+      // The DI seam. Honoured by the constructor (client.js:24-31) and by
+      // Client.from / Client.fromWasmHash (client.js:204, :136).
       server: server as any,
     });
   }
 
   it('exposes the contract methods from the wasm spec', () => {
-    const names = spec.funcs().map((f) => f.name().toString());
+    const names = spec.funcs().map((f) => f.name.toString());
     expect(names).toContain('put_persistent');
     expect(names).toContain('get_persistent');
   });
@@ -75,11 +76,15 @@ describe('contract.Client against the in-process ledger', () => {
     expect(readTx.result).toBe(7n);
   });
 
-  it('DOCUMENTS THE TRAP: Client.deploy ignores options.server and hits the network', async () => {
-    // client.js:36-38 builds `new RpcServer(rpcUrl, serverOpts)` in a private
-    // helper and never consults options.server. Against an unresolvable URL
-    // this must fail — if this test ever starts passing, the leak was fixed
-    // upstream and the workaround below can be dropped.
+  it('Client.deploy honours options.server: it asks the in-process ledger, not the network', async () => {
+    // Through 16.2.0, deploy built `new RpcServer(rpcUrl, serverOpts)` in a
+    // private helper and never consulted options.server. 17.0.0 fixed that
+    // (stellar/js-stellar-sdk#1665): client.js:71 is now
+    // `clientOptions.server ?? new RpcServer(rpcUrl, ...)`. So the wasm lookup
+    // reaches the injected server, which answers from the in-process ledger;
+    // nothing there has the zero hash, so the deploy still rejects, but for
+    // the missing code (rpc/server.js:614-619), not for an unresolvable URL.
+    const before = stats.calls.length;
     await expect(
       contract.Client.deploy(null, {
         wasmHash: Buffer.alloc(32).toString('hex'),
@@ -89,6 +94,7 @@ describe('contract.Client against the in-process ledger', () => {
         publicKey: kp.publicKey(),
         server: server as any,
       } as any),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: 404, message: 'Could not obtain contract wasm from server' });
+    expect(stats.calls.slice(before).map((c) => c.method)).toContain('getLedgerEntries');
   });
 });

@@ -44,7 +44,7 @@ describe('rpc.Server compatibility', () => {
       new xdr.LedgerKeyContractData({
         contract: c.address,
         key: xdr.ScVal.scvLedgerKeyContractInstance(),
-        durability: xdr.ContractDataDurability.persistent(),
+        durability: xdr.ContractDataDurability.persistent,
       }),
     );
 
@@ -85,7 +85,7 @@ describe('rpc.Server compatibility', () => {
   it('getLedgerEntries returns LedgerEntryData and a TTL', async () => {
     const r = await server.getLedgerEntries(instanceKey());
     expect(r.entries).toHaveLength(1);
-    expect(r.entries[0].val.switch().name).toBe('contractData');
+    expect(r.entries[0].val.type).toBe('contractData');
     expect(r.entries[0].liveUntilLedgerSeq).toBeGreaterThan(0);
   });
 
@@ -95,7 +95,7 @@ describe('rpc.Server compatibility', () => {
       xdr.ScVal.scvLedgerKeyContractInstance(),
       rpc.Durability.Persistent,
     );
-    expect(d.val.switch().name).toBe('contractData');
+    expect(d.val.type).toBe('contractData');
 
     const inst = await (server as any).getContractInstance(c.contractId);
     expect(inst).toBeTruthy();
@@ -250,7 +250,11 @@ describe('rpc.Server compatibility', () => {
       expect(client).toBeInstanceOf(contract.Client);
     });
 
-    it('KNOWN TRAP: Client.deploy ignores options.server and reaches the network', async () => {
+    // Through 16.2.0 deploy ignored options.server and reached the network.
+    // 17.0.0 fixed that (client.js:71, `clientOptions.server ?? new RpcServer(...)`),
+    // so the zero hash is looked up in the in-process ledger and is missing there
+    // (rpc/server.js:614-619); an unresolvable URL would fail differently.
+    it('Client.deploy honours options.server', async () => {
       await expect(
         contract.Client.deploy(null, {
           wasmHash: Buffer.alloc(32).toString('hex'),
@@ -260,7 +264,7 @@ describe('rpc.Server compatibility', () => {
           publicKey: alice.publicKey,
           server: server as any,
         } as any),
-      ).rejects.toThrow();
+      ).rejects.toMatchObject({ code: 404, message: 'Could not obtain contract wasm from server' });
     });
   });
 });

@@ -122,19 +122,19 @@ export function accountIdFromPublicKey(pk: string): xdr.AccountId {
 
 /** Strip a MuxedAccount down to its underlying AccountId. */
 export function muxedToAccountId(m: xdr.MuxedAccount): xdr.AccountId {
-  return m.switch().name === 'keyTypeMuxedEd25519'
-    ? xdr.AccountId.publicKeyTypeEd25519(m.med25519().ed25519())
-    : xdr.AccountId.publicKeyTypeEd25519(m.ed25519());
+  return m.type === 'keyTypeMuxedEd25519'
+    ? xdr.AccountId.publicKeyTypeEd25519(m.med25519.ed25519)
+    : xdr.AccountId.publicKeyTypeEd25519(m.ed25519);
 }
 
 export function isMuxed(m: xdr.MuxedAccount): boolean {
-  return m.switch().name === 'keyTypeMuxedEd25519';
+  return m.type === 'keyTypeMuxedEd25519';
 }
 
 export function loadAccount(ledger: Ledger, id: xdr.AccountId): xdr.AccountEntry | null {
-  const raw = ledger.getEntry(accountKey(id).toXDR('base64'));
+  const raw = ledger.getEntry(accountKey(id).toXdr('base64'));
   if (!raw) return null;
-  return xdr.LedgerEntry.fromXDR(raw, 'base64').data().account();
+  return xdr.expectUnionVariant(xdr.LedgerEntry.fromXdr(raw, 'base64').data, 'account').account;
 }
 
 export function storeAccount(ledger: Ledger, account: xdr.AccountEntry): void {
@@ -142,10 +142,16 @@ export function storeAccount(ledger: Ledger, account: xdr.AccountEntry): void {
     new xdr.LedgerEntry({
       lastModifiedLedgerSeq: ledger.ledgerSeq,
       data: xdr.LedgerEntryData.account(account),
-      ext: new xdr.LedgerEntryExt(0),
-    }).toXDR('base64'),
+      ext: xdr.LedgerEntryExt.v0(),
+    }).toXdr('base64'),
   );
 }
+
+/** The four threshold bytes: [master weight, low, medium, high]. */
+const thresholdsOf = (account: xdr.AccountEntry): Uint8Array => account.thresholds.toBytes();
+
+/** Byte equality across Buffer and Uint8Array. */
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => Buffer.compare(a, b) === 0;
 
 export interface FundOptions {
   balance?: bigint;
@@ -160,8 +166,8 @@ export function fundAccount(ledger: Ledger, publicKey: string, opts: FundOptions
   const thresholds = opts.thresholds ?? [1, 0, 0, 0];
   const account = new xdr.AccountEntry({
     accountId: accountIdFromPublicKey(publicKey),
-    balance: new xdr.Int64(opts.balance ?? 100_000_000_000n),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(opts.seqNum ?? 0n)),
+    balance: opts.balance ?? 100_000_000_000n,
+    seqNum: opts.seqNum ?? 0n,
     numSubEntries: 0,
     inflationDest: null,
     flags: 0,
@@ -174,15 +180,15 @@ export function fundAccount(ledger: Ledger, publicKey: string, opts: FundOptions
           weight: s.weight,
         }),
     ),
-    ext: new xdr.AccountEntryExt(0),
+    ext: xdr.AccountEntryExt.v0(),
   });
   storeAccount(ledger, account);
 }
 
 /** Available balance net of the base reserve requirement. */
 export function availableBalance(account: xdr.AccountEntry): bigint {
-  const reserve = BigInt(2 + account.numSubEntries()) * BigInt(BASE_RESERVE);
-  return BigInt(account.balance().toString()) - reserve;
+  const reserve = BigInt(2 + account.numSubEntries) * BigInt(BASE_RESERVE);
+  return account.balance - reserve;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,19 +208,19 @@ const SOROBAN_OP_TYPES = new Set([
 export function signatureWeight(
   account: xdr.AccountEntry,
   signatures: xdr.DecoratedSignature[],
-  txHash: Buffer,
+  txHash: Uint8Array,
 ): number {
   const candidates: { pk: string; weight: number }[] = [
     {
-      pk: StrKey.encodeEd25519PublicKey(account.accountId().ed25519()),
-      weight: account.thresholds()[0],
+      pk: StrKey.encodeEd25519PublicKey(account.accountId.ed25519.toBytes()),
+      weight: thresholdsOf(account)[0],
     },
   ];
-  for (const s of account.signers()) {
-    if (s.key().switch().name !== 'signerKeyTypeEd25519') continue;
+  for (const s of account.signers) {
+    if (s.key.type !== 'signerKeyTypeEd25519') continue;
     candidates.push({
-      pk: StrKey.encodeEd25519PublicKey(s.key().ed25519()),
-      weight: s.weight(),
+      pk: StrKey.encodeEd25519PublicKey(s.key.ed25519.toBytes()),
+      weight: s.weight,
     });
   }
 
@@ -225,8 +231,8 @@ export function signatureWeight(
       if (used.has(c.pk)) continue;
       const kp = Keypair.fromPublicKey(c.pk);
       // Hint is a cheap prefilter; the signature check is what decides.
-      if (!kp.signatureHint().equals(sig.hint())) continue;
-      if (kp.verify(txHash, sig.signature())) {
+      if (!sameBytes(kp.signatureHint(), sig.hint.toBytes())) continue;
+      if (kp.verify(txHash, sig.signature.toBytes())) {
         used.add(c.pk);
         total += c.weight;
         break;
@@ -250,31 +256,32 @@ export interface WeightedSigner {
  */
 export function accountSigners(account: xdr.AccountEntry): WeightedSigner[] {
   const signers: WeightedSigner[] = [];
-  const master = account.thresholds()[0];
+  const master = thresholdsOf(account)[0];
   if (master) {
     signers.push({
-      key: xdr.SignerKey.signerKeyTypeEd25519(account.accountId().ed25519()),
+      key: xdr.SignerKey.signerKeyTypeEd25519(account.accountId.ed25519),
       weight: master,
     });
   }
-  for (const s of account.signers()) signers.push({ key: s.key(), weight: s.weight() });
+  for (const s of account.signers) signers.push({ key: s.key, weight: s.weight });
   return signers;
 }
 
 /** SignatureUtils getHint: the last 4 bytes, or all of them zero-padded if fewer. */
-function hintOf(bytes: Buffer): Buffer {
+function hintOf(bytes: Uint8Array): Buffer {
+  const b = Buffer.from(bytes);
   const hint = Buffer.alloc(4);
-  if (bytes.length < 4) bytes.copy(hint, 0);
-  else bytes.copy(hint, 0, bytes.length - 4);
+  if (b.length < 4) b.copy(hint, 0);
+  else b.copy(hint, 0, b.length - 4);
   return hint;
 }
 
 /** SignatureUtils doesHintMatch: needs at least 4 bytes, compares the last 4. */
-function hintMatches(bytes: Buffer, hint: Buffer): boolean {
-  return bytes.length >= 4 && bytes.subarray(bytes.length - 4).equals(hint);
+function hintMatches(bytes: Uint8Array, hint: Uint8Array): boolean {
+  return bytes.length >= 4 && sameBytes(bytes.subarray(bytes.length - 4), hint);
 }
 
-function verifyEd25519(publicKey: Buffer, signature: Buffer, message: Buffer): boolean {
+function verifyEd25519(publicKey: Uint8Array, signature: Uint8Array, message: Uint8Array): boolean {
   try {
     return Keypair.fromPublicKey(StrKey.encodeEd25519PublicKey(publicKey)).verify(message, signature);
   } catch {
@@ -303,18 +310,18 @@ export class SignatureChecker {
 
   constructor(
     private readonly signatures: xdr.DecoratedSignature[],
-    private readonly contentsHash: Buffer,
+    private readonly contentsHash: Uint8Array,
   ) {
     this.used = signatures.map(() => false);
   }
 
   checkSignature(signers: WeightedSigner[], neededWeight: number): boolean {
-    const ofType = (name: string) => signers.filter((s) => s.key.switch().name === name);
+    const ofType = (name: xdr.SignerKey['type']) => signers.filter((s) => s.key.type === name);
     const cap = (w: number) => Math.min(w, 255);
     let total = 0;
 
     for (const s of ofType('signerKeyTypePreAuthTx')) {
-      if (s.key.preAuthTx().equals(this.contentsHash)) {
+      if (sameBytes(xdr.expectUnionVariant(s.key, 'signerKeyTypePreAuthTx').preAuthTx.toBytes(), this.contentsHash)) {
         total += cap(s.weight);
         if (total >= neededWeight) return true;
       }
@@ -336,24 +343,29 @@ export class SignatureChecker {
     };
 
     if (
-      verifyAll(ofType('signerKeyTypeHashX'), (sig, s) =>
-        hintMatches(s.key.hashX(), sig.hint()) && sha256(sig.signature()).equals(s.key.hashX()),
-      )
+      verifyAll(ofType('signerKeyTypeHashX'), (sig, s) => {
+        const hashX = xdr.expectUnionVariant(s.key, 'signerKeyTypeHashX').hashX.toBytes();
+        return hintMatches(hashX, sig.hint.toBytes()) && sameBytes(sha256(sig.signature.toBytes()), hashX);
+      })
     ) {
       return true;
     }
     if (
-      verifyAll(ofType('signerKeyTypeEd25519'), (sig, s) =>
-        hintMatches(s.key.ed25519(), sig.hint()) &&
-        verifyEd25519(s.key.ed25519(), sig.signature(), this.contentsHash),
-      )
+      verifyAll(ofType('signerKeyTypeEd25519'), (sig, s) => {
+        const ed25519 = xdr.expectUnionVariant(s.key, 'signerKeyTypeEd25519').ed25519.toBytes();
+        return (
+          hintMatches(ed25519, sig.hint.toBytes()) &&
+          verifyEd25519(ed25519, sig.signature.toBytes(), this.contentsHash)
+        );
+      })
     ) {
       return true;
     }
     return verifyAll(ofType('signerKeyTypeEd25519SignedPayload'), (sig, s) => {
-      const sp = s.key.ed25519SignedPayload();
-      const hint = Buffer.from(hintOf(sp.ed25519()).map((b, i) => b ^ hintOf(sp.payload())[i]));
-      return hint.equals(sig.hint()) && verifyEd25519(sp.ed25519(), sig.signature(), sp.payload());
+      const sp = xdr.expectUnionVariant(s.key, 'signerKeyTypeEd25519SignedPayload').ed25519SignedPayload;
+      const ed25519 = sp.ed25519.toBytes();
+      const hint = Buffer.from(hintOf(ed25519).map((b, i) => b ^ hintOf(sp.payload)[i]));
+      return sameBytes(hint, sig.hint.toBytes()) && verifyEd25519(ed25519, sig.signature.toBytes(), sp.payload);
     });
   }
 
@@ -371,7 +383,7 @@ export class SignatureChecker {
 export function checkSignature(
   account: xdr.AccountEntry,
   signatures: xdr.DecoratedSignature[],
-  txHash: Buffer,
+  txHash: Uint8Array,
   neededWeight: number,
 ): boolean {
   return new SignatureChecker(signatures, txHash).checkSignature(accountSigners(account), neededWeight);
@@ -379,9 +391,9 @@ export function checkSignature(
 
 /** PRECOND_V2 extraSigners: every one must sign (TransactionFrame::checkExtraSigners). */
 function checkExtraSigners(checker: SignatureChecker, raw: xdr.Transaction): boolean {
-  const cond = raw.cond();
-  if (cond.switch().name !== 'precondV2') return true;
-  const extra = cond.v2().extraSigners();
+  const cond = raw.cond;
+  if (cond.type !== 'precondV2') return true;
+  const extra = cond.v2.extraSigners;
   if (extra.length === 0) return true;
   return checker.checkSignature(
     extra.map((key) => ({ key, weight: 1 })),
@@ -394,15 +406,15 @@ function checkExtraSigners(checker: SignatureChecker, raw: xdr.Transaction): boo
 // ---------------------------------------------------------------------------
 
 function preconditionsV2(raw: xdr.Transaction): xdr.PreconditionsV2 | null {
-  const cond = raw.cond();
-  return cond.switch().name === 'precondV2' ? cond.v2() : null;
+  const cond = raw.cond;
+  return cond.type === 'precondV2' ? cond.v2 : null;
 }
 
 /** getTimeBounds: PRECOND_TIME's, or the optional ones carried in PRECOND_V2. */
 function timeBounds(raw: xdr.Transaction): xdr.TimeBounds | null {
-  const cond = raw.cond();
-  if (cond.switch().name === 'precondTime') return cond.timeBounds();
-  return preconditionsV2(raw)?.timeBounds() ?? null;
+  const cond = raw.cond;
+  if (cond.type === 'precondTime') return cond.timeBounds;
+  return preconditionsV2(raw)?.timeBounds ?? null;
 }
 
 /**
@@ -411,14 +423,14 @@ function timeBounds(raw: xdr.Transaction): xdr.TimeBounds | null {
  * txMALFORMED. XDR caps extraSigners at 2, so "identical" compares one pair.
  */
 function extraSignersMalformed(raw: xdr.Transaction): string | null {
-  const extra = preconditionsV2(raw)?.extraSigners() ?? [];
-  if (extra.length === 2 && extra[0].toXDR().equals(extra[1].toXDR())) {
+  const extra = preconditionsV2(raw)?.extraSigners ?? [];
+  if (extra.length === 2 && sameBytes(extra[0].toXdr(), extra[1].toXdr())) {
     return 'the two PRECOND_V2 extraSigners are identical';
   }
   for (const s of extra) {
     if (
-      s.switch().name === 'signerKeyTypeEd25519SignedPayload' &&
-      s.ed25519SignedPayload().payload().length === 0
+      s.type === 'signerKeyTypeEd25519SignedPayload' &&
+      s.ed25519SignedPayload.payload.length === 0
     ) {
       return 'a PRECOND_V2 ed25519SignedPayload extraSigner has an empty payload';
     }
@@ -436,20 +448,20 @@ function boundsProblem(ledger: Ledger, raw: xdr.Transaction): { code: TxResultCo
   const now = BigInt(ledger.timestamp);
   const seq = ledger.ledgerSeq;
   const tb = timeBounds(raw);
-  const lb = preconditionsV2(raw)?.ledgerBounds() ?? null;
-  const minTime = tb ? BigInt(tb.minTime().toString()) : 0n;
-  const maxTime = tb ? BigInt(tb.maxTime().toString()) : 0n;
+  const lb = preconditionsV2(raw)?.ledgerBounds ?? null;
+  const minTime = tb ? tb.minTime : 0n;
+  const maxTime = tb ? tb.maxTime : 0n;
   if (minTime !== 0n && minTime > now) {
     return { code: 'txTOO_EARLY', detail: `minTime ${minTime} is after the close time ${now}` };
   }
-  if (lb && lb.minLedger() > seq) {
-    return { code: 'txTOO_EARLY', detail: `minLedger ${lb.minLedger()} is after ledger ${seq}` };
+  if (lb && lb.minLedger > seq) {
+    return { code: 'txTOO_EARLY', detail: `minLedger ${lb.minLedger} is after ledger ${seq}` };
   }
   if (maxTime !== 0n && maxTime < now) {
     return { code: 'txTOO_LATE', detail: `maxTime ${maxTime} is before the close time ${now}` };
   }
-  if (lb && lb.maxLedger() !== 0 && lb.maxLedger() <= seq) {
-    return { code: 'txTOO_LATE', detail: `maxLedger ${lb.maxLedger()} is not after ledger ${seq}` };
+  if (lb && lb.maxLedger !== 0 && lb.maxLedger <= seq) {
+    return { code: 'txTOO_LATE', detail: `maxLedger ${lb.maxLedger} is not after ledger ${seq}` };
   }
   return null;
 }
@@ -459,9 +471,9 @@ function boundsProblem(ledger: Ledger, raw: xdr.Transaction): { code: TxResultCo
  * the strict account seqNum + 1 rule to minSeqNum <= account seqNum < tx seqNum.
  */
 function badSequence(raw: xdr.Transaction, currentSeq: bigint, txSeq: bigint): string | null {
-  const minSeqNum = preconditionsV2(raw)?.minSeqNum();
-  if (minSeqNum) {
-    const min = BigInt(minSeqNum.toString());
+  // Present-but-zero still relaxes the rule (core tests the optional, not its value).
+  const min = preconditionsV2(raw)?.minSeqNum;
+  if (min != null) {
     if (currentSeq < min || currentSeq >= txSeq) {
       return `minSeqNum ${min} needs the account sequence ${currentSeq} in [${min}, ${txSeq})`;
     }
@@ -479,11 +491,11 @@ function badSequence(raw: xdr.Transaction, currentSeq: bigint, txSeq: bigint): s
  */
 function tooEarlyForAccount(ledger: Ledger, raw: xdr.Transaction, account: xdr.AccountEntry): string | null {
   const v2 = preconditionsV2(raw);
-  const minSeqAge = v2 ? BigInt(v2.minSeqAge().toString()) : 0n;
-  const minSeqLedgerGap = v2 ? v2.minSeqLedgerGap() : 0;
+  const minSeqAge = v2 ? v2.minSeqAge : 0n;
+  const minSeqLedgerGap = v2 ? v2.minSeqLedgerGap : 0;
   const v3 = accountEntryExtensionV3(account);
-  const seqTime = v3 ? BigInt(v3.seqTime().toString()) : 0n;
-  const seqLedger = v3 ? v3.seqLedger() : 0;
+  const seqTime = v3 ? v3.seqTime : 0n;
+  const seqLedger = v3 ? v3.seqLedger : 0;
 
   const closeTime = BigInt(ledger.timestamp);
   if (minSeqAge > closeTime || closeTime - minSeqAge < seqTime) {
@@ -526,10 +538,10 @@ const MAX_RESOURCE_FEE = 1n << 50n;
  * [0, MAX_RESOURCE_FEE]. Checked before anything else, sequence included.
  */
 function xdrProvidesValidFee(raw: xdr.Transaction): string | null {
-  const first = raw.operations()[0];
-  if (!first || !SOROBAN_OP_TYPES.has(first.body().switch().name)) return null;
-  if (raw.ext().switch() !== 1) return 'a Soroban transaction must carry SorobanTransactionData';
-  const resourceFee = BigInt(raw.ext().sorobanData().resourceFee().toString());
+  const first = raw.operations[0];
+  if (!first || !SOROBAN_OP_TYPES.has(first.body.type)) return null;
+  if (raw.ext.type !== 'sorobanData') return 'a Soroban transaction must carry SorobanTransactionData';
+  const resourceFee = raw.ext.sorobanData.resourceFee;
   if (resourceFee < 0n || resourceFee > MAX_RESOURCE_FEE) {
     return `resource fee ${resourceFee} outside [0, 2^50]`;
   }
@@ -573,7 +585,7 @@ export function applyTransaction(
   passphrase: string = DEFAULT_PASSPHRASE,
   validation: ValidationOptions = {},
 ): TxOutcome {
-  const envelope = xdr.TransactionEnvelope.fromXDR(envelopeB64, 'base64');
+  const envelope = xdr.TransactionEnvelope.fromXdr(envelopeB64, 'base64');
   const outcome = applyEnvelope(ledger, envelope, passphrase, validation);
   if (outcome.rejected && !unseeded.has(outcome) && outcome.feeCharged === 0n) {
     outcome.feeCharged = nominalFee(envelope) ?? 0n;
@@ -587,33 +599,33 @@ function applyEnvelope(
   passphrase: string,
   validation: ValidationOptions,
 ): TxOutcome {
-  if (envelope.switch().name === 'envelopeTypeTxFeeBump') {
+  if (envelope.type === 'envelopeTypeTxFeeBump') {
     return applyFeeBump(ledger, envelope, passphrase, validation);
   }
-  if (envelope.switch().name !== 'envelopeTypeTx') {
+  if (envelope.type !== 'envelopeTypeTx') {
     return malformed('only v1 and fee-bump envelopes are supported');
   }
 
   const tx = new Transaction(envelope, passphrase);
-  const raw = envelope.v1().tx();
+  const raw = envelope.v1.tx;
   const badFee = xdrProvidesValidFee(raw);
   if (badFee) return malformed(badFee);
-  const queueFee = negativeInclusionFee(BigInt(raw.fee().toString()), declaredResourceFee(raw));
+  const queueFee = negativeInclusionFee(BigInt(raw.fee), declaredResourceFee(raw));
   if (queueFee) return malformed(queueFee);
 
   // -- fee source is the tx source for a plain v1 envelope
   const charge =
     validation.feeCharging !== false
       ? {
-          payer: muxedToAccountId(raw.sourceAccount()),
-          upfront: feeToCharge(BigInt(raw.fee().toString()), declaredResourceFee(raw), raw.operations().length),
+          payer: muxedToAccountId(raw.sourceAccount),
+          upfront: feeToCharge(BigInt(raw.fee), declaredResourceFee(raw), raw.operations.length),
         }
       : null;
-  return applyInner(ledger, tx, raw, passphrase, false, validation, envelope.toXDR().length, charge);
+  return applyInner(ledger, tx, raw, passphrase, false, validation, envelope.toXdr().length, charge);
 }
 
 const declaredResourceFee = (raw: xdr.Transaction): bigint =>
-  raw.ext().switch() === 1 ? BigInt(raw.ext().sorobanData().resourceFee().toString()) : 0n;
+  raw.ext.type === 'sorobanData' ? raw.ext.sorobanData.resourceFee : 0n;
 
 /**
  * TransactionQueue::canAdd (stellar-core v29.0.0 herder/TransactionQueue.cpp
@@ -656,31 +668,32 @@ interface FeeCharge {
  * node reports exactly this for txBAD_AUTH, txBAD_AUTH_EXTRA and txFAILED.
  */
 function nominalFee(envelope: xdr.TransactionEnvelope): bigint | undefined {
-  const isBump = envelope.switch().name === 'envelopeTypeTxFeeBump';
-  if (!isBump && envelope.switch().name !== 'envelopeTypeTx') return undefined;
-  const raw = isBump ? envelope.feeBump().tx().innerTx().v1().tx() : envelope.v1().tx();
-  const resourceFee =
-    raw.ext().switch() === 1 ? BigInt(raw.ext().sorobanData().resourceFee().toString()) : 0n;
-  const ops = raw.operations().length + (isBump ? 1 : 0);
+  let raw: xdr.Transaction;
+  if (envelope.type === 'envelopeTypeTxFeeBump') raw = envelope.feeBump.tx.innerTx.v1.tx;
+  else if (envelope.type === 'envelopeTypeTx') raw = envelope.v1.tx;
+  else return undefined;
+  const isBump = envelope.type === 'envelopeTypeTxFeeBump';
+  const resourceFee = declaredResourceFee(raw);
+  const ops = raw.operations.length + (isBump ? 1 : 0);
   return resourceFee + BigInt(BASE_FEE) * BigInt(Math.max(1, ops));
 }
 
 function applyFeeBump(
   ledger: Ledger,
-  envelope: xdr.TransactionEnvelope,
+  envelope: xdr.TransactionEnvelopeTxFeeBump,
   passphrase: string,
   validation: ValidationOptions,
 ): TxOutcome {
-  const fb = envelope.feeBump();
+  const fb = envelope.feeBump;
   const feeBumpTx = new FeeBumpTransaction(envelope, passphrase);
-  const innerEnvelope = xdr.TransactionEnvelope.envelopeTypeTx(fb.tx().innerTx().v1());
+  const innerEnvelope = xdr.TransactionEnvelope.envelopeTypeTx(fb.tx.innerTx.v1);
   const innerTx = new Transaction(innerEnvelope, passphrase);
-  const innerRaw = innerEnvelope.v1().tx();
+  const innerRaw = innerEnvelope.v1.tx;
 
   // FeeBumpTransactionFrame::checkValidImpl, in its order (stellar-core v29.0.0).
   // XDRProvidesValidFee covers the inner transaction too, so a malformed inner
   // fee is the OUTER envelope's txMALFORMED, not an inner failure.
-  const totalFee = BigInt(fb.tx().fee().toString());
+  const totalFee = fb.tx.fee;
   if (totalFee < 0n) return malformed('negative fee bump fee');
   const badInnerFee = xdrProvidesValidFee(innerRaw);
   if (badInnerFee) return malformed(`inner transaction: ${badInnerFee}`);
@@ -688,9 +701,8 @@ function applyFeeBump(
   // commonValidPreSeqNum. Inclusion fee = full fee minus the inner Soroban
   // resource fee; a fee bump counts as innerOps + 1 operations, and
   // getMinInclusionFee is baseFee * max(1, operations).
-  const innerSoroban = innerRaw.ext().switch() === 1 ? innerRaw.ext().sorobanData() : null;
-  const resourceFee = innerSoroban ? BigInt(innerSoroban.resourceFee().toString()) : 0n;
-  const innerOps = BigInt(innerRaw.operations().length);
+  const resourceFee = declaredResourceFee(innerRaw);
+  const innerOps = BigInt(innerRaw.operations.length);
   const minInclusion = (ops: bigint) => BigInt(BASE_FEE) * (ops > 1n ? ops : 1n);
   const inclusionFee = totalFee - resourceFee;
   const queueFee = negativeInclusionFee(totalFee, resourceFee);
@@ -705,7 +717,7 @@ function applyFeeBump(
   //   outerInclusion * minInclusion(inner) >= innerInclusion * minInclusion(outer).
   // From protocol 23 a Soroban inner tx may have a negative inclusion fee, and
   // then there is nothing to compare.
-  const innerInclusion = BigInt(innerRaw.fee().toString()) - resourceFee;
+  const innerInclusion = BigInt(innerRaw.fee) - resourceFee;
   if (innerInclusion >= 0n) {
     const v1 = inclusionFee * minInclusion(innerOps);
     const v2 = innerInclusion * minInclusion(innerOps + 1n);
@@ -718,7 +730,7 @@ function applyFeeBump(
 
   // A fee bump's fee source MAY be muxed: validateSorobanMemo (TransactionFrame
   // .cpp:363) checks the tx source and the op source, never the fee source.
-  const feeSourceId = muxedToAccountId(fb.tx().feeSource());
+  const feeSourceId = muxedToAccountId(fb.tx.feeSource);
   const feeAccount = loadAccount(ledger, feeSourceId);
   if (!feeAccount) return fail('txNO_ACCOUNT', 'fee source account does not exist');
 
@@ -726,7 +738,7 @@ function applyFeeBump(
   // its own), with the OUTER signatures and their own checker.
   const checker =
     validation.sigverify !== false ? new SignatureChecker(feeBumpTx.signatures, feeBumpTx.hash()) : null;
-  if (checker && !checker.checkSignature(accountSigners(feeAccount), feeAccount.thresholds()[1])) {
+  if (checker && !checker.checkSignature(accountSigners(feeAccount), thresholdsOf(feeAccount)[1])) {
     return fail('txBAD_AUTH', 'fee bump signatures do not satisfy the fee source low threshold');
   }
 
@@ -748,7 +760,7 @@ function applyFeeBump(
   const charge = charging
     ? { payer: feeSourceId, upfront: feeToCharge(totalFee, resourceFee, Number(innerOps) + 1) }
     : null;
-  const inner = applyInner(ledger, innerTx, innerRaw, passphrase, true, validation, innerEnvelope.toXDR().length, charge);
+  const inner = applyInner(ledger, innerTx, innerRaw, passphrase, true, validation, innerEnvelope.toXdr().length, charge);
   if (inner.rejected) {
     return {
       ...inner,
@@ -775,7 +787,7 @@ function applyInner(
   txSize: number,
   charge: FeeCharge | null,
 ): TxOutcome {
-  const ops = raw.operations();
+  const ops = raw.operations;
 
   // The checks below run in commonValidPreSeqNum's order, then commonValid's
   // (TransactionFrame.cpp, v29.0.0): the order decides which code wins when
@@ -786,8 +798,8 @@ function applyInner(
   // -- envelope shape (TransactionFrame.cpp:1325, :760) --------------------
   if (ops.length === 0) return fail('txMISSING_OPERATION');
 
-  const opType = ops[0].body().switch().name;
-  const sorobanOps = ops.filter((o) => SOROBAN_OP_TYPES.has(o.body().switch().name));
+  const opType = ops[0].body.type;
+  const sorobanOps = ops.filter((o) => SOROBAN_OP_TYPES.has(o.body.type));
   if (sorobanOps.length === 0) {
     return fail('txMALFORMED', 'classic operations are out of scope for this harness');
   }
@@ -804,9 +816,9 @@ function applyInner(
   // validateSorobanMemo only applies to INVOKE_HOST_FUNCTION; ExtendFootprintTTL
   // and RestoreFootprint return true early.
   if (opType === 'invokeHostFunction') {
-    const memoIsNone = raw.memo().switch().name === 'memoNone';
-    const opSource = ops[0].sourceAccount();
-    if (!memoIsNone || isMuxed(raw.sourceAccount()) || (opSource && isMuxed(opSource))) {
+    const memoIsNone = raw.memo.type === 'memoNone';
+    const opSource = ops[0].sourceAccount;
+    if (!memoIsNone || isMuxed(raw.sourceAccount) || (opSource && isMuxed(opSource))) {
       return fail(
         'txSOROBAN_INVALID',
         'Soroban transactions are not allowed to use memo or muxed source account',
@@ -814,7 +826,7 @@ function applyInner(
     }
   }
 
-  const sorobanData = raw.ext().switch() === 1 ? raw.ext().sorobanData() : null;
+  const sorobanData = raw.ext.type === 'sorobanData' ? raw.ext.sorobanData : null;
   if (!sorobanData) return fail('txSOROBAN_INVALID', 'missing SorobanTransactionData');
 
   // -- the declared resources against the network's limits ------------------
@@ -829,7 +841,7 @@ function applyInner(
   // priced on this envelope's size, with no events yet. The non-refundable
   // part is charged whatever happens; the rest is the most rent and events may
   // cost.
-  const resourceFee = BigInt(sorobanData.resourceFee().toString());
+  const resourceFee = sorobanData.resourceFee;
   let nonRefundable = 0n;
   if (charge) {
     const actual = ledger.computeResourceFee(sorobanData, txSize, 0, opType === 'restoreFootprint');
@@ -854,7 +866,7 @@ function applyInner(
   }
 
   // -- source account ------------------------------------------------------
-  const sourceId = muxedToAccountId(raw.sourceAccount());
+  const sourceId = muxedToAccountId(raw.sourceAccount);
   const account = loadAccount(ledger, sourceId);
   if (!account) return fail('txNO_ACCOUNT', 'source account does not exist');
 
@@ -864,13 +876,13 @@ function applyInner(
   // A missing operation source is not a submit-time error: core checks a
   // signature from that key instead (checkSignatureNoAccount) and fails the
   // operation with opNO_ACCOUNT when it applies.
-  const opSourceMuxed = ops[0].sourceAccount();
+  const opSourceMuxed = ops[0].sourceAccount;
   const invokerId = opSourceMuxed ? muxedToAccountId(opSourceMuxed) : sourceId;
   const opAccount = opSourceMuxed ? loadAccount(ledger, invokerId) : account;
 
   // -- sequence number -----------------------------------------------------
-  const currentSeq = BigInt(account.seqNum().toString());
-  const txSeq = BigInt(raw.seqNum().toString());
+  const currentSeq = account.seqNum;
+  const txSeq = raw.seqNum;
   // Core's first isBadSeq clause is unconditional: a transaction may never use
   // getStartingSequenceNumber(currentLedger), because CreateAccount hands that
   // very number to accounts created in this ledger.
@@ -902,11 +914,11 @@ function applyInner(
   const checker =
     validation.sigverify !== false ? new SignatureChecker(tx.signatures, tx.hash()) : null;
   if (checker) {
-    if (!checker.checkSignature(accountSigners(account), account.thresholds()[1])) {
+    if (!checker.checkSignature(accountSigners(account), thresholdsOf(account)[1])) {
       return fail(
         'txBAD_AUTH',
-        `transaction source signatures do not satisfy low threshold ${account.thresholds()[1]} for ${
-          StrKey.encodeEd25519PublicKey(account.accountId().ed25519())
+        `transaction source signatures do not satisfy low threshold ${thresholdsOf(account)[1]} for ${
+          StrKey.encodeEd25519PublicKey(account.accountId.ed25519.toBytes())
         }`,
       );
     }
@@ -916,7 +928,7 @@ function applyInner(
   }
 
   // -- fees ----------------------------------------------------------------
-  const totalFee = BigInt(raw.fee().toString());
+  const totalFee = BigInt(raw.fee);
   const inclusionFee = totalFee - resourceFee;
 
   // From protocol 23 a fee-bumped inner tx may carry an insufficient full fee
@@ -941,9 +953,9 @@ function applyInner(
   if (checker) {
     const level = opType === 'invokeHostFunction' ? 2 : 1;
     const opSigned = opAccount
-      ? checker.checkSignature(accountSigners(opAccount), opAccount.thresholds()[level])
+      ? checker.checkSignature(accountSigners(opAccount), thresholdsOf(opAccount)[level])
       : checker.checkSignature(
-          [{ key: xdr.SignerKey.signerKeyTypeEd25519(invokerId.ed25519()), weight: 1 }],
+          [{ key: xdr.SignerKey.signerKeyTypeEd25519(invokerId.ed25519), weight: 1 }],
           0,
         );
     if (!opSigned) {
@@ -951,7 +963,7 @@ function applyInner(
         ...fail(
           'txFAILED',
           `operation source signatures do not satisfy its ${level === 2 ? 'medium' : 'low'} threshold for ${
-            StrKey.encodeEd25519PublicKey(invokerId.ed25519())
+            StrKey.encodeEd25519PublicKey(invokerId.ed25519.toBytes())
           } (opBAD_AUTH)`,
         ),
         opCode: 'opBAD_AUTH',
@@ -1007,7 +1019,12 @@ function applyInner(
   if (opType === 'extendFootprintTtl' || opType === 'restoreFootprint') {
     const extend = opType === 'extendFootprintTtl';
     const applied = extend
-      ? applyExtendFootprintTtl(ledger, ops[0].body().extendFootprintTtlOp().extendTo(), sorobanData, refundableCap)
+      ? applyExtendFootprintTtl(
+          ledger,
+          xdr.expectUnionVariant(ops[0].body, 'extendFootprintTtl').extendFootprintTtlOp.extendTo,
+          sorobanData,
+          refundableCap,
+        )
       : applyRestoreFootprint(ledger, sorobanData, refundableCap);
     if (applied.overLimit) {
       return settle({
@@ -1040,15 +1057,14 @@ function applyInner(
     );
   }
 
-  const hostFn = ops[0].body().invokeHostFunctionOp().hostFunction();
-  const auth = ops[0].body().invokeHostFunctionOp().auth();
-  const resources = sorobanData.resources();
+  const { hostFunction: hostFn, auth } = xdr.expectUnionVariant(ops[0].body, 'invokeHostFunction').invokeHostFunctionOp;
+  const resources = sorobanData.resources;
 
   const sent = ledger.send(
     hostFn,
-    invokerId.toXDR('base64'),
-    resources.toXDR('base64'),
-    auth.map((a) => a.toXDR('base64')),
+    invokerId.toXdr('base64'),
+    resources.toXdr('base64'),
+    auth.map((a) => a.toXdr('base64')),
     [],
     refundableCap,
   );
@@ -1082,10 +1098,12 @@ const isAsciiAlphaNumeric = (b: number) =>
  * pool shares are valid.
  */
 function trustLineAssetValid(asset: xdr.TrustLineAsset): boolean {
-  const kind = asset.switch().name;
+  const kind = asset.type;
   if (kind === 'assetTypeNative' || kind === 'assetTypePoolShare') return true;
-  const code: Buffer =
-    kind === 'assetTypeCreditAlphanum4' ? asset.alphaNum4().assetCode() : asset.alphaNum12().assetCode();
+  const code: Uint8Array =
+    kind === 'assetTypeCreditAlphanum4'
+      ? xdr.expectUnionVariant(asset, 'assetTypeCreditAlphanum4').alphaNum4.assetCode.toBytes()
+      : xdr.expectUnionVariant(asset, 'assetTypeCreditAlphanum12').alphaNum12.assetCode.toBytes();
   let zeros = false;
   let chars = 0;
   for (const b of code) {
@@ -1098,10 +1116,13 @@ function trustLineAssetValid(asset: xdr.TrustLineAsset): boolean {
 
 /** isIssuer (stellar-core src/util/types.h:69). */
 function isIssuerOf(account: xdr.AccountId, asset: xdr.TrustLineAsset): boolean {
-  const kind = asset.switch().name;
+  const kind = asset.type;
   if (kind !== 'assetTypeCreditAlphanum4' && kind !== 'assetTypeCreditAlphanum12') return false;
-  const issuer = kind === 'assetTypeCreditAlphanum4' ? asset.alphaNum4().issuer() : asset.alphaNum12().issuer();
-  return issuer.toXDR().equals(account.toXDR());
+  const issuer =
+    kind === 'assetTypeCreditAlphanum4'
+      ? xdr.expectUnionVariant(asset, 'assetTypeCreditAlphanum4').alphaNum4.issuer
+      : xdr.expectUnionVariant(asset, 'assetTypeCreditAlphanum12').alphaNum12.issuer;
+  return sameBytes(issuer.toXdr(), account.toXdr());
 }
 
 /**
@@ -1117,24 +1138,24 @@ function sorobanResourcesProblem(
   txSize: number,
   isRestore: boolean,
 ): string | null {
-  const r = data.resources();
-  const readOnly = r.footprint().readOnly();
-  const readWrite = r.footprint().readWrite();
+  const r = data.resources;
+  const readOnly = r.footprint.readOnly;
+  const readWrite = r.footprint.readWrite;
   const over = (what: string, value: number, limit: number) => `${what}: ${value} > ${limit}`;
 
-  if (r.instructions() > limits.txMaxInstructions) {
-    return over('transaction instructions resources exceed network config limit', r.instructions(), limits.txMaxInstructions);
+  if (r.instructions > limits.txMaxInstructions) {
+    return over('transaction instructions resources exceed network config limit', r.instructions, limits.txMaxInstructions);
   }
-  if (r.diskReadBytes() > limits.txMaxDiskReadBytes) {
-    return over('transaction byte-read resources exceed network config limit', r.diskReadBytes(), limits.txMaxDiskReadBytes);
+  if (r.diskReadBytes > limits.txMaxDiskReadBytes) {
+    return over('transaction byte-read resources exceed network config limit', r.diskReadBytes, limits.txMaxDiskReadBytes);
   }
-  if (r.writeBytes() > limits.txMaxWriteBytes) {
-    return over('transaction byte-write resources exceed network config limit', r.writeBytes(), limits.txMaxWriteBytes);
+  if (r.writeBytes > limits.txMaxWriteBytes) {
+    return over('transaction byte-write resources exceed network config limit', r.writeBytes, limits.txMaxWriteBytes);
   }
   // getNumDiskReadEntries (TransactionFrame.cpp:67): every entry a restore
   // names, otherwise the classic keys and the archived entries marked for
   // restoring. Live Soroban state is in memory.
-  const archived = data.ext().switch() === 1 ? data.ext().resourceExt().archivedSorobanEntries() : [];
+  const archived = data.ext.type === 'resourceExt' ? data.ext.resourceExt.archivedSorobanEntries : [];
   const diskReads = isRestore
     ? readWrite.length
     : [...readOnly, ...readWrite].filter((k) => !isTtlKey(k)).length + archived.length;
@@ -1154,23 +1175,23 @@ function sorobanResourcesProblem(
   }
 
   for (const key of [...readOnly, ...readWrite]) {
-    switch (key.switch().name) {
+    switch (key.type) {
       case 'account':
       case 'contractData':
       case 'contractCode':
         break;
       case 'trustline': {
-        const tl = key.trustLine();
-        const asset = tl.asset();
-        if (!trustLineAssetValid(asset) || asset.switch().name === 'assetTypeNative' || isIssuerOf(tl.accountId(), asset)) {
+        const tl = key.trustLine;
+        const asset = tl.asset;
+        if (!trustLineAssetValid(asset) || asset.type === 'assetTypeNative' || isIssuerOf(tl.accountId, asset)) {
           return 'transaction footprint contains invalid trustline asset';
         }
         break;
       }
       default:
-        return `transaction footprint contains unsupported ledger key type: ${key.switch().value}`;
+        return `transaction footprint contains unsupported ledger key type: ${xdr.LedgerEntryType[key.type].value}`;
     }
-    const keySize = key.toXDR().length;
+    const keySize = key.toXdr().length;
     if (keySize > limits.maxContractDataKeySizeBytes) {
       return over('transaction footprint key exceeds network config limit', keySize, limits.maxContractDataKeySizeBytes);
     }
@@ -1188,7 +1209,7 @@ function sorobanResourcesProblem(
       return `archivedSorobanEntries index is out of bounds: ${index} >= ${readWrite.length}`;
     }
     if (!isPersistentKey(readWrite[index])) {
-      return `archivedSorobanEntries index points to a non-persistent entry: ${index}, key type ${readWrite[index].switch().value}`;
+      return `archivedSorobanEntries index points to a non-persistent entry: ${index}, key type ${xdr.LedgerEntryType[readWrite[index].type].value}`;
     }
   }
   return null;
@@ -1201,10 +1222,10 @@ function sorobanResourcesProblem(
  * null.
  */
 function contractEntryTooLarge(limits: NetworkFeeSettings, key: xdr.LedgerKey, entrySize: number): string | null {
-  if (key.switch().name === 'contractCode' && limits.maxContractSizeBytes < entrySize) {
+  if (key.type === 'contractCode' && limits.maxContractSizeBytes < entrySize) {
     return `Wasm size exceeds network config maximum contract size: ${entrySize} > ${limits.maxContractSizeBytes}`;
   }
-  if (key.switch().name === 'contractData' && limits.maxContractDataEntrySizeBytes < entrySize) {
+  if (key.type === 'contractData' && limits.maxContractDataEntrySizeBytes < entrySize) {
     return `ContractData size exceeds network config maximum size: ${entrySize} > ${limits.maxContractDataEntrySizeBytes}`;
   }
   return null;
@@ -1214,12 +1235,11 @@ function contractEntryTooLarge(limits: NetworkFeeSettings, key: xdr.LedgerKey, e
 // ExtendFootprintTTL / RestoreFootprint (stellar-core v29.0.0)
 // ---------------------------------------------------------------------------
 
-const isTtlKey = (k: xdr.LedgerKey) =>
-  k.switch().name === 'contractData' || k.switch().name === 'contractCode';
+const isTtlKey = (k: xdr.LedgerKey) => k.type === 'contractData' || k.type === 'contractCode';
 
 const isPersistentKey = (k: xdr.LedgerKey) =>
-  k.switch().name === 'contractCode' ||
-  (k.switch().name === 'contractData' && k.contractData().durability().name === 'persistent');
+  k.type === 'contractCode' ||
+  (k.type === 'contractData' && k.contractData.durability.name === 'persistent');
 
 /**
  * ExtendFootprintTTLOpFrame / RestoreFootprintOpFrame::doCheckValidForSoroban:
@@ -1231,27 +1251,27 @@ function footprintOpMalformed(
   op: xdr.Operation,
   sorobanData: xdr.SorobanTransactionData,
 ): { code: NonNullable<TxOutcome['footprintOpResult']>; detail: string } | null {
-  const type = op.body().switch().name;
-  const fp = sorobanData.resources().footprint();
-  if (type === 'extendFootprintTtl') {
+  const body = op.body;
+  const fp = sorobanData.resources.footprint;
+  if (body.type === 'extendFootprintTtl') {
     const malformed = (detail: string) => ({ code: 'extendFootprintTtlMalformed' as const, detail });
-    if (fp.readWrite().length > 0) {
+    if (fp.readWrite.length > 0) {
       return malformed('read-write footprint must be empty for ExtendFootprintTTL operation');
     }
-    if (!fp.readOnly().every(isTtlKey)) {
+    if (!fp.readOnly.every(isTtlKey)) {
       return malformed('only entries with TTL (contract data or code entries) can have it extended');
     }
-    const extendTo = op.body().extendFootprintTtlOp().extendTo();
+    const extendTo = body.extendFootprintTtlOp.extendTo;
     const max = ledger.archivalSettings.maxEntryTtl - 1;
     if (extendTo > max) return malformed(`TTL extension is too large: ${extendTo} > ${max}`);
     return null;
   }
-  if (type === 'restoreFootprint') {
+  if (body.type === 'restoreFootprint') {
     const malformed = (detail: string) => ({ code: 'restoreFootprintMalformed' as const, detail });
-    if (fp.readOnly().length > 0) {
+    if (fp.readOnly.length > 0) {
       return malformed('read-only footprint must be empty for RestoreFootprint operation');
     }
-    if (!fp.readWrite().every(isPersistentKey)) {
+    if (!fp.readWrite.every(isPersistentKey)) {
       return malformed('only persistent Soroban entries can be restored');
     }
   }
@@ -1320,8 +1340,8 @@ function applyExtendFootprintTtl(
 ): FootprintOpApplied {
   const newLiveUntil = ledger.ledgerSeq + extendTo;
   const moves = [];
-  for (const key of sorobanData.resources().footprint().readOnly()) {
-    const k = key.toXDR('base64');
+  for (const key of sorobanData.resources.footprint.readOnly) {
+    const k = key.toXdr('base64');
     const entry = ledger.getEntry(k);
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined || ttl < ledger.ledgerSeq) continue; // missing, or not live
@@ -1352,34 +1372,34 @@ function applyRestoreFootprint(
   maxRefundable: bigint | undefined,
 ): FootprintOpApplied {
   const restoredLiveUntil = ledger.ledgerSeq + ledger.archivalSettings.minPersistentTtl - 1;
-  const resources = sorobanData.resources();
+  const resources = sorobanData.resources;
   const limits = ledger.feeSettings;
   let readBytes = 0;
   let writeBytes = 0;
   const moves = [];
-  for (const key of resources.footprint().readWrite()) {
-    const k = key.toXDR('base64');
+  for (const key of resources.footprint.readWrite) {
+    const k = key.toXdr('base64');
     const entry = ledger.getEntry(k);
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined) continue;
     if (ttl >= ledger.ledgerSeq) continue; // live
     const entrySize = Buffer.from(entry, 'base64').length;
     readBytes += entrySize;
-    if (resources.diskReadBytes() < readBytes) {
+    if (resources.diskReadBytes < readBytes) {
       return {
         changed: [],
         rent: 0n,
-        overLimit: `operation byte-read resources exceeds amount specified: ${readBytes} > ${resources.diskReadBytes()}`,
+        overLimit: `operation byte-read resources exceeds amount specified: ${readBytes} > ${resources.diskReadBytes}`,
       };
     }
     writeBytes += entrySize;
     const overLimit = contractEntryTooLarge(limits, key, entrySize);
     if (overLimit) return { changed: [], rent: 0n, overLimit };
-    if (resources.writeBytes() < writeBytes) {
+    if (resources.writeBytes < writeBytes) {
       return {
         changed: [],
         rent: 0n,
-        overLimit: `operation byte-write resources exceeds amount specified: ${writeBytes} > ${resources.writeBytes()}`,
+        overLimit: `operation byte-write resources exceeds amount specified: ${writeBytes} > ${resources.writeBytes}`,
       };
     }
     moves.push({ k, entry, oldLiveUntil: 0, newLiveUntil: restoredLiveUntil });
@@ -1397,68 +1417,82 @@ function applyRestoreFootprint(
  */
 function bumpSequence(ledger: Ledger, id: xdr.AccountId, to: bigint): void {
   const account = loadAccount(ledger, id)!;
-  account.seqNum(new xdr.SequenceNumber(new xdr.Int64(to)));
   const v3 = prepareAccountEntryExtensionV3(account);
-  v3.seqLedger(ledger.ledgerSeq);
-  v3.seqTime(new xdr.TimePoint(xdr.Uint64.fromString(String(ledger.timestamp))));
-  storeAccount(ledger, account);
+  storeAccount(
+    ledger,
+    new xdr.AccountEntry({
+      ...account,
+      seqNum: to,
+      ext: withAccountEntryExtensionV3(
+        account,
+        new xdr.AccountEntryExtensionV3({ ...v3, seqLedger: ledger.ledgerSeq, seqTime: BigInt(ledger.timestamp) }),
+      ),
+    }),
+  );
 }
 
 /** hasAccountEntryExtV3 / getAccountEntryExtensionV3: the v3 extension, if the chain reaches it. */
 function accountEntryExtensionV3(account: xdr.AccountEntry): xdr.AccountEntryExtensionV3 | null {
-  if (account.ext().switch() !== 1) return null;
-  const v1 = account.ext().v1();
-  if (v1.ext().switch() !== 2) return null;
-  const v2 = v1.ext().v2();
-  return v2.ext().switch() === 3 ? v2.ext().v3() : null;
+  if (account.ext.type !== 'v1') return null;
+  const v1 = account.ext.v1;
+  if (v1.ext.type !== 'v2') return null;
+  const v2 = v1.ext.v2;
+  return v2.ext.type === 'v3' ? v2.ext.v3 : null;
 }
 
-/** Core's prepareAccountEntryExtensionV1/V2/V3: create what is missing, zeroed. */
-function prepareAccountEntryExtensionV3(account: xdr.AccountEntry): xdr.AccountEntryExtensionV3 {
-  if (account.ext().switch() === 0) {
-    account.ext(
-      new xdr.AccountEntryExt(
-        1,
-        new xdr.AccountEntryExtensionV1({
-          liabilities: new xdr.Liabilities({ buying: new xdr.Int64(0n), selling: new xdr.Int64(0n) }),
-          ext: new xdr.AccountEntryExtensionV1Ext(0),
-        }),
-      ),
-    );
-  }
-  const v1 = account.ext().v1();
-  if (v1.ext().switch() === 0) {
-    v1.ext(
-      new xdr.AccountEntryExtensionV1Ext(
-        2,
-        new xdr.AccountEntryExtensionV2({
+/**
+ * Core's prepareAccountEntryExtensionV1/V2/V3: the v1 and v2 levels as they
+ * are, or created zeroed where missing. XDR values are immutable, so the chain
+ * is rebuilt around a v3 by `withAccountEntryExtensionV3`.
+ */
+function accountEntryExtensionChain(account: xdr.AccountEntry): {
+  v1: xdr.AccountEntryExtensionV1;
+  v2: xdr.AccountEntryExtensionV2;
+} {
+  const v1 =
+    account.ext.type === 'v1'
+      ? account.ext.v1
+      : new xdr.AccountEntryExtensionV1({
+          liabilities: new xdr.Liabilities({ buying: 0n, selling: 0n }),
+          ext: xdr.AccountEntryExtensionV1Ext.v0(),
+        });
+  const v2 =
+    v1.ext.type === 'v2'
+      ? v1.ext.v2
+      : new xdr.AccountEntryExtensionV2({
           numSponsored: 0,
           numSponsoring: 0,
-          signerSponsoringIDs: account.signers().map(() => null),
-          ext: new xdr.AccountEntryExtensionV2Ext(0),
-        }),
+          signerSponsoringIDs: account.signers.map(() => null),
+          ext: xdr.AccountEntryExtensionV2Ext.v0(),
+        });
+  return { v1, v2 };
+}
+
+/** The account's v3 extension, or a zeroed one when the chain does not reach it. */
+function prepareAccountEntryExtensionV3(account: xdr.AccountEntry): xdr.AccountEntryExtensionV3 {
+  return (
+    accountEntryExtensionV3(account) ??
+    new xdr.AccountEntryExtensionV3({ ext: xdr.ExtensionPoint.v0(), seqLedger: 0, seqTime: 0n })
+  );
+}
+
+/** The account's ext chain, with whatever was missing created, ending in `v3`. */
+function withAccountEntryExtensionV3(
+  account: xdr.AccountEntry,
+  v3: xdr.AccountEntryExtensionV3,
+): xdr.AccountEntryExt {
+  const { v1, v2 } = accountEntryExtensionChain(account);
+  return xdr.AccountEntryExt.v1(
+    new xdr.AccountEntryExtensionV1({
+      ...v1,
+      ext: xdr.AccountEntryExtensionV1Ext.v2(
+        new xdr.AccountEntryExtensionV2({ ...v2, ext: xdr.AccountEntryExtensionV2Ext.v3(v3) }),
       ),
-    );
-  }
-  const v2 = v1.ext().v2();
-  if (v2.ext().switch() === 0) {
-    v2.ext(
-      new xdr.AccountEntryExtensionV2Ext(
-        3,
-        new xdr.AccountEntryExtensionV3({
-          ext: new xdr.ExtensionPoint(0),
-          seqLedger: 0,
-          seqTime: new xdr.TimePoint(xdr.Uint64.fromString('0')),
-        }),
-      ),
-    );
-  }
-  return v2.ext().v3();
+    }),
+  );
 }
 
 function debit(ledger: Ledger, id: xdr.AccountId, amount: bigint): void {
   const account = loadAccount(ledger, id)!;
-  const balance = BigInt(account.balance().toString());
-  account.balance(new xdr.Int64(balance - amount));
-  storeAccount(ledger, account);
+  storeAccount(ledger, new xdr.AccountEntry({ ...account, balance: account.balance - amount }));
 }

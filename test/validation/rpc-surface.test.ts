@@ -69,7 +69,10 @@ function deploy(code: Uint8Array, salt = 0): { hash: string; addr: xdr.ScAddress
     w.accountIdB64,
   );
   if (!sent.ok) throw new Error(`deploy failed: ${sent.error}`);
-  return { hash, addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address() };
+  return {
+    hash,
+    addr: xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address,
+  };
 }
 
 beforeEach(() => {
@@ -118,10 +121,10 @@ function rawSorobanData(hostFn: xdr.HostFunction): xdr.SorobanTransactionData {
   const sim = L.simulate(hostFn, w.accountIdB64);
   expect(sim.ok, sim.error).toBe(true);
   return new xdr.SorobanTransactionData({
-    ext: new (xdr as any).SorobanTransactionDataExt(0),
-    resources: xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64'),
-    resourceFee: (xdr as any).Int64.fromString('2000000'),
-  } as any);
+    ext: xdr.SorobanTransactionDataExt.v0(),
+    resources: xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+    resourceFee: xdr.Int64.fromString('2000000'),
+  });
 }
 
 const codeKey = (hash = wasmHash) =>
@@ -154,7 +157,7 @@ describe('implemented methods, as the SDK parses them', () => {
   });
 
   it('getLatestLedger parses into Api.GetLatestLedgerResponse', async () => {
-    // parsers.js:211 parseRawLatestLedger REQUIRES headerXdr and metadataXdr and
+    // parsers.js:210 parseRawLatestLedger REQUIRES headerXdr and metadataXdr and
     // decodes them into xdr.LedgerHeader / xdr.LedgerCloseMeta.
     const latest = await server.getLatestLedger();
     expect(latest.sequence).toBe(L.ledgerSeq - 1);
@@ -170,11 +173,13 @@ describe('implemented methods, as the SDK parses them', () => {
     expect(res.entries).toHaveLength(1);
 
     const entry = res.entries[0];
-    expect(entry.val.switch().name).toBe('account');
-    expect(StrKey.encodeEd25519PublicKey(entry.val.account().accountId().ed25519())).toBe(
-      w.publicKey,
-    );
-    expect(entry.key.toXDR('base64')).toBe(key.toXDR('base64'));
+    expect(entry.val.type).toBe('account');
+    expect(
+      StrKey.encodeEd25519PublicKey(
+        xdr.expectUnionVariant(entry.val, 'account').account.accountId.ed25519.toBytes(),
+      ),
+    ).toBe(w.publicKey);
+    expect(entry.key.toXdr('base64')).toBe(key.toXdr('base64'));
   });
 
   it('getLedgerEntries carries liveUntilLedgerSeq for a TTL-bearing entry', async () => {
@@ -184,14 +189,14 @@ describe('implemented methods, as the SDK parses them', () => {
 
     // Host truth: seed_wasm writes ttl = ledger_seq + 100_000 (lib.rs), which is
     // also the host's min_persistent_entry_ttl.
-    expect(res.entries[0].liveUntilLedgerSeq).toBe(L.getEntryTtl(key.toXDR('base64')));
+    expect(res.entries[0].liveUntilLedgerSeq).toBe(L.getEntryTtl(key.toXdr('base64')));
     expect(res.entries[0].liveUntilLedgerSeq).toBeGreaterThan(L.ledgerSeq);
   });
 
   it('getLedgerEntries reports the ENTRY lastModifiedLedgerSeq, not the current ledger', async () => {
     const key = accountKey(w.accountId);
-    const stored = xdr.LedgerEntry.fromXDR(L.getEntry(key.toXDR('base64'))!, 'base64');
-    const writtenAt = stored.lastModifiedLedgerSeq();
+    const stored = xdr.LedgerEntry.fromXdr(L.getEntry(key.toXdr('base64'))!, 'base64');
+    const writtenAt = stored.lastModifiedLedgerSeq;
 
     L.advanceLedgers(500);
 
@@ -212,7 +217,7 @@ describe('implemented methods, as the SDK parses them', () => {
   it('getLedgerEntries returns only the present entries of a mixed batch', async () => {
     const missing = accountKey(accountIdFromPublicKey(Keypair.random().publicKey()));
     const res = await server.getLedgerEntries(accountKey(w.accountId), missing, codeKey());
-    expect(res.entries.map((e) => e.val.switch().name)).toEqual(['account', 'contractCode']);
+    expect(res.entries.map((e) => e.val.type)).toEqual(['account', 'contractCode']);
   });
 
   it('simulateTransaction parses into a success response with a decoded retval', async () => {
@@ -225,16 +230,16 @@ describe('implemented methods, as the SDK parses them', () => {
     expect(rpc.Api.isSimulationSuccess(sim), JSON.stringify(sim)).toBe(true);
 
     const s = sim as rpc.Api.SimulateTransactionSuccessResponse;
-    expect(s.result!.retval.switch().name).toBe('scvU64');
+    expect(s.result!.retval.type).toBe('scvU64');
     expect(scValToNative(s.result!.retval)).toBe(77n);
     expect(s.result!.auth).toEqual([]);
 
     expect(typeof s.minResourceFee).toBe('string');
     const data = s.transactionData.build();
-    expect(BigInt(s.minResourceFee)).toBe(data.resourceFee().toBigInt());
-    expect(data.resources().instructions()).toBeGreaterThan(0);
+    expect(BigInt(s.minResourceFee)).toBe(data.resourceFee);
+    expect(data.resources.instructions).toBeGreaterThan(0);
     // The footprint must at least cover the contract instance and its code.
-    expect(data.resources().footprint().readOnly().length).toBeGreaterThanOrEqual(2);
+    expect(data.resources.footprint.readOnly.length).toBeGreaterThanOrEqual(2);
     expect(s.latestLedger).toBe(L.ledgerSeq - 1);
     expect((s as unknown as { _parsed: boolean })._parsed).toBe(true);
   });
@@ -284,7 +289,9 @@ describe('the full app-shaped flow', () => {
     const assembled = rpc.assembleTransaction(tx, sim).build();
     const resourceFee = (sim as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee;
     expect(BigInt(assembled.fee)).toBe(100n + BigInt(resourceFee));
-    expect(assembled.toEnvelope().v1().tx().ext().switch()).toBe(1);
+    expect(
+      xdr.expectUnionVariant(assembled.toEnvelope(), 'envelopeTypeTx').v1.tx.ext.toXdrObject().v,
+    ).toBe(1);
 
     // 5. sign — the account has medium threshold 1, so this is load-bearing
     assembled.sign(w.keypair);
@@ -293,7 +300,7 @@ describe('the full app-shaped flow', () => {
     // 6. sendTransaction
     const sent = await server.sendTransaction(assembled);
     expect(sent.status, JSON.stringify(sent)).toBe('PENDING');
-    expect(sent.hash).toBe(assembled.hash().toString('hex'));
+    expect(sent.hash).toBe(Buffer.from(assembled.hash()).toString('hex'));
     expect((sent as unknown as Record<string, unknown>).errorResult).toBeUndefined();
 
     // 7. pollTransaction
@@ -305,24 +312,31 @@ describe('the full app-shaped flow', () => {
     expect(ok.txHash).toBe(sent.hash);
     expect(ok.feeBump).toBe(false);
     expect(ok.applicationOrder).toBe(1);
-    expect(ok.resultXdr.result().switch().name).toBe('txSuccess');
+    expect(ok.resultXdr.result.type).toBe('txSuccess');
     // Charged as core charges: the resource fee it consumed plus the base
     // fee, not the bid (the meta carries the split).
-    const fees = ok.resultMetaXdr.v4().sorobanMeta()!.ext().v1();
-    expect(ok.resultXdr.feeCharged().toBigInt()).toBe(
-      fees.totalNonRefundableResourceFeeCharged().toBigInt() +
-        fees.totalRefundableResourceFeeCharged().toBigInt() +
+    const fees = xdr.expectUnionVariant(
+      xdr.expectUnionVariant(ok.resultMetaXdr, 'v4').v4.sorobanMeta!.ext,
+      'v1',
+    ).v1;
+    expect(ok.resultXdr.feeCharged).toBe(
+      fees.totalNonRefundableResourceFeeCharged +
+        fees.totalRefundableResourceFeeCharged +
         100n,
     );
-    expect(ok.resultXdr.feeCharged().toBigInt()).toBeLessThan(BigInt(assembled.fee));
-    expect(ok.envelopeXdr.v1().tx().seqNum().toString()).toBe('1');
-    expect(ok.resultMetaXdr.switch()).toBe(4);
+    expect(ok.resultXdr.feeCharged).toBeLessThan(BigInt(assembled.fee));
+    expect(
+      xdr.expectUnionVariant(ok.envelopeXdr, 'envelopeTypeTx').v1.tx.seqNum.toString(),
+    ).toBe('1');
+    expect(ok.resultMetaXdr.toXdrObject().v).toBe(4);
     // put_persistent returns void, and that is what the meta must say.
-    expect(ok.resultMetaXdr.v4().sorobanMeta()!.returnValue().switch().name).toBe('scvVoid');
+    expect(
+      xdr.expectUnionVariant(ok.resultMetaXdr, 'v4').v4.sorobanMeta!.returnValue.type,
+    ).toBe('scvVoid');
 
     // 9. the ledger really moved
     expect(w.sequence()).toBe(1n);
-    expect(w.balance()).toBe(balanceBefore - ok.resultXdr.feeCharged().toBigInt());
+    expect(w.balance()).toBe(balanceBefore - ok.resultXdr.feeCharged);
 
     // 10. read it back through the same flow: the value the contract returns
     //     must be the value the first transaction wrote.
@@ -347,7 +361,9 @@ describe('the full app-shaped flow', () => {
     expect(scValToNative(readGot.returnValue!)).toBe(77n);
     // ...and decoded straight out of the meta, the way an app that keeps the
     // raw meta (for indexing, or for a receipt) would read it.
-    expect(scValToNative(readGot.resultMetaXdr.v4().sorobanMeta()!.returnValue())).toBe(77n);
+    expect(
+      scValToNative(xdr.expectUnionVariant(readGot.resultMetaXdr, 'v4').v4.sorobanMeta!.returnValue),
+    ).toBe(77n);
   });
 
   it('the passphrase from getNetwork can be used to build and sign a transaction', async () => {
@@ -417,10 +433,10 @@ describe('sendTransaction ERROR: classic failures surface as errorResult', () =>
   async function expectError(tx: ReturnType<typeof raw>, arm: string) {
     const sent = await server.sendTransaction(tx);
     expect(sent.status, JSON.stringify(sent)).toBe('ERROR');
-    expect(sent.hash).toBe(tx.hash().toString('hex'));
+    expect(sent.hash).toBe(Buffer.from(tx.hash()).toString('hex'));
     const err = (sent as rpc.Api.SendTransactionResponse).errorResult;
     expect(err, 'errorResult must be a decoded xdr.TransactionResult').toBeDefined();
-    expect(err!.result().switch().name).toBe(arm);
+    expect(err!.result.type).toBe(arm);
     return sent;
   }
 
@@ -536,11 +552,12 @@ describe('a transaction that simulates green and applies red', () => {
     expect(got.status).toBe(rpc.Api.GetTransactionStatus.FAILED);
 
     const failed = got as rpc.Api.GetFailedTransactionResponse;
-    expect(failed.resultXdr.result().switch().name).toBe('txFailed');
-    const opResult = failed.resultXdr.result().results()[0];
-    expect(opResult.tr().invokeHostFunctionResult().switch().name).toBe(
-      'invokeHostFunctionTrapped',
-    );
+    expect(failed.resultXdr.result.type).toBe('txFailed');
+    const opResult = xdr.expectUnionVariant(failed.resultXdr.result, 'txFailed').results[0];
+    expect(
+      xdr.expectUnionVariant(xdr.expectUnionVariant(opResult, 'opInner').tr, 'invokeHostFunction')
+        .invokeHostFunctionResult.type,
+    ).toBe('invokeHostFunctionTrapped');
     // A failed transaction still costs its fee and burns the sequence number.
     expect(w.sequence()).toBe(1n);
   });
@@ -563,7 +580,7 @@ describe('events', () => {
   });
 
   it('simulateTransaction.events decode as DiagnosticEvent, which is what parsers.js does', async () => {
-    // parsers.js:176 — events: sim.events?.map(e => xdr.DiagnosticEvent.fromXDR(e, 'base64'))
+    // parsers.js:178 — events: sim.events?.map(e => xdr.DiagnosticEvent.fromXdr(e, 'base64'))
     const sim = (await server.simulateTransaction(
       await build(op('add', [i32(7), i32(35)], addAddr)),
     )) as rpc.Api.SimulateTransactionSuccessResponse;
@@ -572,7 +589,7 @@ describe('events', () => {
     expect(sim.events.length).toBeGreaterThan(0);
     expect(sim.events[0]).toBeInstanceOf(xdr.DiagnosticEvent);
     const topics = sim.events
-      .flatMap((e) => e.event().body().v0().topics())
+      .flatMap((e) => e.event.body.v0.topics)
       .map((t) => scValToNative(t));
     expect(topics).toContain('add');
   });
@@ -603,7 +620,7 @@ describe('events', () => {
     // Api.TransactionEvents — how an app confirms what a transaction did.
     const topics = got.events.contractEventsXdr
       .flat()
-      .flatMap((e) => e.body().v0().topics())
+      .flatMap((e) => e.body.v0.topics)
       .map((t) => scValToNative(t));
     expect(topics).toContain('add');
   });
@@ -628,9 +645,9 @@ describe('events', () => {
 
     // TransactionMetaV4.operations[i].events is where contract events live in
     // P23+ meta; an indexer replaying meta reads them from there.
-    const ops = got.resultMetaXdr.v4().operations();
+    const ops = xdr.expectUnionVariant(got.resultMetaXdr, 'v4').v4.operations;
     expect(ops).toHaveLength(1);
-    expect(ops[0].events().length).toBeGreaterThan(0);
+    expect(ops[0].events.length).toBeGreaterThan(0);
   });
 
   it('getEvents serves the events the ledger already holds', async () => {

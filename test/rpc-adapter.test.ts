@@ -31,7 +31,7 @@ describe('rpc.Server backed by the in-process ledger', () => {
   beforeEach(() => {
     L = new Ledger();
     sourceB64 = L.fundAccount(1);
-    G = StrKey.encodeEd25519PublicKey(xdr.AccountId.fromXDR(sourceB64, 'base64').ed25519());
+    G = StrKey.encodeEd25519PublicKey(xdr.AccountId.fromXdr(sourceB64, 'base64').ed25519.toBytes());
 
     // A URL that cannot resolve: if anything reaches the network, it fails loudly.
     server = new rpc.Server('https://in-process.invalid');
@@ -55,7 +55,7 @@ describe('rpc.Server backed by the in-process ledger', () => {
     // Deploy through the raw ledger API first.
     const wasmHash = L.seedWasm(CODE);
     const { sent } = L.simulateAndSend(createContractHostFn(sourceB64, wasmHash), sourceB64);
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
     const contractId = Address.fromScAddress(addr).toString();
 
     // From here on, everything goes through the real SDK.
@@ -91,7 +91,7 @@ describe('rpc.Server backed by the in-process ledger', () => {
   it('simulation reflects state written earlier in the same test', async () => {
     const wasmHash = L.seedWasm(CODE);
     const { sent } = L.simulateAndSend(createContractHostFn(sourceB64, wasmHash), sourceB64);
-    const addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    const addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     L.simulateAndSend(invokeHostFn(addr, 'put_persistent', [sym('ctr'), u64(123n)]), sourceB64);
 

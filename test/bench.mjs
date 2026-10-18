@@ -7,29 +7,29 @@ const require = createRequire(import.meta.url);
 const wasm = require('../pkg/soroban_host.js');
 
 const CODE = new Uint8Array(readFileSync(new URL('./fixtures/contract_data.wasm', import.meta.url)));
-const sym = (s) => nativeToScVal(s, { type: 'symbol' }).toXDR('base64');
-const u64 = (n) => nativeToScVal(n, { type: 'u64' }).toXDR('base64');
-const sv = (b64) => xdr.ScVal.fromXDR(b64, 'base64');
+const sym = (s) => nativeToScVal(s, { type: 'symbol' }).toXdr('base64');
+const u64 = (n) => nativeToScVal(n, { type: 'u64' }).toXdr('base64');
+const sv = (b64) => xdr.ScVal.fromXdr(b64, 'base64');
 
 function createFn(deployerB64, hashB64) {
   return xdr.HostFunction.hostFunctionTypeCreateContractV2(
     new xdr.CreateContractArgsV2({
       contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
         new xdr.ContractIdPreimageFromAddress({
-          address: xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXDR(deployerB64, 'base64')),
+          address: xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.fromXdr(deployerB64, 'base64')),
           salt: Buffer.alloc(32),
         }),
       ),
       executable: xdr.ContractExecutable.contractExecutableWasm(Buffer.from(hashB64, 'base64')),
       constructorArgs: [],
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function invokeFn(addr, fn, argsB64) {
   return xdr.HostFunction.hostFunctionTypeInvokeContract(
     new xdr.InvokeContractArgs({ contractAddress: addr, functionName: fn, args: argsB64.map(sv) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function freshLedgerWithContract() {
@@ -39,7 +39,7 @@ function freshLedgerWithContract() {
   const fn = createFn(src, hash);
   const sim = env.simulate(fn, src);
   const sent = env.send(fn, src, sim.resourcesXdr, sim.authXdr, Uint32Array.from(sim.restoredRwEntryIndices));
-  const addr = sv(sent.returnValueXdr).address();
+  const addr = sv(sent.returnValueXdr).address;
   return { env, src, addr };
 }
 
@@ -100,10 +100,12 @@ console.log(`  footprint: ${s2.readOnlyKeys.length} read-only, ${s2.readWriteKey
 console.log(`  resource fee inputs: instructions=${s2.instructions} readBytes=${s2.readBytes} writeBytes=${s2.writeBytes}`);
 
 // Why the enforcing path rejects a stripped footprint.
-const bad = xdr.SorobanResources.fromXDR(s2.resourcesXdr, 'base64');
-bad.footprint(new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }));
+const bad = new xdr.SorobanResources({
+  ...xdr.SorobanResources.fromXdr(s2.resourcesXdr, 'base64'),
+  footprint: new xdr.LedgerFootprint({ readOnly: [], readWrite: [] }),
+});
 try {
-  const r = env.send(putFn, src, bad.toXDR('base64'), s2.authXdr, new Uint32Array());
+  const r = env.send(putFn, src, bad.toXdr('base64'), s2.authXdr, new Uint32Array());
   console.log(`  stripped footprint -> ok=${r.ok} error=${(r.error || '').slice(0, 120)}`);
 } catch (e) {
   console.log(`  stripped footprint -> threw: ${String(e.message).slice(0, 120)}`);

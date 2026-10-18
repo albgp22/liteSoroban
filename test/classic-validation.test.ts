@@ -44,7 +44,7 @@ function world() {
   };
   const state = (k: Keypair) => {
     const a = svm.getAccount(k.publicKey())!;
-    return { seq: a.seqNum().toString(), balance: a.balance().toString() };
+    return { seq: a.seqNum.toString(), balance: a.balance.toString() };
   };
   /** A simulated, assembled add(2, 3) from `source`, unsigned. */
   const addTx = async (
@@ -69,12 +69,13 @@ function world() {
       .build();
     return (await server.prepareTransaction(tx)) as Transaction;
   };
-  const send = (tx: Transaction | FeeBumpTransaction) => svm.sendTransaction(tx.toXDR());
+  const send = (tx: Transaction | FeeBumpTransaction) => svm.sendTransaction(tx.toXdr());
   return { svm, server, account, state, addTx, send };
 }
 
 const resourceFee = (tx: Transaction) =>
-  BigInt(tx.toEnvelope().v1().tx().ext().sorobanData().resourceFee().toString());
+  xdr.expectUnionVariant(xdr.expectUnionVariant(tx.toEnvelope(), 'envelopeTypeTx').v1.tx.ext, 'sorobanData').sorobanData
+    .resourceFee;
 
 function bump(inner: Transaction, feeSource: Keypair, inclusion: bigint, signers: Keypair[], passphrase: string) {
   const env = xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
@@ -82,8 +83,8 @@ function bump(inner: Transaction, feeSource: Keypair, inclusion: bigint, signers
       tx: new xdr.FeeBumpTransaction({
         feeSource: feeSource.xdrMuxedAccount(),
         fee: xdr.Int64.fromString(String(resourceFee(inner) + inclusion)),
-        innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(inner.toEnvelope().v1()),
-        ext: new xdr.FeeBumpTransactionExt(0),
+        innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(xdr.expectUnionVariant(inner.toEnvelope(), 'envelopeTypeTx').v1),
+        ext: xdr.FeeBumpTransactionExt.v0(),
       }),
       signatures: [],
     }),
@@ -139,9 +140,9 @@ describe('operation signatures are checked at submission (OperationFrame::checkV
     const before = w.state(a);
     const sent = await w.server.sendTransaction(tx);
     expect(sent.status).toBe('ERROR');
-    const r = sent.errorResult!.result();
-    expect(r.switch().name).toBe('txFailed');
-    expect(r.results()[0].switch().name).toBe('opBadAuth');
+    const r = sent.errorResult!.result;
+    expect(r.type).toBe('txFailed');
+    expect(xdr.expectUnionVariant(r, 'txFailed').results[0].type).toBe('opBadAuth');
     expect(w.state(a)).toEqual(before);
   });
 
@@ -226,19 +227,21 @@ describe('fee bumps (FeeBumpTransactionFrame::commonValidPreSeqNum / checkValidI
     const [fBefore, aBefore] = [w.state(f), w.state(a)];
     const sent = await w.server.sendTransaction(fb);
     expect(sent.status).toBe('ERROR');
-    const pair = sent.errorResult!.result().innerResultPair();
-    expect(pair.transactionHash().equals(fb.innerTransaction.hash())).toBe(true);
-    expect(pair.result().result().switch().name).toBe('txBadAuthExtra');
+    const pair = xdr.expectUnionVariant(sent.errorResult!.result, 'txFeeBumpInnerFailed').innerResultPair;
+    expect(Buffer.from(pair.transactionHash.toBytes()).equals(fb.innerTransaction.hash())).toBe(true);
+    expect(pair.result.result.type).toBe('txBadAuthExtra');
     expect([w.state(f), w.state(a)]).toEqual([fBefore, aBefore]);
   });
 });
 
 describe('fee-field validity comes first (TransactionFrame::XDRProvidesValidFee)', () => {
   /** Re-wrap a prepared tx after editing its XDR, then sign it. */
-  const edited = (tx: Transaction, edit: (raw: xdr.Transaction) => void, passphrase: string, signer: Keypair) => {
-    const env = tx.toEnvelope();
-    edit(env.v1().tx());
-    const out = new Transaction(env, passphrase);
+  const edited = (tx: Transaction, edit: (raw: xdr.Transaction) => xdr.Transaction, passphrase: string, signer: Keypair) => {
+    const env = xdr.expectUnionVariant(tx.toEnvelope(), 'envelopeTypeTx').v1;
+    const out = new Transaction(
+      xdr.TransactionEnvelope.envelopeTypeTx(new xdr.TransactionV1Envelope({ ...env, tx: edit(env.tx) })),
+      passphrase,
+    );
     out.sign(signer);
     return out;
   };
@@ -246,10 +249,11 @@ describe('fee-field validity comes first (TransactionFrame::XDRProvidesValidFee)
   it('no SorobanTransactionData is txMALFORMED with feeCharged 0, even with a stale sequence', async () => {
     const w = world();
     const a = w.account({ seqNum: 10n });
-    const tx = edited(await w.addTx(a), (raw) => {
-      raw.seqNum(new xdr.SequenceNumber(new xdr.Int64(3n))); // stale: the account is at 10
-      raw.ext(new xdr.TransactionExt(0));
-    }, w.svm.networkPassphrase, a);
+    const tx = edited(await w.addTx(a), (raw) => new xdr.Transaction({
+      ...raw,
+      seqNum: 3n, // stale: the account is at 10
+      ext: xdr.TransactionExt.v0(),
+    }), w.svm.networkPassphrase, a);
     const out = w.send(tx);
     expect([out.code, out.feeCharged, out.rejected]).toEqual(['txMALFORMED', 0n, true]);
   });
@@ -258,7 +262,11 @@ describe('fee-field validity comes first (TransactionFrame::XDRProvidesValidFee)
     const w = world();
     const a = w.account();
     const tx = edited(await w.addTx(a), (raw) => {
-      raw.ext().sorobanData().resourceFee(new xdr.Int64(-1n));
+      const sorobanData = xdr.expectUnionVariant(raw.ext, 'sorobanData').sorobanData;
+      return new xdr.Transaction({
+        ...raw,
+        ext: xdr.TransactionExt.sorobanData(new xdr.SorobanTransactionData({ ...sorobanData, resourceFee: -1n })),
+      });
     }, w.svm.networkPassphrase, a);
     const out = w.send(tx);
     expect([out.code, out.feeCharged]).toEqual(['txMALFORMED', 0n]);
@@ -267,14 +275,14 @@ describe('fee-field validity comes first (TransactionFrame::XDRProvidesValidFee)
   it("an inner tx without SorobanTransactionData is the fee bump's own txMALFORMED", async () => {
     const w = world();
     const [a, f] = [w.account(), w.account()];
-    const inner = edited(await w.addTx(a), (raw) => raw.ext(new xdr.TransactionExt(0)), w.svm.networkPassphrase, a);
+    const inner = edited(await w.addTx(a), (raw) => new xdr.Transaction({ ...raw, ext: xdr.TransactionExt.v0() }), w.svm.networkPassphrase, a);
     const env = xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
       new xdr.FeeBumpTransactionEnvelope({
         tx: new xdr.FeeBumpTransaction({
           feeSource: f.xdrMuxedAccount(),
-          fee: new xdr.Int64(1_000_000n),
-          innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(inner.toEnvelope().v1()),
-          ext: new xdr.FeeBumpTransactionExt(0),
+          fee: 1_000_000n,
+          innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(xdr.expectUnionVariant(inner.toEnvelope(), 'envelopeTypeTx').v1),
+          ext: xdr.FeeBumpTransactionExt.v0(),
         }),
         signatures: [],
       }),
@@ -295,7 +303,7 @@ describe('AccountEntry extensions', () => {
     const w = world();
     const a = w.account();
     const fresh = w.svm.getAccount(a.publicKey())!;
-    expect([fresh.ext().switch(), fresh.toXDR().length]).toEqual([0, 80]);
+    expect([fresh.ext.toXdrObject().v, fresh.toXdr().length]).toEqual([0, 80]);
 
     const tx = await w.addTx(a);
     tx.sign(a);
@@ -303,9 +311,11 @@ describe('AccountEntry extensions', () => {
     expect(w.send(tx).code).toBe('txSUCCESS');
 
     const after = w.svm.getAccount(a.publicKey())!;
-    expect(after.toXDR().length).toBe(132);
-    const v3 = after.ext().v1().ext().v2().ext().v3();
-    expect([v3.seqLedger(), v3.seqTime().toString()]).toEqual([ledgerSeq, String(closeTime)]);
+    expect(after.toXdr().length).toBe(132);
+    const v1 = xdr.expectUnionVariant(after.ext, 'v1').v1;
+    const v2 = xdr.expectUnionVariant(v1.ext, 'v2').v2;
+    const v3 = xdr.expectUnionVariant(v2.ext, 'v3').v3;
+    expect([v3.seqLedger, v3.seqTime.toString()]).toEqual([ledgerSeq, String(closeTime)]);
   });
 
   // soroban-simulation's SimulationSnapshotSource hands the host every account
@@ -332,7 +342,7 @@ describe('AccountEntry extensions', () => {
     const tx = await w.addTx(toKp); // `to` transacts once: now stored as v3
     tx.sign(toKp);
     expect(w.send(tx).code).toBe('txSUCCESS');
-    expect(w.svm.getAccount(toKp.publicKey())!.ext().switch()).toBe(1);
+    expect(w.svm.getAccount(toKp.publicKey())!.ext.toXdrObject().v).toBe(1);
     expect(transferReadBytes()).toBe(whileFresh);
   });
 });

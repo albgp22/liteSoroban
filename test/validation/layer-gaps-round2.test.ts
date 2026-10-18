@@ -49,7 +49,7 @@ const RESOURCE_FEE = 500_000n;
 
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) =>
   xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 
@@ -71,24 +71,24 @@ function rawTx(s: Spec): xdr.Transaction {
   return new xdr.Transaction({
     sourceAccount: s.source,
     fee: Number(s.fee),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(s.seqNum)),
+    seqNum: s.seqNum,
     cond: s.cond ?? xdr.Preconditions.precondNone(),
     memo: s.memo ?? xdr.Memo.memoNone(),
     operations: s.ops,
     ext:
       s.sorobanData === null
-        ? new xdr.TransactionExt(0)
-        : new xdr.TransactionExt(1, s.sorobanData!),
+        ? xdr.TransactionExt.v0()
+        : xdr.TransactionExt.sorobanData(s.sorobanData!),
   });
 }
 
-function txHash(raw: xdr.Transaction): Buffer {
+function txHash(raw: xdr.Transaction): Uint8Array {
   return sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
 }
 
@@ -96,7 +96,7 @@ function signed(raw: xdr.Transaction, kps: Keypair[]): string {
   const h = txHash(raw);
   return xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: kps.map((k) => k.signDecorated(h)) }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function feeBumpEnvelope(
@@ -105,26 +105,26 @@ function feeBumpEnvelope(
   innerEnvB64: string,
   kps: Keypair[],
 ): string {
-  const innerV1 = xdr.TransactionEnvelope.fromXDR(innerEnvB64, 'base64').v1();
+  const innerV1 = xdr.expectUnionVariant(xdr.TransactionEnvelope.fromXdr(innerEnvB64, 'base64'), 'envelopeTypeTx').v1;
   const fbTx = new xdr.FeeBumpTransaction({
     feeSource,
-    fee: new xdr.Int64(fee),
+    fee,
     innerTx: xdr.FeeBumpTransactionInnerTx.envelopeTypeTx(innerV1),
-    ext: new xdr.FeeBumpTransactionExt(0),
+    ext: xdr.FeeBumpTransactionExt.v0(),
   });
   const h = sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction:
         xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTxFeeBump(fbTx),
-    }).toXDR(),
+    }).toXdr(),
   );
   return xdr.TransactionEnvelope.envelopeTypeTxFeeBump(
     new xdr.FeeBumpTransactionEnvelope({
       tx: fbTx,
       signatures: kps.map((k) => k.signDecorated(h)),
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 function ihfOp(fn: xdr.HostFunction, source?: xdr.MuxedAccount): xdr.Operation {
@@ -140,7 +140,7 @@ function extendOp(source?: xdr.MuxedAccount): xdr.Operation {
   return new xdr.Operation({
     sourceAccount: source ?? null,
     body: xdr.OperationBody.extendFootprintTtl(
-      new xdr.ExtendFootprintTtlOp({ ext: new xdr.ExtensionPoint(0), extendTo: 100_000 }),
+      new xdr.ExtendFootprintTtlOp({ ext: xdr.ExtensionPoint.v0(), extendTo: 100_000 }),
     ),
   });
 }
@@ -149,7 +149,7 @@ function restoreOp(source?: xdr.MuxedAccount): xdr.Operation {
   return new xdr.Operation({
     sourceAccount: source ?? null,
     body: xdr.OperationBody.restoreFootprint(
-      new xdr.RestoreFootprintOp({ ext: new xdr.ExtensionPoint(0) }),
+      new xdr.RestoreFootprintOp({ ext: xdr.ExtensionPoint.v0() }),
     ),
   });
 }
@@ -158,7 +158,7 @@ function restoreOp(source?: xdr.MuxedAccount): xdr.Operation {
 function v2cond(over: Partial<{
   timeBounds: xdr.TimeBounds | null;
   ledgerBounds: xdr.LedgerBounds | null;
-  minSeqNum: xdr.SequenceNumber | null;
+  minSeqNum: bigint | null;
   minSeqAge: bigint;
   minSeqLedgerGap: number;
   extraSigners: xdr.SignerKey[];
@@ -168,7 +168,7 @@ function v2cond(over: Partial<{
       timeBounds: over.timeBounds ?? null,
       ledgerBounds: over.ledgerBounds ?? null,
       minSeqNum: over.minSeqNum ?? null,
-      minSeqAge: new xdr.Duration(new xdr.Uint64(over.minSeqAge ?? 0n)),
+      minSeqAge: over.minSeqAge ?? 0n,
       minSeqLedgerGap: over.minSeqLedgerGap ?? 0,
       extraSigners: over.extraSigners ?? [],
     }),
@@ -176,7 +176,7 @@ function v2cond(over: Partial<{
 }
 
 const bounds = (min: bigint, max: bigint) =>
-  new xdr.TimeBounds({ minTime: new xdr.Uint64(min), maxTime: new xdr.Uint64(max) });
+  new xdr.TimeBounds({ minTime: min, maxTime: max });
 
 // ---------------------------------------------------------------------------
 
@@ -190,13 +190,13 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
 
   const sorobanData = (resourceFee: bigint = RESOURCE_FEE, res = RESOURCES) =>
     new xdr.SorobanTransactionData({
-      ext: new xdr.SorobanTransactionDataExt(0),
+      ext: xdr.SorobanTransactionDataExt.v0(),
       resources: res,
-      resourceFee: new xdr.Int64(resourceFee),
+      resourceFee,
     });
 
   const seqOf = (kp: Keypair) =>
-    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum().toString());
+    BigInt(loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!.seqNum.toString());
 
   const spec = (source: Keypair, over: Partial<Spec> = {}): Spec => ({
     source: over.source ?? plain(source.publicKey()),
@@ -218,18 +218,18 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       createContractHostFn(accB64(deployer.publicKey()), wasmHash),
       accB64(deployer.publicKey()),
     );
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
 
     const sim = L.simulate(hostFn(), accB64(deployer.publicKey()));
     expect(sim.ok).toBe(true);
-    RESOURCES = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    RESOURCES = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
   });
 
   // =========================================================================
   // A. PRECONDITIONS OTHER THAN PRECOND_TIME
   //
   //    classic.ts:407 gates every precondition check on
-  //        cond.switch().name === 'precondTime'
+  //        cond.type === 'precondTime'
   //    so a PRECOND_V2 envelope skips ALL of them. core reads the same fields
   //    out of PRECOND_V2: TransactionFrame::getTimeBounds (:654-684) returns
   //    cond.v2().timeBounds, getLedgerBounds (:688), getMinSeqNum (:727),
@@ -311,7 +311,7 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
           rawTx(
             spec(a, {
               seqNum: cur + 1000n,
-              cond: v2cond({ minSeqNum: new xdr.SequenceNumber(new xdr.Int64(cur)) }),
+              cond: v2cond({ minSeqNum: cur }),
             }),
           ),
           [a],
@@ -389,15 +389,15 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       // LIVE: duplicate readOnly key -> txSorobanInvalid.
       const a = Keypair.random();
       L.fund(a.publicKey());
-      const ro = RESOURCES.footprint().readOnly();
+      const ro = RESOURCES.footprint.readOnly;
       const dup = new xdr.SorobanResources({
         footprint: new xdr.LedgerFootprint({
           readOnly: [...ro, ro[0]],
-          readWrite: RESOURCES.footprint().readWrite(),
+          readWrite: RESOURCES.footprint.readWrite,
         }),
-        instructions: RESOURCES.instructions(),
-        diskReadBytes: RESOURCES.diskReadBytes(),
-        writeBytes: RESOURCES.writeBytes(),
+        instructions: RESOURCES.instructions,
+        diskReadBytes: RESOURCES.diskReadBytes,
+        writeBytes: RESOURCES.writeBytes,
       });
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { sorobanData: sorobanData(RESOURCE_FEE, dup) })), [a]),
@@ -409,16 +409,16 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       // LIVE: same key in RO and RW -> txSorobanInvalid.
       const a = Keypair.random();
       L.fund(a.publicKey());
-      const rw = RESOURCES.footprint().readWrite();
+      const rw = RESOURCES.footprint.readWrite;
       expect(rw.length).toBeGreaterThan(0);
       const overlap = new xdr.SorobanResources({
         footprint: new xdr.LedgerFootprint({
-          readOnly: [...RESOURCES.footprint().readOnly(), rw[0]],
+          readOnly: [...RESOURCES.footprint.readOnly, rw[0]],
           readWrite: rw,
         }),
-        instructions: RESOURCES.instructions(),
-        diskReadBytes: RESOURCES.diskReadBytes(),
-        writeBytes: RESOURCES.writeBytes(),
+        instructions: RESOURCES.instructions,
+        diskReadBytes: RESOURCES.diskReadBytes,
+        writeBytes: RESOURCES.writeBytes,
       });
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { sorobanData: sorobanData(RESOURCE_FEE, overlap) })), [a]),
@@ -431,10 +431,10 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       const a = Keypair.random();
       L.fund(a.publicKey());
       const huge = new xdr.SorobanResources({
-        footprint: RESOURCES.footprint(),
+        footprint: RESOURCES.footprint,
         instructions: 1_000_000_000,
-        diskReadBytes: RESOURCES.diskReadBytes(),
-        writeBytes: RESOURCES.writeBytes(),
+        diskReadBytes: RESOURCES.diskReadBytes,
+        writeBytes: RESOURCES.writeBytes,
       });
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { sorobanData: sorobanData(RESOURCE_FEE, huge) })), [a]),
@@ -690,19 +690,21 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       const a = Keypair.random();
       L.fund(a.publicKey());
       const before = loadAccount(L, accountIdFromPublicKey(a.publicKey()))!;
-      expect(before.ext().switch()).toBe(0);
+      expect(before.ext.type).toBe('v0');
 
       L.setTimestamp(1_234_567);
       const out = L.sendTransaction(signed(rawTx(spec(a)), [a]));
       expect(out.code).toBe('txSUCCESS');
 
       const after = loadAccount(L, accountIdFromPublicKey(a.publicKey()))!;
-      expect(after.ext().switch()).toBe(1);
-      expect(after.ext().v1().ext().switch()).toBe(2);
-      expect(after.ext().v1().ext().v2().ext().switch()).toBe(3);
-      const v3 = after.ext().v1().ext().v2().ext().v3();
-      expect(v3.seqLedger()).toBe(L.ledgerSeq);
-      expect(BigInt(v3.seqTime().toString())).toBe(1_234_567n);
+      expect(after.ext.type).toBe('v1');
+      const v1 = xdr.expectUnionVariant(after.ext, 'v1').v1;
+      expect(v1.ext.type).toBe('v2');
+      const v2 = xdr.expectUnionVariant(v1.ext, 'v2').v2;
+      expect(v2.ext.type).toBe('v3');
+      const v3 = xdr.expectUnionVariant(v2.ext, 'v3').v3;
+      expect(v3.seqLedger).toBe(L.ledgerSeq);
+      expect(BigInt(v3.seqTime.toString())).toBe(1_234_567n);
     });
 
     it('adds exactly the 52 bytes the live network adds', () => {
@@ -711,11 +713,11 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       L.fund(a.publicKey());
       const before = xdr.LedgerEntryData.account(
         loadAccount(L, accountIdFromPublicKey(a.publicKey()))!,
-      ).toXDR().length;
+      ).toXdr().length;
       L.sendTransaction(signed(rawTx(spec(a)), [a]));
       const after = xdr.LedgerEntryData.account(
         loadAccount(L, accountIdFromPublicKey(a.publicKey()))!,
-      ).toXDR().length;
+      ).toXdr().length;
       expect(before).toBe(84);
       expect(after).toBe(136);
     });
@@ -777,7 +779,7 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
   //    core: TransactionFrame::getFee (:417) when applying returns
   //      declaredSorobanResourceFee + min(getInclusionFee(), baseFee * nOps)
   //    so the charged inclusion fee is CAPPED at baseFee * numOperations
-  //    before any refund. classic.ts:452 debits the whole `raw.fee()`.
+  //    before any refund. classic.ts:452 debits the whole `raw.fee`.
   //    LIVE: the identical transaction bid at inclusion 100, 10 000 and
   //    1 000 000 was charged 16 706 stroops every time.
   // =========================================================================
@@ -821,12 +823,12 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
 
       const L2 = svm.ledger;
       const bal = () =>
-        BigInt(loadAccount(L2, accountIdFromPublicKey(f.publicKey()))!.balance().toString());
+        BigInt(loadAccount(L2, accountIdFromPublicKey(f.publicKey()))!.balance.toString());
       const before = bal();
 
       const innerSpec: Spec = {
         source: plain(a.publicKey()),
-        seqNum: BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum().toString()) + 1n,
+        seqNum: BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum.toString()) + 1n,
         fee: RESOURCE_FEE,
         ops: [ihfOp(hostFn())],
         sorobanData: sorobanData(),
@@ -849,7 +851,7 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       const L2 = svm.ledger;
       const innerSpec: Spec = {
         source: plain(a.publicKey()),
-        seqNum: BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum().toString()) + 1n,
+        seqNum: BigInt(loadAccount(L2, accountIdFromPublicKey(a.publicKey()))!.seqNum.toString()) + 1n,
         fee: RESOURCE_FEE,
         ops: [ihfOp(hostFn())],
         sorobanData: sorobanData(),

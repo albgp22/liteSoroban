@@ -43,8 +43,8 @@ async function unsignedAdd(svm: LiteStellar, seqSkew = 0n) {
   return { alice, server, prepared: await server.prepareTransaction(tx) };
 }
 
-const errorCode = (sent: { errorResult?: { result(): { switch(): { name: string } } } }) =>
-  sent.errorResult?.result().switch().name;
+const errorCode = (sent: { errorResult?: { result: { type: string } } }) =>
+  sent.errorResult?.result.type;
 
 describe('rpcServer() honours the validation switches', () => {
   it('control: by default an unsigned envelope is rejected', async () => {
@@ -107,8 +107,8 @@ describe('requestAirdrop', () => {
 
     // Funding it anyway used to rebuild the entry: sequence 0, signers gone.
     const account = svm.getAccount(alice.publicKey)!;
-    expect(account.thresholds()).toEqual(Buffer.from([1, 1, 2, 2]));
-    expect(account.signers()).toHaveLength(1);
+    expect(Buffer.from(account.thresholds.toBytes())).toEqual(Buffer.from([1, 1, 2, 2]));
+    expect(account.signers).toHaveLength(1);
     expect(alice.balance()).toBe(balance);
   });
 });

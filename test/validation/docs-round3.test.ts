@@ -14,7 +14,7 @@
  *       a soroban-env-host 27.0.1 checkout
  *   $STELLAR_CORE_SRC/src/ledger/NetworkConfig.cpp
  *       a stellar-core checkout
- *   node_modules/@stellar/stellar-sdk (the pinned 16.2.0)
+ *   node_modules/@stellar/stellar-sdk (the pinned 17.2.1)
  */
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
@@ -245,7 +245,7 @@ describe('the "18 rpc.Server methods" claim', () => {
     expect(
       names.length,
       `README.md:172-174 and GUIDE.md:344-348 both say "all 18 rpc.Server methods". ` +
-        `The pinned @stellar/stellar-sdk 16.2.0 exposes ${names.length}: ` +
+        `The pinned @stellar/stellar-sdk 17.2.1 exposes ${names.length}: ` +
         `${names.sort().join(', ')}. Whatever 18 counted, it is not this surface, ` +
         `so "all 18" cannot mean "all of them".`,
     ).toBe(18);

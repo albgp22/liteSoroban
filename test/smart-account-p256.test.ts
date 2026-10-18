@@ -69,14 +69,14 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
       source,
     );
     expect(sent.ok, `deploy failed: ${sent.error}`).toBe(true);
-    return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   }
 
   beforeEach(() => {
     L = new Ledger();
     const deployer = Keypair.random();
     L.fund(deployer.publicKey());
-    source = accountIdFromPublicKey(deployer.publicKey()).toXDR('base64');
+    source = accountIdFromPublicKey(deployer.publicKey()).toXdr('base64');
     passkey = createP256Signer();
     addr = deploy([p256Signer(passkey)]);
   });
@@ -93,7 +93,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
       source,
     );
     expect(has.ok, has.error).toBe(true);
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(true);
   });
 
   it('a passkey signature passes __check_auth and the call applies', async () => {
@@ -109,7 +109,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
       invokeHostFn(addr, 'has_signer', [ed25519SignerKey(newKey.rawPublicKey())]),
       source,
     );
-    expect(scValToNative(xdr.ScVal.fromXDR(has.returnValueXdr!, 'base64'))).toBe(true);
+    expect(scValToNative(xdr.ScVal.fromXdr(has.returnValueXdr!, 'base64'))).toBe(true);
   });
 
   it('a signature from a DIFFERENT passkey is rejected', async () => {
@@ -178,7 +178,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
     L = new Ledger();
     const deployer = Keypair.random();
     L.fund(deployer.publicKey());
-    source = accountIdFromPublicKey(deployer.publicKey()).toXDR('base64');
+    source = accountIdFromPublicKey(deployer.publicKey()).toXdr('base64');
     const multi = deploy([edSigner(ed), p256Signer(pk2)]);
 
     const fn = invokeHostFn(multi, 'add_signer', [edSigner(Keypair.random())]);
@@ -193,7 +193,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
     L = new Ledger();
     const deployer = Keypair.random();
     L.fund(deployer.publicKey());
-    source = accountIdFromPublicKey(deployer.publicKey()).toXDR('base64');
+    source = accountIdFromPublicKey(deployer.publicKey()).toXdr('base64');
 
     const edAddr = deploy([edSigner(edKp)]);
     const fn = invokeHostFn(edAddr, 'add_signer', [edSigner(Keypair.random())]);
@@ -207,7 +207,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
     const L2 = new Ledger();
     const d2 = Keypair.random();
     L2.fund(d2.publicKey());
-    const src2 = accountIdFromPublicKey(d2.publicKey()).toXDR('base64');
+    const src2 = accountIdFromPublicKey(d2.publicKey()).toXdr('base64');
     const pk = createP256Signer();
     const hash2 = L2.seedWasm(CODE);
     const { sent: dep2 } = L2.simulateAndSend(
@@ -217,7 +217,7 @@ describe('smart account (current build): secp256r1 / passkey auth', () => {
       ]),
       src2,
     );
-    const a2 = xdr.ScVal.fromXDR(dep2.returnValueXdr!, 'base64').address();
+    const a2 = xdr.expectUnionVariant(xdr.ScVal.fromXdr(dep2.returnValueXdr!, 'base64'), 'scvAddress').address;
     const fn2 = invokeHostFn(a2, 'add_signer', [edSigner(Keypair.random())]);
     const rec2 = L2.simulate(fn2, src2);
     const pkAuth = await signAuthEntries(L2, rec2.authXdr, {

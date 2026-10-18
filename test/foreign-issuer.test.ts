@@ -113,7 +113,7 @@ describe('a token whose issuer we do not control', () => {
     expect(issuer.keypair.canSign()).toBe(false);
     // It can still be a transaction source, because source-account auth needs
     // no signature — which is exactly why minting works.
-    expect(issuer.accountIdB64).toBe(accountIdFromPublicKey(USDC_ISSUER).toXDR('base64'));
+    expect(issuer.accountIdB64).toBe(accountIdFromPublicKey(USDC_ISSUER).toXdr('base64'));
   });
 
   it('a locally-issued token still works the normal way', () => {

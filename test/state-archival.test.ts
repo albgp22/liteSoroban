@@ -35,7 +35,7 @@ const stubServer = (entryXdr: string) =>
   ({
     getLedgerEntries: async () => ({
       latestLedger: 5_264_566,
-      entries: [{ val: xdr.LedgerEntryData.fromXDR(entryXdr, 'base64'), lastModifiedLedgerSeq: 2_332 }],
+      entries: [{ val: xdr.LedgerEntryData.fromXdr(entryXdr, 'base64'), lastModifiedLedgerSeq: 2_332 }],
     }),
   }) as unknown as rpc.Server;
 
@@ -44,15 +44,15 @@ function dataKey(contractId: string, name: string, durability: 'persistent' | 't
     new xdr.LedgerKeyContractData({
       contract: Address.fromString(contractId).toScAddress(),
       key: sym(name),
-      durability: xdr.ContractDataDurability[durability](),
+      durability: xdr.ContractDataDurability[durability],
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 const codeKey = (hashB64: string) =>
   xdr.LedgerKey.contractCode(
     new xdr.LedgerKeyContractCode({ hash: Buffer.from(hashB64, 'base64') }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 describe('state-archival settings', () => {
   it("decodes testnet's ConfigSettingStateArchival entry", async () => {
@@ -72,7 +72,7 @@ describe('state-archival settings', () => {
   it('refuses an entry that is not the state-archival setting', async () => {
     const compute = xdr.LedgerEntryData.configSetting(
       xdr.ConfigSettingEntry.configSettingContractMaxSizeBytes(65_536),
-    ).toXDR('base64');
+    ).toXdr('base64');
     await expect(loadArchivalSettingsFromRpc(stubServer(compute))).rejects.toThrow(
       /ConfigSettingStateArchival/,
     );
@@ -94,7 +94,9 @@ describe('state-archival settings', () => {
     const uploaded = new LiteStellar();
     const hash = seeded.addContract(CONTRACT_DATA);
     const ret = uploaded.uploadContract(CONTRACT_DATA);
-    expect(Buffer.from(xdr.ScVal.fromXDR(ret, 'base64').bytes()).toString('base64')).toBe(hash);
+    expect(
+      Buffer.from(xdr.expectUnionVariant(xdr.ScVal.fromXdr(ret, 'base64'), 'scvBytes').bytes.toBytes()).toString('base64'),
+    ).toBe(hash);
 
     const ttl = uploaded.getEntryTtl(codeKey(hash));
     expect(ttl).toBe(uploaded.ledger.ledgerSeq + 120_960 - 1);

@@ -91,7 +91,7 @@ let S: rpc.Server;
 let a: Keypair;
 let store: string;
 
-const balance = (k: Keypair) => BigInt(svm.getAccount(k.publicKey())!.balance().toString());
+const balance = (k: Keypair) => BigInt(svm.getAccount(k.publicKey())!.balance.toString());
 const fund = () => {
   const k = Keypair.random();
   svm.ledger.fund(k.publicKey(), { balance: 10_000n * 10_000_000n });
@@ -119,13 +119,16 @@ async function withData(op: xdr.Operation, data: xdr.SorobanTransactionData) {
 }
 
 const sorobanData = (tx: Transaction) =>
-  xdr.SorobanTransactionData.fromXDR(tx.toEnvelope().v1().tx().ext().sorobanData().toXDR());
+  xdr.expectUnionVariant(xdr.expectUnionVariant(tx.toEnvelope(), 'envelopeTypeTx').v1.tx.ext, 'sorobanData').sorobanData;
+/** `d` with some of its resources replaced: XDR values are read-only. */
+const withResources = (d: xdr.SorobanTransactionData, r: Partial<xdr.SorobanResources>) =>
+  new xdr.SorobanTransactionData({ ...d, resources: new xdr.SorobanResources({ ...d.resources, ...r }) });
 
 /** Through the classic layer, for the outcome's diagnostic. */
 function submit(tx: Transaction | FeeBumpTransaction, payer = a) {
   tx.sign(payer);
   const before = balance(payer);
-  const out = svm.sendTransaction(tx.toXDR());
+  const out = svm.sendTransaction(tx.toXdr());
   return { ...out, debited: before - balance(payer) };
 }
 
@@ -134,13 +137,13 @@ async function run(tx: Transaction, payer = a) {
   tx.sign(payer);
   const before = balance(payer);
   const sent = await S.sendTransaction(tx);
-  if (sent.status === 'ERROR') return { status: `ERROR ${sent.errorResult!.result().switch().name}`, op: '', fee: 0n, debited: 0n };
+  if (sent.status === 'ERROR') return { status: `ERROR ${sent.errorResult!.result.type}`, op: '', fee: 0n, debited: 0n };
   const got: any = await S.pollTransaction(sent.hash);
   const result: xdr.TransactionResult = got.resultXdr;
   return {
     status: got.status as string,
-    op: result.result().results()[0].tr().value().switch().name as string,
-    fee: BigInt(result.feeCharged().toString()),
+    op: (result.result as any).results[0].tr.value.type as string,
+    fee: BigInt(result.feeCharged.toString()),
     debited: before - balance(payer),
   };
 }
@@ -152,7 +155,7 @@ async function deploy(wasm: Buffer, salt = Buffer.alloc(32, 1)): Promise<string>
   );
   const out = submit(create);
   expect(out.code).toBe('txSUCCESS');
-  return Address.fromScVal(xdr.ScVal.fromXDR(out.returnValueXdr!, 'base64')).toString();
+  return Address.fromScVal(xdr.ScVal.fromXdr(out.returnValueXdr!, 'base64')).toString();
 }
 
 const dataKey = (k: xdr.ScVal, durability: 'persistent' | 'temporary' = 'persistent') =>
@@ -160,7 +163,7 @@ const dataKey = (k: xdr.ScVal, durability: 'persistent' | 'temporary' = 'persist
     new xdr.LedgerKeyContractData({
       contract: Address.fromString(store).toScAddress(),
       key: k,
-      durability: xdr.ContractDataDurability[durability](),
+      durability: xdr.ContractDataDurability[durability],
     }),
   );
 const accountKey = (k: Keypair) => xdr.LedgerKey.account(new xdr.LedgerKeyAccount({ accountId: k.xdrAccountId() }));
@@ -176,41 +179,44 @@ beforeEach(async () => {
 
 describe('submission: checkSorobanResources -> txSOROBAN_INVALID', () => {
   type Fp = xdr.SorobanTransactionData;
-  const res = (d: Fp) => d.resources();
-  const addRo = (d: Fp, keys: xdr.LedgerKey[]) => res(d).footprint().readOnly([...res(d).footprint().readOnly(), ...keys]);
-  const addRw = (d: Fp, keys: xdr.LedgerKey[]) => res(d).footprint().readWrite([...res(d).footprint().readWrite(), ...keys]);
+  const res = (d: Fp) => d.resources;
+  const footprint = (d: Fp, f: Partial<xdr.LedgerFootprint>) =>
+    withResources(d, { footprint: new xdr.LedgerFootprint({ ...res(d).footprint, ...f }) });
+  const addRo = (d: Fp, keys: xdr.LedgerKey[]) => footprint(d, { readOnly: [...res(d).footprint.readOnly, ...keys] });
+  const addRw = (d: Fp, keys: xdr.LedgerKey[]) => footprint(d, { readWrite: [...res(d).footprint.readWrite, ...keys] });
   const junk = (n: number) => Array.from({ length: n }, (_, i) => dataKey(sym(`j${i}`)));
   const accounts = (n: number) => Array.from({ length: n }, () => accountKey(Keypair.random()));
   const bytesKey = (n: number) => dataKey(nativeToScVal(Buffer.alloc(n, 1)));
   const trustline = (asset: xdr.TrustLineAsset) =>
     xdr.LedgerKey.trustline(new xdr.LedgerKeyTrustLine({ accountId: a.xdrAccountId(), asset }));
   const archived = (indexes: number[]) => (d: Fp) =>
-    d.ext(new (xdr.SorobanTransactionDataExt as any)(1, new xdr.SorobanResourcesExtV0({ archivedSorobanEntries: indexes })));
+    new xdr.SorobanTransactionData({
+      ...d,
+      ext: xdr.SorobanTransactionDataExt.resourceExt(new xdr.SorobanResourcesExtV0({ archivedSorobanEntries: indexes })),
+    });
 
   /** A simulated put_persistent with its SorobanTransactionData edited. Its footprint is
    * 3 entries: the instance and the code read-only, the key read-write. */
-  async function edited(edit: (d: Fp) => void, enoughFee = false) {
+  async function edited(edit: (d: Fp) => Fp, enoughFee = false) {
     const op = put('k');
-    const d = sorobanData(await prepared(op));
-    edit(d);
+    let d = edit(sorobanData(await prepared(op)));
     if (enoughFee) {
-      d.resourceFee(new xdr.Int64(50_000_000n));
-      if (res(d).instructions() < 100_000_000) res(d).instructions(100_000_000);
+      d = new xdr.SorobanTransactionData({ ...d, resourceFee: 50_000_000n });
+      if (res(d).instructions < 100_000_000) d = withResources(d, { instructions: 100_000_000 });
     }
     return withData(op, d);
   }
 
-  const over: [string, (d: Fp) => void, string][] = [
-    ['instructions', (d) => res(d).instructions(400_000_001),
+  const over: [string, (d: Fp) => Fp, string][] = [
+    ['instructions', (d) => withResources(d, { instructions: 400_000_001 }),
       'transaction instructions resources exceed network config limit: 400000001 > 400000000'],
-    ['disk read bytes', (d) => res(d).diskReadBytes(200_001),
+    ['disk read bytes', (d) => withResources(d, { diskReadBytes: 200_001 }),
       'transaction byte-read resources exceed network config limit: 200001 > 200000'],
-    ['write bytes', (d) => res(d).writeBytes(132_097),
+    ['write bytes', (d) => withResources(d, { writeBytes: 132_097 }),
       'transaction byte-write resources exceed network config limit: 132097 > 132096'],
-    ['instructions and disk read bytes: the first check wins', (d) => {
-      res(d).instructions(400_000_001);
-      res(d).diskReadBytes(200_001);
-    }, 'transaction instructions resources exceed network config limit: 400000001 > 400000000'],
+    ['instructions and disk read bytes: the first check wins', (d) =>
+      withResources(d, { instructions: 400_000_001, diskReadBytes: 200_001 }),
+      'transaction instructions resources exceed network config limit: 400000001 > 400000000'],
     ['footprint entries', (d) => addRo(d, junk(398)),
       'the number of entries in transaction footprint exceeds the network config limit: 401 > 400'],
     ['disk read entries (classic keys)', (d) => addRo(d, accounts(201)),
@@ -223,23 +229,20 @@ describe('submission: checkSorobanResources -> txSOROBAN_INVALID', () => {
       'transaction footprint contains unsupported ledger key type: 9'],
     ['a native trustline', (d) => addRo(d, [trustline(xdr.TrustLineAsset.assetTypeNative())]),
       'transaction footprint contains invalid trustline asset'],
-    ["the issuer's own trustline", (d) => addRo(d, [trustline(new Asset('USD', a.publicKey()).toTrustLineXDRObject())]),
+    ["the issuer's own trustline", (d) => addRo(d, [trustline(new Asset('USD', a.publicKey()).toTrustLineXdrObject())]),
       'transaction footprint contains invalid trustline asset'],
     ['an asset code with a zero in the middle', (d) => addRo(d, [trustline(
       xdr.TrustLineAsset.assetTypeCreditAlphanum4(
         new xdr.AlphaNum4({ assetCode: Buffer.from([0x55, 0, 0x53, 0]), issuer: Keypair.random().xdrAccountId() }),
       ),
     )]), 'transaction footprint contains invalid trustline asset'],
-    ['archived indexes out of order', (d) => {
-      addRw(d, junk(1));
-      archived([0, 0])(d);
-    }, 'archivedSorobanEntries must be sorted in ascending order'],
+    ['archived indexes out of order', (d) => archived([0, 0])(addRw(d, junk(1))),
+      'archivedSorobanEntries must be sorted in ascending order'],
     ['an archived index past the read-write footprint', archived([5]),
       'archivedSorobanEntries index is out of bounds: 5 >= 1'],
-    ['an archived index on a temporary key', (d) => {
-      res(d).footprint().readWrite([dataKey(sym('t'), 'temporary'), ...res(d).footprint().readWrite()]);
-      archived([0])(d);
-    }, 'archivedSorobanEntries index points to a non-persistent entry: 0, key type 6'],
+    ['an archived index on a temporary key', (d) =>
+      archived([0])(footprint(d, { readWrite: [dataKey(sym('t'), 'temporary'), ...res(d).footprint.readWrite] })),
+      'archivedSorobanEntries index points to a non-persistent entry: 0, key type 6'],
   ];
 
   it.each(over)('over the limit: %s', async (_, edit, detail) => {
@@ -247,13 +250,13 @@ describe('submission: checkSorobanResources -> txSOROBAN_INVALID', () => {
     const out = submit(tx);
     expect([out.code, out.rejected, out.detail]).toEqual(['txSOROBAN_INVALID', true, detail]);
     // Nothing moves; the result reports the declared resource fee + baseFee.
-    const declared = BigInt(sorobanData(tx).resourceFee().toString());
+    const declared = BigInt(sorobanData(tx).resourceFee.toString());
     expect([out.debited, out.feeCharged]).toEqual([0n, declared + 100n]);
   });
 
   it('every limit is inclusive: a transaction AT each one is accepted and applies', async () => {
-    const at: ((d: Fp) => void)[] = [
-      (d) => res(d).instructions(400_000_000),
+    const at: ((d: Fp) => Fp)[] = [
+      (d) => withResources(d, { instructions: 400_000_000 }),
       (d) => addRo(d, junk(397)),
       (d) => addRo(d, accounts(200)),
       (d) => addRw(d, junk(199)),
@@ -284,8 +287,7 @@ describe('submission: checkSorobanResources -> txSOROBAN_INVALID', () => {
 
   it('judges a fee bump by its inner transaction', async () => {
     const op = put('fb');
-    const d = sorobanData(await prepared(op));
-    res(d).instructions(400_000_001);
+    const d = withResources(sorobanData(await prepared(op)), { instructions: 400_000_001 });
     const inner = await withData(op, d);
     inner.sign(a);
     const f = fund();
@@ -300,7 +302,7 @@ describe('submission: checkSorobanResources -> txSOROBAN_INVALID', () => {
 
   it("enforces the installed network's limits, whether or not fees are charged", async () => {
     const tx = await prepared(put('k'));
-    const declared = res(sorobanData(tx)).instructions();
+    const declared = res(sorobanData(tx)).instructions;
     svm.withFeeSettings({ ...QUICKSTART, txMaxInstructions: declared - 1 }).withFeeCharging(false);
     expect(submit(tx).detail).toBe(
       `transaction instructions resources exceed network config limit: ${declared} > ${declared - 1}`,
@@ -336,8 +338,8 @@ describe('apply: InvokeHostFunction -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEE
 
   it('writes no more bytes than the transaction declares', async () => {
     const op = put('w');
-    const d = sorobanData(await prepared(op));
-    d.resources().writeBytes(d.resources().writeBytes() - 1);
+    const d0 = sorobanData(await prepared(op));
+    const d = withResources(d0, { writeBytes: d0.resources.writeBytes - 1 });
     expect(await run(await withData(op, d))).toEqual({
       status: 'FAILED', op: 'invokeHostFunctionResourceLimitExceeded', fee: 6_067n, debited: 6_067n,
     });
@@ -352,8 +354,8 @@ describe('apply: InvokeHostFunction -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEE
       function: 'balance',
       args: [new Address(a.publicKey()).toScVal()],
     });
-    const d = sorobanData(await prepared(op));
-    d.resources().diskReadBytes(d.resources().diskReadBytes() - 1);
+    const d0 = sorobanData(await prepared(op));
+    const d = withResources(d0, { diskReadBytes: d0.resources.diskReadBytes - 1 });
     const out = submit(await withData(op, d));
     expect([out.code, out.invokeResult, out.error]).toEqual([
       'txFAILED',
@@ -368,8 +370,7 @@ describe('apply: InvokeHostFunction -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEE
   ])('%s lifts the declared bytes, never the network limits', async (_, lift) => {
     lift();
     const op = put('w');
-    const d = sorobanData(await prepared(op));
-    d.resources().writeBytes(0);
+    const d = withResources(sorobanData(await prepared(op)), { writeBytes: 0 });
     expect(submit(await withData(op, d)).code).toBe('txSUCCESS');
     expect(submit(await prepared(bytes('b64', 64))).invokeResult).toBe('invokeHostFunctionResourceLimitExceeded');
   });
@@ -379,17 +380,22 @@ describe('apply: ExtendFootprintTTL / RestoreFootprint', () => {
   const restoreOp = Operation.restoreFootprint({});
   const archive = () => svm.ledger.advanceLedgers(svm.ledger.archivalSettings.minPersistentTtl + 1);
   /** A restore of `k` as simulated, with its declared bytes edited. */
-  async function restore(k: string, edit: (r: xdr.SorobanResources) => void = () => {}) {
+  async function restore(k: string, edit: Partial<xdr.SorobanResources> = {}) {
     const d = sorobanData(await prepared(restoreOp, new SorobanDataBuilder().setReadWrite([dataKey(sym(k))]).build()));
-    edit(d.resources());
-    return withData(restoreOp, d);
+    return withData(restoreOp, withResources(d, edit));
   }
-  const ttl = (k: string) => svm.ledger.getEntryTtl(dataKey(sym(k)).toXDR('base64'));
+  const ttl = (k: string) => svm.ledger.getEntryTtl(dataKey(sym(k)).toXdr('base64'));
   const keepContractAlive = async () => {
     expect((await run(await prepared(call('extend_instance', [u32(1_000_000), u32(1_000_000)]))))).toMatchObject({ status: 'SUCCESS' });
     const instance = (await S.getLedgerEntries(dataKey(xdr.ScVal.scvLedgerKeyContractInstance()))).entries[0];
     const code = xdr.LedgerKey.contractCode(
-      new xdr.LedgerKeyContractCode({ hash: instance.val.contractData().val().instance().executable().wasmHash() }),
+      new xdr.LedgerKeyContractCode({
+        hash: xdr.expectUnionVariant(
+          xdr.expectUnionVariant(xdr.expectUnionVariant(instance.val, 'contractData').contractData.val, 'scvContractInstance')
+            .instance.executable,
+          'contractExecutableWasm',
+        ).wasmHash,
+      }),
     );
     const extend = await prepared(Operation.extendFootprintTtl({ extendTo: 1_000_000 }), new SorobanDataBuilder().setReadOnly([code]).build());
     expect(await run(extend)).toMatchObject({ status: 'SUCCESS' });
@@ -399,10 +405,10 @@ describe('apply: ExtendFootprintTTL / RestoreFootprint', () => {
     await keepContractAlive();
     for (const k of ['r1', 'r2', 'r3', 'r4']) expect(await run(await prepared(put(k)))).toMatchObject({ status: 'SUCCESS' });
     archive();
-    const cases: [string, (r: xdr.SorobanResources) => void, bigint, string][] = [
-      ['r1', (r) => r.diskReadBytes(79), 6_591n, 'operation byte-read resources exceeds amount specified: 80 > 79'],
-      ['r2', (r) => r.writeBytes(79), 6_590n, 'operation byte-write resources exceeds amount specified: 80 > 79'],
-      ['r3', (r) => (r.diskReadBytes(0), r.writeBytes(0)), 6_487n, 'operation byte-read resources exceeds amount specified: 80 > 0'],
+    const cases: [string, Partial<xdr.SorobanResources>, bigint, string][] = [
+      ['r1', { diskReadBytes: 79 }, 6_591n, 'operation byte-read resources exceeds amount specified: 80 > 79'],
+      ['r2', { writeBytes: 79 }, 6_590n, 'operation byte-write resources exceeds amount specified: 80 > 79'],
+      ['r3', { diskReadBytes: 0, writeBytes: 0 }, 6_487n, 'operation byte-read resources exceeds amount specified: 80 > 0'],
     ];
     for (const [k, edit, fee, detail] of cases) {
       const before = ttl(k);
@@ -454,7 +460,7 @@ describe("the host's budget: txMaxInstructions and txMemoryLimit", () => {
   /** ~41.6 instructions a guest cycle: 3M cycles need ~120M, 9.4M ~376M. */
   const work = (contract: string, cycles: number) =>
     Operation.invokeContractFunction({ contract, function: 'do_cpu_only_work', args: [u32(cycles), u32(0), u32(0)] });
-  const declared = (tx: Transaction) => sorobanData(tx).resources().instructions();
+  const declared = (tx: Transaction) => sorobanData(tx).resources.instructions;
   const stored = async (k: xdr.LedgerKey) => (await S.getLedgerEntries(k)).entries.length;
   const simError = async (op: xdr.Operation) => {
     const raw = new TransactionBuilder(await S.getAccount(a.publicKey()), { fee: '100', networkPassphrase: PASS })
@@ -516,8 +522,7 @@ describe("the host's budget: txMaxInstructions and txMemoryLimit", () => {
   it('stops an applied call at its declared instructions: a guest out of fuel is a trap', async () => {
     const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
     const op = work(loadgen, 3_000_000);
-    const d = sorobanData(await prepared(op));
-    d.resources().instructions(100_000_000);
+    const d = withResources(sorobanData(await prepared(op)), { instructions: 100_000_000 });
     // The node: "VM call trapped: OutOfFuel". The guest runs on fuel drawn from
     // what the budget has left, so it stops AT the declared count and no charge
     // passes it: InvokeHostFunctionOpFrame.cpp:737 does not fire.

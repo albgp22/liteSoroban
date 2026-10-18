@@ -75,13 +75,13 @@ function envelope(
   return TransactionBuilder.cloneFrom(tx, {
     fee: '1000000',
     sorobanData: new xdr.SorobanTransactionData({
-      ext: new (xdr as any).SorobanTransactionDataExt(0),
-      resources: xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64'),
-      resourceFee: (xdr as any).Int64.fromString('500000'),
+      ext: xdr.SorobanTransactionDataExt.v0(),
+      resources: xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64'),
+      resourceFee: xdr.Int64.fromString('500000'),
     }),
   })
     .build()
-    .toXDR();
+    .toXdr();
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ describe('escape hatches: do they disable what they claim?', () => {
     const c2 = svm2.deployContract(ADD_I32, { as: alice2 });
     const env2 = envelope(svm2, alice2, c2);
     const sent = await svm2.rpcServer().sendTransaction(
-      TransactionBuilder.fromXDR(env2, svm2.networkPassphrase) as any,
+      TransactionBuilder.fromXdr(env2, svm2.networkPassphrase) as any,
     );
     expect(sent.status, 'rpcServer() ignored withSigverify(false)').not.toBe('ERROR');
   });
@@ -283,7 +283,7 @@ describe('signAuthEntriesSync vs the SDK', () => {
   const invocation = new xdr.SorobanAuthorizedInvocation({
     function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
       new xdr.InvokeContractArgs({
-        contractAddress: xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 3)),
+        contractAddress: xdr.ScAddress.scAddressTypeContract(new xdr.ContractId(Buffer.alloc(32, 3))),
         functionName: 'go',
         args: [],
       }),
@@ -294,7 +294,7 @@ describe('signAuthEntriesSync vs the SDK', () => {
   const addrCreds = () =>
     new xdr.SorobanAddressCredentials({
       address: new Address(kp.publicKey()).toScAddress(),
-      nonce: new xdr.Int64(7n),
+      nonce: 7n,
       signatureExpirationLedger: 0,
       signature: xdr.ScVal.scvVec([]),
     });
@@ -322,7 +322,7 @@ describe('signAuthEntriesSync vs the SDK', () => {
     const entry = entryFor(xdr.SorobanCredentials.sorobanCredentialsAddress(addrCreds()));
     const sdk = await sdkPayloadFor(entry);
     let ours!: Buffer;
-    signAuthEntriesSync([entry.toXDR('base64')], {
+    signAuthEntriesSync([entry.toXdr('base64')], {
       sign: (p) => {
         ours = Buffer.from(p);
         return SIG;
@@ -334,23 +334,24 @@ describe('signAuthEntriesSync vs the SDK', () => {
   });
 
   /**
-   * DEFECT 6. litestellar.ts:139 reads `credentials.address()` UNCONDITIONALLY,
-   * before the arm test on line 143. js-xdr throws "address not set" for any
-   * other arm, so the CAP-71 `envelopeTypeSorobanAuthorizationWithAddress`
-   * branch on lines 152-161 is unreachable dead code — the exact case its
-   * comment (lines 122-125) claims to handle.
+   * DEFECT 6. litestellar.ts:139 reads `credentials.address` UNCONDITIONALLY,
+   * before the arm test on line 143. Any other arm has no `address` field (it
+   * is undefined, and the next read through it throws), so the CAP-71
+   * `envelopeTypeSorobanAuthorizationWithAddress` branch on lines 152-161 is
+   * unreachable dead code — the exact case its comment (lines 122-125) claims
+   * to handle.
    *
    * The SDK gets this right by dispatching first
-   * (stellar-sdk/lib/esm/base/auth.js:201-212, getAddressCredentials):
-   *   Address        -> credentials.address()
-   *   AddressV2      -> credentials.addressV2()
-   *   WithDelegates  -> credentials.addressWithDelegates().addressCredentials()
+   * (stellar-sdk/lib/esm/base/auth.js:251-262, getAddressCredentials):
+   *   Address        -> credentials.address
+   *   AddressV2      -> credentials.addressV2
+   *   WithDelegates  -> credentials.addressWithDelegates.addressCredentials
    */
   it('matches the SDK for AddressV2 (CAP-71) credentials', async () => {
     const entry = entryFor(xdr.SorobanCredentials.sorobanCredentialsAddressV2(addrCreds()));
     const sdk = await sdkPayloadFor(entry);
     let ours!: Buffer;
-    signAuthEntriesSync([entry.toXDR('base64')], {
+    signAuthEntriesSync([entry.toXdr('base64')], {
       sign: (p) => {
         ours = Buffer.from(p);
         return SIG;
@@ -364,7 +365,7 @@ describe('signAuthEntriesSync vs the SDK', () => {
   it('matches the SDK for AddressWithDelegates (CAP-71) credentials', async () => {
     const entry = entryFor(
       xdr.SorobanCredentials.sorobanCredentialsAddressWithDelegates(
-        new (xdr as any).SorobanAddressCredentialsWithDelegates({
+        new xdr.SorobanAddressCredentialsWithDelegates({
           addressCredentials: addrCreds(),
           delegates: [],
         }),
@@ -372,7 +373,7 @@ describe('signAuthEntriesSync vs the SDK', () => {
     );
     const sdk = await sdkPayloadFor(entry);
     let ours!: Buffer;
-    signAuthEntriesSync([entry.toXDR('base64')], {
+    signAuthEntriesSync([entry.toXdr('base64')], {
       sign: (p) => {
         ours = Buffer.from(p);
         return SIG;
@@ -394,8 +395,8 @@ describe('signAuthEntriesSync vs the SDK', () => {
    *   sign: opts.signAuth as (p: Buffer) => xdr.ScVal
    *
    * and the Promise is handed to js-xdr as the signature. The failure surfaces
-   * as `XdrWriterError: [object Promise] has union name undefined, not ScVal`,
-   * which names neither signAuth nor async.
+   * as `TypeError: this.signature.toXdrObject is not a function`, which names
+   * neither signAuth nor async.
    */
   it('an async signAuth builder is either supported or rejected clearly', () => {
     const svm = new LiteStellar();
@@ -532,9 +533,9 @@ describe('fixtures', () => {
     const alice = svm.airdrop();
     const usdc = svm.deployToken({ code: 'USDC' });
     usdc.trust(alice);
-    const subs = svm.getAccount(alice.publicKey)!.numSubEntries();
+    const subs = svm.getAccount(alice.publicKey)!.numSubEntries;
     svm.trust(alice, usdc.asset);
-    expect(svm.getAccount(alice.publicKey)!.numSubEntries(), 'a second trust() added a phantom sub-entry').toBe(subs);
+    expect(svm.getAccount(alice.publicKey)!.numSubEntries, 'a second trust() added a phantom sub-entry').toBe(subs);
   });
 
   /**

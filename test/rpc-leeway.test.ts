@@ -57,7 +57,7 @@ function setup() {
       tx,
       leeway === undefined ? undefined : { cpuInstructions: leeway },
     );
-    return sim.transactionData.build().resources().instructions() as number;
+    return sim.transactionData.build().resources.instructions as number;
   };
   // Raw JSON-RPC, to see the exact response shape stellar-rpc sends.
   const raw = (instructionLeeway: number) =>
@@ -67,7 +67,7 @@ function setup() {
         jsonrpc: '2.0',
         id: 1,
         method: 'simulateTransaction',
-        params: { transaction: tx.toXDR(), resourceConfig: { instructionLeeway } },
+        params: { transaction: tx.toXdr(), resourceConfig: { instructionLeeway } },
       }),
     }).then((r: any) => r.data);
   return { instructions, raw };

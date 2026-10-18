@@ -48,18 +48,20 @@ describe('network cost calibration', () => {
 
   it('the shipped table is a real 86-entry protocol-27 calibration', async () => {
     const { xdr } = await import('@stellar/stellar-sdk');
-    const cpu = xdr.ContractCostParams.fromXDR(
+    const cpu = xdr.decodeArray(
+      xdr.ContractCostParamEntry,
       Buffer.from(PROTOCOL_27_COST_PARAMS.cpuInstructions, 'base64'),
     );
-    const mem = xdr.ContractCostParams.fromXDR(
+    const mem = xdr.decodeArray(
+      xdr.ContractCostParamEntry,
       Buffer.from(PROTOCOL_27_COST_PARAMS.memoryBytes, 'base64'),
     );
     expect(cpu.length).toBe(86);
     expect(mem.length).toBe(86);
     // The entry that dominates the divergence: 331 on a real network,
     // 59,052 in the host's protocol-20 defaults.
-    expect(cpu.some((e: any) => e.constTerm().toString() === '331')).toBe(true);
-    expect(cpu.every((e: any) => e.constTerm().toString() !== '59052')).toBe(true);
+    expect(cpu.some((e: any) => e.constTerm.toString() === '331')).toBe(true);
+    expect(cpu.every((e: any) => e.constTerm.toString() !== '59052')).toBe(true);
   });
 
   // soroban-env-host 28.0.0 replaced its protocol-20 `Budget::default()` with
@@ -76,22 +78,19 @@ describe('network cost calibration', () => {
   // effect: restore the protocol-20 ValDeser const_term (59,052 vs 331).
   it('a table that differs from the host defaults still takes effect', async () => {
     const { xdr } = await import('@stellar/stellar-sdk');
-    const cpu = xdr.ContractCostParams.fromXDR(
+    const cpu = xdr.decodeArray(
+      xdr.ContractCostParamEntry,
       Buffer.from(PROTOCOL_27_COST_PARAMS.cpuInstructions, 'base64'),
     );
-    const valDeser = xdr.ContractCostType.valDeser().value;
+    const valDeser = xdr.ContractCostType.valDeser.value;
     cpu[valDeser] = new xdr.ContractCostParamEntry({
-      ext: new xdr.ExtensionPoint(0),
-      constTerm: new xdr.Int64(59_052n),
-      linearTerm: cpu[valDeser].linearTerm(),
+      ext: xdr.ExtensionPoint.v0(),
+      constTerm: 59_052n,
+      linearTerm: cpu[valDeser].linearTerm,
     });
-    // js-xdr cannot serialise the ContractCostParams typedef on its own; see
-    // encodeParams in src/cost-params.ts.
-    const cpuInstructions = Buffer.from(
-      xdr.ConfigSettingEntry.configSettingContractCostParamsCpuInstructions(cpu)
-        .toXDR()
-        .subarray(4),
-    ).toString('base64');
+    // The ContractCostParams typedef is a length-prefixed ContractCostParamEntry
+    // array; see encodeParams in src/cost-params.ts.
+    const cpuInstructions = xdr.encodeArray(xdr.ContractCostParamEntry, cpu, 'base64');
 
     const host = measure(new LiteStellar());
     const p20ValDeser = measure(

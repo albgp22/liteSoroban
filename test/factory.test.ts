@@ -194,7 +194,7 @@ describe('contract factory', () => {
 
     expect(r.ok).toBe(true);
     const topics = r.events.flatMap((e) =>
-      e.body().v0().topics().map((t) => {
+      e.body.v0.topics.map((t) => {
         try {
           return scValToNative(t);
         } catch {
@@ -232,9 +232,9 @@ describe('contract factory', () => {
         new xdr.LedgerKeyContractData({
           contract: factory.address,
           key: xdr.ScVal.scvLedgerKeyContractInstance(),
-          durability: xdr.ContractDataDurability.persistent(),
+          durability: xdr.ContractDataDurability.persistent,
         }),
-      ).toXDR('base64'),
+      ).toXdr('base64'),
     );
     expect(before).toBeGreaterThan(0);
   });

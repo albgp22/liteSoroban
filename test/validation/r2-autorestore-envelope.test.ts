@@ -36,7 +36,7 @@ const CODE = new Uint8Array(
 const NETWORK_ID = sha256(Networks.TESTNET);
 const sym = (s: string) => nativeToScVal(s, { type: 'symbol' });
 const u64 = (n: bigint) => nativeToScVal(n, { type: 'u64' });
-const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXDR('base64');
+const accB64 = (pk: string) => accountIdFromPublicKey(pk).toXdr('base64');
 const plain = (pk: string) => xdr.MuxedAccount.keyTypeEd25519(StrKey.decodeEd25519PublicKey(pk));
 const RESOURCE_FEE = 5_000_000n;
 /** Testnet's minPersistentTTL (ConfigSettingStateArchival, read 2026-10-18). */
@@ -47,9 +47,9 @@ const persistentKey = (c: xdr.ScAddress, k: string) =>
     new xdr.LedgerKeyContractData({
       contract: c,
       key: sym(k),
-      durability: xdr.ContractDataDurability.persistent(),
+      durability: xdr.ContractDataDurability.persistent,
     }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 
 function envelopeFor(
   kp: Keypair,
@@ -59,15 +59,14 @@ function envelopeFor(
   archived: number[] | null,
 ): string {
   const ext = archived
-    ? new xdr.SorobanTransactionDataExt(
-        1,
+    ? xdr.SorobanTransactionDataExt.resourceExt(
         new xdr.SorobanResourcesExtV0({ archivedSorobanEntries: archived }),
       )
-    : new xdr.SorobanTransactionDataExt(0);
+    : xdr.SorobanTransactionDataExt.v0();
   const raw = new xdr.Transaction({
     sourceAccount: plain(kp.publicKey()),
     fee: Number(RESOURCE_FEE + BigInt(BASE_FEE)),
-    seqNum: new xdr.SequenceNumber(new xdr.Int64(seqNum)),
+    seqNum,
     cond: xdr.Preconditions.precondNone(),
     memo: xdr.Memo.memoNone(),
     operations: [
@@ -78,20 +77,19 @@ function envelopeFor(
         ),
       }),
     ],
-    ext: new xdr.TransactionExt(
-      1,
-      new xdr.SorobanTransactionData({ ext, resources, resourceFee: new xdr.Int64(RESOURCE_FEE) }),
+    ext: xdr.TransactionExt.sorobanData(
+      new xdr.SorobanTransactionData({ ext, resources, resourceFee: RESOURCE_FEE }),
     ),
   });
   const h = sha256(
     new xdr.TransactionSignaturePayload({
       networkId: NETWORK_ID,
       taggedTransaction: xdr.TransactionSignaturePayloadTaggedTransaction.envelopeTypeTx(raw),
-    }).toXDR(),
+    }).toXdr(),
   );
   return xdr.TransactionEnvelope.envelopeTypeTx(
     new xdr.TransactionV1Envelope({ tx: raw, signatures: [kp.signDecorated(h)] }),
-  ).toXDR('base64');
+  ).toXdr('base64');
 }
 
 describe('ROUND 2 — auto-restore through the envelope path', () => {
@@ -108,7 +106,7 @@ describe('ROUND 2 — auto-restore through the envelope path', () => {
       createContractHostFn(accB64(a.publicKey()), wasmHash),
       accB64(a.publicKey()),
     );
-    addr = xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    addr = xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   });
 
   it('HOLDS: the raw send() path auto-restores with the right live_until', () => {
@@ -141,20 +139,23 @@ describe('ROUND 2 — auto-restore through the envelope path', () => {
     expect(sim.ok, sim.error).toBe(true);
     expect(sim.restoredRwEntryIndices.length).toBe(3);
 
-    const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    const resources = xdr.SorobanResources.fromXdr(sim.resourcesXdr, 'base64');
     // Exactly what a protocol-23+ client submits: the read-write footprint
     // indices of the archived entries, ascending.
     const archived = [...sim.restoredRwEntryIndices].sort((x, y) => x - y);
     const env = envelopeFor(a, 1n, get, resources, archived);
 
     // Sanity: the field really is on the wire.
-    const roundTrip = xdr.TransactionEnvelope.fromXDR(env, 'base64').v1().tx().ext().sorobanData();
-    expect(roundTrip.ext().switch()).toBe(1);
-    expect(roundTrip.ext().resourceExt().archivedSorobanEntries()).toEqual(archived);
+    const roundTrip = xdr.expectUnionVariant(
+      xdr.expectUnionVariant(xdr.TransactionEnvelope.fromXdr(env, 'base64'), 'envelopeTypeTx').v1.tx.ext,
+      'sorobanData',
+    ).sorobanData;
+    expect(roundTrip.ext.type).toBe('resourceExt');
+    expect(xdr.expectUnionVariant(roundTrip.ext, 'resourceExt').resourceExt.archivedSorobanEntries).toEqual(archived);
 
     const out = L.sendTransaction(env);
     expect(out.code, `harness said ${out.code}: ${out.error}`).toBe('txSUCCESS');
-    expect(scValToNative(xdr.ScVal.fromXDR(out.returnValueXdr!, 'base64'))).toBe(42n);
+    expect(scValToNative(xdr.ScVal.fromXdr(out.returnValueXdr!, 'base64'))).toBe(42n);
   });
 
   it('CONTEXT: the failure mode is a host-level error, and fix #11 keeps it non-throwing', () => {

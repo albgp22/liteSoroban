@@ -84,7 +84,7 @@ function e2eLedger(): Ledger {
 function getAccountId(seed: number): xdr.AccountId {
   return xdr.AccountId.publicKeyTypeEd25519(Buffer.alloc(32, seed));
 }
-const SOURCE = getAccountId(123).toXDR('base64');
+const SOURCE = getAccountId(123).toXdr('base64');
 
 /** `get_wasm_hash(wasm)` */
 const wasmHash = (code: Uint8Array) => sha256(Buffer.from(code));
@@ -95,7 +95,7 @@ function getWasmKey(code: Uint8Array): xdr.LedgerKey {
     new xdr.LedgerKeyContractCode({ hash: wasmHash(code) }),
   );
 }
-const b64 = (k: { toXDR(f: 'base64'): string }) => k.toXDR('base64');
+const b64 = (k: { toXdr(f: 'base64'): string }) => k.toXdr('base64');
 
 /** `bytes_sc_val(&get_wasm_hash(wasm))` */
 const wasmHashScVal = (code: Uint8Array) => xdr.ScVal.scvBytes(wasmHash(code));
@@ -111,7 +111,7 @@ function resources(
     instructions,
     diskReadBytes: 0,
     writeBytes: 0,
-  }).toXDR('base64');
+  }).toXdr('base64');
 }
 
 /** `get_contract_id_preimage_from_address(address, salt)` */
@@ -125,11 +125,11 @@ function contractIdPreimage(address: xdr.ScAddress, salt: number): xdr.ContractI
  * `get_contract_id_hash(preimage)` — with the harness's network id rather than
  * the host's DEFAULT_NETWORK_ID; see the header note.
  */
-function contractIdHash(networkId: Buffer, preimage: xdr.ContractIdPreimage): Buffer {
+function contractIdHash(networkId: Uint8Array, preimage: xdr.ContractIdPreimage): Uint8Array {
   return sha256(
     xdr.HashIdPreimage.envelopeTypeContractId(
       new xdr.HashIdPreimageContractId({ networkId, contractIdPreimage: preimage }),
-    ).toXDR(),
+    ).toXdr(),
   );
 }
 
@@ -138,7 +138,7 @@ function ledgerEntry(data: xdr.LedgerEntryData): xdr.LedgerEntry {
   return new xdr.LedgerEntry({
     lastModifiedLedgerSeq: 0,
     data,
-    ext: new xdr.LedgerEntryExt(0),
+    ext: xdr.LedgerEntryExt.v0(),
   });
 }
 
@@ -163,7 +163,7 @@ function contractDataEntry(
   return ledgerEntry(
     xdr.LedgerEntryData.contractData(
       new xdr.ContractDataEntry({
-        ext: new xdr.ExtensionPoint(0),
+        ext: xdr.ExtensionPoint.v0(),
         contract,
         key,
         durability,
@@ -174,7 +174,7 @@ function contractDataEntry(
 }
 
 const symbolScVal = (s: string) => xdr.ScVal.scvSymbol(s);
-const u64ScVal = (v: bigint) => xdr.ScVal.scvU64(new xdr.Uint64(v));
+const u64ScVal = (v: bigint) => xdr.ScVal.scvU64(v);
 const u32ScVal = (v: number) => xdr.ScVal.scvU32(v);
 
 /** The `CreateContractData` struct of e2e_testutils.rs, for one Ledger. */
@@ -195,7 +195,7 @@ function createContractData(L: Ledger, salt: number, code: Uint8Array): CreateCo
   const preimage = contractIdPreimage(deployerAddress, salt);
   const executable = xdr.ContractExecutable.contractExecutableWasm(wasmHash(code));
   const contractAddress = xdr.ScAddress.scAddressTypeContract(
-    contractIdHash(networkId, preimage),
+    new xdr.ContractId(contractIdHash(networkId, preimage)),
   );
 
   // NOTE: upstream builds the V1 `HostFunction::CreateContract` here even
@@ -209,7 +209,7 @@ function createContractData(L: Ledger, salt: number, code: Uint8Array): CreateCo
   const contractKey = contractDataKey(
     contractAddress,
     xdr.ScVal.scvLedgerKeyContractInstance(),
-    xdr.ContractDataDurability.persistent(),
+    xdr.ContractDataDurability.persistent,
   );
   const contractEntry = contractDataEntry(
     contractAddress,
@@ -217,7 +217,7 @@ function createContractData(L: Ledger, salt: number, code: Uint8Array): CreateCo
     xdr.ScVal.scvContractInstance(
       new xdr.ScContractInstance({ executable, storage: null }),
     ),
-    xdr.ContractDataDurability.persistent(),
+    xdr.ContractDataDurability.persistent,
   );
 
   return {
@@ -297,7 +297,7 @@ function send(
   restored: number[] = [],
 ): Outcome {
   try {
-    const r = L.send(hostFn, source, res, auth.map((a) => a.toXDR('base64')), restored);
+    const r = L.send(hostFn, source, res, auth.map((a) => a.toXdr('base64')), restored);
     return { ...r, threw: false };
   } catch (e) {
     return {
@@ -318,7 +318,7 @@ function expectHostError(o: { ok: boolean; error?: string }, type: string, code:
   expect(o.error ?? '').toMatch(new RegExp(`Error\\(${type}, ${code}\\)`));
 }
 
-const scValEq = (b: string | undefined, v: xdr.ScVal) => expect(b).toBe(v.toXDR('base64'));
+const scValEq = (b: string | undefined, v: xdr.ScVal) => expect(b).toBe(v.toXdr('base64'));
 
 // ===========================================================================
 describe('upstream e2e_tests.rs :: wasm upload', () => {
@@ -439,7 +439,7 @@ describe('upstream e2e_tests.rs :: wasm upload', () => {
     const res = send(
       L,
       uploadWasmHostFn(ADD_I32),
-      getAccountId(111).toXDR('base64'),
+      getAccountId(111).toXdr('base64'),
       resources(10_000_000, [getWasmKey(ADD_I32)], []),
     );
     expectHostError(res, 'Storage', 'ExceededLimit');
@@ -551,7 +551,7 @@ describe('upstream e2e_tests.rs :: create contract', () => {
     // ledger_changes: the new instance entry, plus a no-op change for the Wasm.
     expect(res.changedKeys).toEqual([b64(cd.contractKey)]);
     expect(res.removedKeys).toEqual([]);
-    expect(L.getEntry(b64(cd.contractKey))).toBe(cd.contractEntry.toXDR('base64'));
+    expect(L.getEntry(b64(cd.contractKey))).toBe(cd.contractEntry.toXdr('base64'));
     expect(L.getEntryTtl(b64(cd.contractKey))).toBe(
       DEFAULT_LEDGER_SEQ + MIN_PERSISTENT_ENTRY_TTL - 1,
     );
@@ -573,7 +573,7 @@ describe('upstream e2e_tests.rs :: create contract', () => {
     scValEq(sim.returnValueXdr, xdr.ScVal.scvAddress(cd.contractAddress));
     expect(sim.eventsXdr).toEqual([]);
     // assert_eq!(res.auth, vec![cd.auth_entry]);
-    expect(sim.authXdr).toEqual([cd.authEntry.toXDR('base64')]);
+    expect(sim.authXdr).toEqual([cd.authEntry.toXdr('base64')]);
 
     expect(sim.instructions).toBe(285014); // expect!["285014"]
     expect(sim.writeBytes).toBe(104); //     expect!["104"]
@@ -593,13 +593,13 @@ describe('upstream e2e_tests.rs :: create contract', () => {
     const cd = createContractData(L, 111, ADD_I32);
     putWasmEntry(L, ADD_I32, DEFAULT_LEDGER_SEQ + 100);
 
-    const sim = L.simulateWithAuth(cd.hostFn, cd.deployer, [cd.authEntry.toXDR('base64')]);
+    const sim = L.simulateWithAuth(cd.hostFn, cd.deployer, [cd.authEntry.toXdr('base64')]);
 
     expect(sim.ok, sim.error).toBe(true);
     scValEq(sim.returnValueXdr, xdr.ScVal.scvAddress(cd.contractAddress));
     expect(sim.eventsXdr).toEqual([]);
     // The entries passed in are passed straight back out.
-    expect(sim.authXdr).toEqual([cd.authEntry.toXDR('base64')]);
+    expect(sim.authXdr).toEqual([cd.authEntry.toXdr('base64')]);
 
     expect(sim.instructions).toBe(286516); // expect!["286516"]
     expect(sim.writeBytes).toBe(104); //     expect!["104"]
@@ -716,7 +716,7 @@ describe('upstream e2e_tests.rs :: create contract', () => {
   // DEFAULT_NETWORK_ID override.
   it('contract id derivation agrees with the host (with the harness network id)', () => {
     const L = e2eLedger();
-    expect(sha256(L.networkPassphrase).equals(Buffer.alloc(32, 5))).toBe(false);
+    expect(Buffer.from(sha256(L.networkPassphrase)).equals(Buffer.alloc(32, 5))).toBe(false);
     const cd = createContractData(L, 111, ADD_I32);
     putWasmEntry(L, ADD_I32, DEFAULT_LEDGER_SEQ + 100);
     const sim = L.simulate(cd.hostFn, cd.deployer);
@@ -733,11 +733,11 @@ describe('upstream e2e_tests.rs :: invoke contract', () => {
   function storageSetup(L: Ledger) {
     const cd = createContractData(L, 111, CONTRACT_STORAGE);
     const wasmEntry = putWasmEntry(L, CONTRACT_STORAGE, DEFAULT_LEDGER_SEQ + 100);
-    L.putEntry(cd.contractEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 1000);
+    L.putEntry(cd.contractEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 1000);
     const dataKey = contractDataKey(
       cd.contractAddress,
       KEY,
-      xdr.ContractDataDurability.temporary(),
+      xdr.ContractDataDurability.temporary,
     );
     return { cd, wasmEntry, dataKey };
   }
@@ -767,11 +767,11 @@ describe('upstream e2e_tests.rs :: invoke contract', () => {
       cd.contractAddress,
       KEY,
       VAL,
-      xdr.ContractDataDurability.temporary(),
+      xdr.ContractDataDurability.temporary,
     );
-    expect(L.getEntry(b64(dataKey))).toBe(newEntry.toXDR('base64'));
+    expect(L.getEntry(b64(dataKey))).toBe(newEntry.toXdr('base64'));
     expect(L.getEntryTtl(b64(dataKey))).toBe(DEFAULT_LEDGER_SEQ + MIN_TEMP_ENTRY_TTL - 1);
-    expect(L.getEntry(b64(cd.contractKey))).toBe(cd.contractEntry.toXDR('base64'));
+    expect(L.getEntry(b64(cd.contractKey))).toBe(cd.contractEntry.toXdr('base64'));
     expect(L.getEntryTtl(b64(cd.contractKey))).toBe(DEFAULT_LEDGER_SEQ + 1000);
     expect(L.getEntry(b64(cd.wasmKey))).toBe(wasmEntry);
     expect(L.getEntryTtl(b64(cd.wasmKey))).toBe(DEFAULT_LEDGER_SEQ + 100);
@@ -780,7 +780,7 @@ describe('upstream e2e_tests.rs :: invoke contract', () => {
     // fresh ledger where the entry exists with live_until = seq + 500.
     const L2 = e2eLedger();
     const s2 = storageSetup(L2);
-    L2.putEntry(newEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 500);
+    L2.putEntry(newEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 500);
     const extendFn = invokeContractHostFn(s2.cd.contractAddress, 'extend_temporary', [
       KEY,
       u32ScVal(501),
@@ -800,7 +800,7 @@ describe('upstream e2e_tests.rs :: invoke contract', () => {
     expect(extended.changedKeys).toEqual([]);
     expect(extended.removedKeys).toEqual([]);
     expect(L2.getEntryTtl(b64(s2.dataKey))).toBe(DEFAULT_LEDGER_SEQ + 5000);
-    expect(L2.getEntry(b64(s2.dataKey))).toBe(newEntry.toXDR('base64'));
+    expect(L2.getEntry(b64(s2.dataKey))).toBe(newEntry.toXdr('base64'));
   });
 
   // e2e_tests.rs:2072 test_invoke_contract_with_storage_ops_success_in_recording_mode
@@ -829,9 +829,9 @@ describe('upstream e2e_tests.rs :: invoke contract', () => {
       s2.cd.contractAddress,
       KEY,
       VAL,
-      xdr.ContractDataDurability.temporary(),
+      xdr.ContractDataDurability.temporary,
     );
-    L2.putEntry(newEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 500);
+    L2.putEntry(newEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 500);
     const extendSim = L2.simulate(
       invokeContractHostFn(s2.cd.contractAddress, 'extend_temporary', [
         KEY,
@@ -887,7 +887,7 @@ describe('upstream e2e_tests.rs :: budget', () => {
     const res = send(
       L,
       uploadWasmHostFn(ADD_I32),
-      getAccountId(0).toXDR('base64'),
+      getAccountId(0).toXdr('base64'),
       resources(1000, [], []),
     );
     expectHostError(res, 'Budget', 'ExceededLimit');
@@ -961,7 +961,7 @@ describe('upstream e2e_tests.rs :: budget', () => {
     const L = e2eLedger();
     const cd = createContractData(L, 111, CONTRACT_STORAGE);
     putWasmEntry(L, CONTRACT_STORAGE, DEFAULT_LEDGER_SEQ + 100);
-    L.putEntry(cd.contractEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 1000);
+    L.putEntry(cd.contractEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 1000);
 
     const hostFn = invokeContractHostFn(cd.contractAddress, 'put_temporary', [
       symbolScVal('key'),
@@ -988,8 +988,8 @@ describe('upstream e2e_tests.rs :: budget', () => {
     const sumCd = createContractData(L, 222, SUM_I32);
     putWasmEntry(L, ADD_I32, DEFAULT_LEDGER_SEQ + 100);
     putWasmEntry(L, SUM_I32, DEFAULT_LEDGER_SEQ + 100);
-    L.putEntry(addCd.contractEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 1000);
-    L.putEntry(sumCd.contractEntry.toXDR('base64'), DEFAULT_LEDGER_SEQ + 1000);
+    L.putEntry(addCd.contractEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 1000);
+    L.putEntry(sumCd.contractEntry.toXdr('base64'), DEFAULT_LEDGER_SEQ + 1000);
 
     const hostFn = invokeContractHostFn(sumCd.contractAddress, 'sum', [
       xdr.ScVal.scvAddress(addCd.contractAddress),

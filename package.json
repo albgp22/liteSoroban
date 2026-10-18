@@ -12,7 +12,7 @@
   },
   "devDependencies": {
     "@noble/curves": "^2.3.0",
-    "@stellar/stellar-sdk": "16.2.0",
+    "@stellar/stellar-sdk": "17.2.1",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   }

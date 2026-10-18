@@ -203,7 +203,7 @@ function build() {
     const h = L.seedWasm(code);
     const { sent } = L.simulateAndSend(createContractHostFn(source, h, Buffer.alloc(32, salt)), source);
     expect(sent.ok, `deploy: ${sent.error}`).toBe(true);
-    return xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address();
+    return xdr.expectUnionVariant(xdr.ScVal.fromXdr(sent.returnValueXdr!, 'base64'), 'scvAddress').address;
   };
 
   both('uploadUnique', uploadWasmHostFn(UNIQUE));
@@ -221,10 +221,12 @@ function build() {
   // The count is bimodal on the byte order of the two contract ids (see the
   // note on NODE_PREFLIGHT_PADDED). The ids depend on the random payer, so pick
   // the pair that reproduces the pinned mode: caller id > callee id.
+  const contractIdBytes = (a: xdr.ScAddress) =>
+    Buffer.from(xdr.expectUnionVariant(a, 'scAddressTypeContract').contractId.toBytes());
   const c1 = deploy(INVOKE_CONTRACT, 43);
   const c2 = deploy(INVOKE_CONTRACT, 44);
   const [A, B] =
-    Buffer.compare(Buffer.from(c1.contractId()), Buffer.from(c2.contractId())) < 0
+    Buffer.compare(contractIdBytes(c1), contractIdBytes(c2)) < 0
       ? [c2, c1] : [c1, c2];
   both('crossContract', invokeHostFn(A, 'add_with', [i32(3), i32(4), addrV(B)]));
 

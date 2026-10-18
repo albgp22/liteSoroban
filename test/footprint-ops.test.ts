@@ -46,10 +46,10 @@ function world() {
       new xdr.LedgerKeyContractData({
         contract: Address.fromString(contract.contractId).toScAddress(),
         key: sym(name),
-        durability: xdr.ContractDataDurability[durability](),
+        durability: xdr.ContractDataDurability[durability],
       }),
     );
-  const ttl = (k: xdr.LedgerKey) => svm.ledger.getEntryTtl(k.toXDR('base64'));
+  const ttl = (k: xdr.LedgerKey) => svm.ledger.getEntryTtl(k.toXdr('base64'));
 
   const build = async (
     op: xdr.Operation,
@@ -71,7 +71,7 @@ function world() {
   };
   const send = (tx: Transaction) => {
     tx.sign(kp);
-    return svm.sendTransaction(tx.toXDR());
+    return svm.sendTransaction(tx.toXdr());
   };
   const put = async (name: string) => {
     const acct = await server.getAccount(kp.publicKey());
@@ -92,13 +92,13 @@ function world() {
   const simulate = async (op: xdr.Operation, fp: { ro?: xdr.LedgerKey[]; rw?: xdr.LedgerKey[] }) => {
     const sim: any = await server.simulateTransaction(await build(op, fp));
     if (sim.error) return { error: String(sim.error) };
-    const r = sim.transactionData.build().resources();
+    const r = sim.transactionData.build().resources;
     return {
-      ro: r.footprint().readOnly().length,
-      rw: r.footprint().readWrite().length,
-      read: r.diskReadBytes(),
-      write: r.writeBytes(),
-      instructions: r.instructions(),
+      ro: r.footprint.readOnly.length,
+      rw: r.footprint.readWrite.length,
+      read: r.diskReadBytes,
+      write: r.writeBytes,
+      instructions: r.instructions,
     };
   };
   return { svm, kp, key, ttl, build, send, put, simulate };
@@ -157,10 +157,10 @@ describe('ExtendFootprintTTL', () => {
     it(`rejects ${name} at submission: txFAILED [extendFootprintTtlMalformed], nothing taken`, async () => {
       const w = world();
       const { op, ro, rw } = make(w);
-      const seq = w.svm.getAccount(w.kp.publicKey())!.seqNum().toString();
+      const seq = w.svm.getAccount(w.kp.publicKey())!.seqNum.toString();
       const out = w.send(await w.build(op, { ro, rw }));
       expect([out.code, out.footprintOpResult, out.rejected]).toEqual(['txFAILED', 'extendFootprintTtlMalformed', true]);
-      expect(w.svm.getAccount(w.kp.publicKey())!.seqNum().toString()).toBe(seq);
+      expect(w.svm.getAccount(w.kp.publicKey())!.seqNum.toString()).toBe(seq);
     });
   }
 
@@ -178,7 +178,7 @@ describe('RestoreFootprint', () => {
     const w = world();
     await w.put('k');
     w.svm.advanceLedgers(w.ttl(w.key('k'))! - w.svm.ledger.ledgerSeq + 2); // archived as of latestLedger
-    const entryBytes = Buffer.from(w.svm.ledger.getEntry(w.key('k').toXDR('base64'))!, 'base64').length;
+    const entryBytes = Buffer.from(w.svm.ledger.getEntry(w.key('k').toXdr('base64'))!, 'base64').length;
     expect(await w.simulate(restore(), { rw: [w.key('k')] })).toEqual({
       ro: 0, rw: 1, read: entryBytes, write: entryBytes, instructions: 0,
     });
