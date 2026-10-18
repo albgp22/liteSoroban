@@ -109,13 +109,25 @@ fn key_of(e: &LedgerEntry) -> Result<LedgerKey, JsError> {
 
 /// stellar-rpc never returns the raw recorded instruction count: recording mode
 /// measures slightly less work than the enforcing pass actually does, so it
-/// pads with `max(raw + 50_000, raw * 1.04)` before handing resources back.
-/// Submitting the raw number produces `Error(Budget, ExceededLimit)` on apply.
-fn adjust_instructions(raw: u32) -> u32 {
-    let raw64 = raw as u64;
-    let padded = std::cmp::max(raw64.saturating_add(50_000), (raw64 * 104) / 100);
-    padded.min(u32::MAX as u64) as u32
+/// pads it before handing resources back. Submitting the raw number produces
+/// `Error(Budget, ExceededLimit)` on apply.
+///
+/// This is soroban-simulation's `SimulationAdjustmentFactor::adjust_u32` with
+/// `default_adjustment()`'s instruction factor (x1.04, +50_000), where
+/// stellar-rpc first raises the additive part to the caller's
+/// `resourceConfig.instructionLeeway` (stellar-rpc v29.0.1,
+/// lib/preflight/src/shared.rs). Same f64 floor, and 0 stays 0.
+fn adjust_instructions(raw: u32, instruction_leeway: u32) -> u32 {
+    if raw == 0 {
+        return 0;
+    }
+    let additive = DEFAULT_INSTRUCTION_ADDITIVE.max(instruction_leeway);
+    raw.saturating_add(additive)
+        .max(((raw as f64) * 1.04).clamp(0.0, u32::MAX as f64).floor() as u32)
 }
+
+/// soroban-simulation `default_adjustment()`: instructions additive factor.
+const DEFAULT_INSTRUCTION_ADDITIVE: u32 = 50_000;
 
 /// Matches the `min_persistent_entry_ttl` in `ledger_info()`.
 const MIN_PERSISTENT_ENTRY_TTL: u32 = 100_000;
@@ -493,8 +505,15 @@ impl SorobanEnv {
 
     /// Recording mode. Discovers the footprint by reading through the snapshot
     /// source, records auth, and measures resources. Does NOT mutate the ledger.
-    pub fn simulate(&self, host_fn_b64: &str, source_b64: &str) -> Result<JsValue, JsError> {
-        self.simulate_inner(host_fn_b64, source_b64, None)
+    /// `instruction_leeway` is stellar-rpc's `resourceConfig.instructionLeeway`;
+    /// see `adjust_instructions`.
+    pub fn simulate(
+        &self,
+        host_fn_b64: &str,
+        source_b64: &str,
+        instruction_leeway: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        self.simulate_inner(host_fn_b64, source_b64, None, instruction_leeway.unwrap_or(0))
     }
 
     /// Re-simulate with already-signed authorization entries, in ENFORCING auth
@@ -509,8 +528,14 @@ impl SorobanEnv {
         host_fn_b64: &str,
         source_b64: &str,
         auth_b64: Vec<String>,
+        instruction_leeway: Option<u32>,
     ) -> Result<JsValue, JsError> {
-        self.simulate_inner(host_fn_b64, source_b64, Some(auth_b64))
+        self.simulate_inner(
+            host_fn_b64,
+            source_b64,
+            Some(auth_b64),
+            instruction_leeway.unwrap_or(0),
+        )
     }
 }
 
@@ -521,6 +546,7 @@ impl SorobanEnv {
         host_fn_b64: &str,
         source_b64: &str,
         auth_b64: Option<Vec<String>>,
+        instruction_leeway: u32,
     ) -> Result<JsValue, JsError> {
         let host_fn: HostFunction = from_xdr_b64(host_fn_b64)?;
         let source: AccountId = from_xdr_b64(source_b64)?;
@@ -589,7 +615,7 @@ impl SorobanEnv {
 
         let raw_instructions = res.resources.instructions;
         let mut submitted_resources = res.resources.clone();
-        submitted_resources.instructions = adjust_instructions(raw_instructions);
+        submitted_resources.instructions = adjust_instructions(raw_instructions, instruction_leeway);
 
         let out = SimulateResult {
             ok,

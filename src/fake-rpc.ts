@@ -340,6 +340,14 @@ export function attachInProcessRpc(
       headers: {},
       config,
     });
+    // stellar-rpc reports a JSON-RPC error with HTTP 200, like `ok`.
+    const rpcError = (code: number, message: string, data?: string) => ({
+      data: { jsonrpc: '2.0', id, error: { code, message, ...(data !== undefined && { data }) } },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    });
 
     switch (method) {
       case 'getHealth':
@@ -492,14 +500,34 @@ export function attachInProcessRpc(
         // ignoring them means an INVALID signature simulates green, because
         // plain recording mode never runs __check_auth. Honour them when present.
         const suppliedAuth = op.body().invokeHostFunctionOp().auth();
+
+        // resourceConfig.instructionLeeway (the SDK's `cpuInstructions`) raises
+        // the +50_000 instruction padding to max(50_000, leeway). stellar-rpc
+        // defaults it to 0 (go-stellar-sdk protocols/rpc) and decodes it as a
+        // Go uint64; preflight then takes it with u32::try_from. Both failure
+        // shapes below are what a local stellar-rpc 29.0.1 answers, verbatim.
+        const rawLeeway = params.resourceConfig?.instructionLeeway ?? 0;
+        const leeway = Number(rawLeeway);
+        if (!Number.isInteger(leeway) || leeway < 0 || leeway > Number.MAX_SAFE_INTEGER) {
+          return rpcError(
+            -32602,
+            'invalid parameters',
+            `json: cannot unmarshal number ${rawLeeway} into Go struct field ` +
+              'ResourceConfig.resourceConfig.instructionLeeway of type uint64',
+          );
+        }
+        if (leeway > 0xffff_ffff) {
+          return ok({ error: 'number too large to fit in target type', latestLedger: ledger.ledgerSeq });
+        }
         const sim =
           suppliedAuth.length > 0
             ? ledger.simulateWithAuth(
                 hostFn,
                 sourceAccountId.toXDR('base64'),
                 suppliedAuth.map((a) => a.toXDR('base64')),
+                leeway,
               )
-            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'));
+            : ledger.simulate(hostFn, sourceAccountId.toXDR('base64'), leeway);
         if (!sim.ok) {
           return ok({ error: sim.error, latestLedger: ledger.ledgerSeq });
         }

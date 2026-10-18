@@ -351,15 +351,18 @@ describe('RED 2: anything holding a classic AccountEntry is mis-metered', () => 
 });
 
 // ===========================================================================
-describe('RED 3: the RPC facade ignores instructionLeeway entirely', () => {
+describe('RED 3 (fixed): the RPC facade honours instructionLeeway', () => {
   // stellar-rpc: adjustment_config.instructions.additive_factor =
   //   max(50_000, resource_config.instruction_leeway)   (preflight/src/shared.rs)
-  // crates/host-wasm/src/lib.rs:103 hard-codes the 50_000 and src/fake-rpc.ts
-  // never reads resourceConfig at all, so the returned resources are identical
-  // whatever the caller asks for. Measured on the live node for add(2,3):
+  // This used to be hard-coded at 50_000, so every leeway returned the same
+  // number. Measured on the live protocol-27 node for add(2,3):
   //   leeway 0 -> 353_123 | 50_001 -> 353_124 | 100_000 -> 403_123
   //   leeway 1_000_000 -> 1_303_123 | 20_000_000 -> 20_303_123
-  it('GAP: every leeway returns the same number; the node scales with it', async () => {
+  // The absolute counts are the separate host-version drift (RED 4 and the
+  // README table): host 29.0.2 records 325_616 for add(2,3), and so does a
+  // local protocol-29 node (stellar-rpc 29.0.1, core 29.0.0) metering with the
+  // same table. What leeway must reproduce is the node's DELTAS.
+  it('scales the padding with the leeway exactly as the node does', async () => {
     const svm = new LiteStellar({ networkPassphrase: PASS }).withNetworkCostParams();
     const c = svm.deployContract(ADD_I32);
     const S = svm.rpcServer();
@@ -377,10 +380,10 @@ describe('RED 3: the RPC facade ignores instructionLeeway entirely', () => {
     console.log('\n  harness leeway ->', JSON.stringify(seen));
     console.log('  node    leeway -> {"0":353123,"100000":403123,"1000000":1303123,"20000000":20303123}');
 
-    expect(seen[0]).toBe(pad(NODE_PREFLIGHT_RAW.add));                       // holds
-    expect(seen[100_000], 'leeway 100k').toBe(NODE_PREFLIGHT_RAW.add + 100_000);
-    expect(seen[1_000_000], 'leeway 1M').toBe(NODE_PREFLIGHT_RAW.add + 1_000_000);
-    expect(seen[20_000_000], 'leeway 20M').toBe(NODE_PREFLIGHT_RAW.add + 20_000_000);
+    const node = { 0: 353_123, 100_000: 403_123, 1_000_000: 1_303_123, 20_000_000: 20_303_123 };
+    for (const leeway of [100_000, 1_000_000, 20_000_000] as const) {
+      expect(seen[leeway] - seen[0], `leeway ${leeway}: delta`).toBe(node[leeway] - node[0]);
+    }
   });
 });
 
