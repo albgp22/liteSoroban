@@ -210,6 +210,11 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
     it('enforces the compiled-in 100M instruction ceiling on the enforcing path', () => {
       const addr = deploy(LOADGEN);
 
+      // The ceiling is what caps send() when the DECLARED count is not enforced;
+      // with it enforced (the default) this call would stop at the cheap
+      // footprint's ~0.4M instead, which the next test pins.
+      L.enforceDeclaredResources(false);
+
       // A cheap call, purely to obtain a legitimate footprint. Arguments do not
       // change the footprint of do_cpu_only_work: it touches no storage.
       const cheap = L.simulate(

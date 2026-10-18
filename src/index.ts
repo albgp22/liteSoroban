@@ -109,6 +109,20 @@ export class Ledger {
     return this.env.hasNetworkCostParams;
   }
 
+  /**
+   * Cap `send()` at the instruction count the transaction DECLARES, the way
+   * stellar-core does. On by default: a transaction whose simulation recorded
+   * less work than it then does (state that grew in between, or an unsigned
+   * custom-account call whose `__check_auth` was never run) fails with
+   * `Error(Budget, ExceededLimit)` instead of the host's more specific error.
+   * Pass `false` to see that error, or to send resources whose instruction count
+   * you do not control. The cap is the smaller of the declared count and the
+   * `cpuLimit` given to `setCostParams`.
+   */
+  enforceDeclaredResources(on: boolean): void {
+    this.env.enforceDeclaredResources(on);
+  }
+
   /** Hash of the ENTIRE ledger. Equal hashes mean byte-identical state. */
   stateHash(): string {
     return this.env.stateHash();

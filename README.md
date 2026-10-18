@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 190 tests, ~800 ms
+npm test               # 194 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -28,7 +28,7 @@ const c = svm.deployContract(wasm, { as: alice });
 expect(c.invoke('add', [sc.i32(2), sc.i32(3)])).toBe(5);
 ```
 
-Setting up a funded wallet, a deployed token and a minted balance costs **0.8 ms**,
+Setting up a funded wallet, a deployed token and a minted balance costs **~1 ms**,
 so `beforeEach` can build a whole world per test. A `stellar/quickstart` container
 needs ~14 s to boot and ~1 s per state-changing transaction, with no per-test
 rollback at any price.
@@ -141,10 +141,13 @@ Authorizing through a contract account is not simulate-then-send:
 4. send
 ```
 
-Skip 2 → `Error(Auth, InvalidAction)`. Skip 3 → `Error(Storage, ExceededLimit)`
-and *"trying to access contract data key outside of the footprint"*, because the
-first simulation never entered `__check_auth`. `contract.invoke(fn, args,
-{ signAuth })` does all four.
+Skip 2 or 3 and the call runs out of the instructions the first simulation
+declared, because that simulation never entered `__check_auth`. The declared count
+is enforced by default, as on a network, so both mistakes surface as
+`Error(Budget, ExceededLimit)`. With `ledger.enforceDeclaredResources(false)` you
+get the host's own errors instead: skip 2 → `Error(Auth, InvalidAction)`, skip 3 →
+`Error(Storage, ExceededLimit)` and *"trying to access contract data key outside
+of the footprint"*. `contract.invoke(fn, args, { signAuth })` does all four.
 
 Two host settings must be right or every custom-account authorization fails for
 reasons that look nothing like the cause: `network_id` must equal
@@ -214,6 +217,12 @@ protocol-27 node, with host 27.0.1, the same change brings it to +0.5% and +0.0%
 (not re-run on a protocol-29 node). Uploads of bytes the node had already stored
 differ by 1-3% in both directions; that is the existing-code artifact described in
 `test/validation/differential.test.ts`, not the cache.
+
+That also made it safe to enforce the instruction count a transaction declares,
+which is now **on by default** (`ledger.enforceDeclaredResources(false)` turns it
+off): every deploy and invocation above fits its declared count with 3.8-27% to
+spare, and the floor of that margin is stellar-rpc's own 4% padding. It used to be
+off because enforcing it failed every deploy with `Error(Budget, ExceededLimit)`.
 
 What is still not modelled: a node builds its cache at ledger close, so a contract
 uploaded and invoked within the SAME ledger pays the full parse there (the host's

@@ -371,22 +371,28 @@ pub struct SorobanEnv {
     cpu_limit: u64,
     mem_limit: u64,
     /// Cap the enforcing pass at the DECLARED instruction count, the way
-    /// stellar-core does.
+    /// stellar-core does. On by default.
     ///
-    /// Off by default. It used to be off because the enforcing pass ran with
+    /// This used to be off, because the enforcing pass ran with
     /// `module_cache: None`: it paid the full `VmInstantiation` Wasm-parse cost
     /// (const_term 451,626) where recording mode charges the cached price to its
     /// shadow budget, the two halves disagreed by 71-188% per invocation, and
     /// enforcing the declared limit failed every deploy with
     /// Error(Budget, ExceededLimit). `send` now hands the host a module cache
     /// (see `prepare_module_cache`) and the applied count tracks the recorded
-    /// one to within 1%, so turning this on is safe; every deploy and invocation
-    /// in the calibration scenarios fits its declared count with 3.8-27% to
-    /// spare.
+    /// one to within 1%, so every deploy and invocation in the calibration
+    /// scenarios fits its declared count with 3.8-27% to spare.
     ///
     /// The floor of that margin is stellar-rpc's own padding
     /// (`max(raw + 50_000, raw * 1.04)`): an apply that costs more than 4% over
-    /// what the simulation recorded is refused, exactly as on a network.
+    /// what the simulation recorded is refused, exactly as on a network, e.g.
+    /// when state grows between simulate and send. The same goes for a
+    /// simulation that left work out, such as an unsigned custom-account call
+    /// whose `__check_auth` the recording never ran: it now dies with
+    /// Error(Budget, ExceededLimit) before the host gets to reject the
+    /// signature. The limit is the smaller of the declared count and the
+    /// configured `cpu_limit`. Turn this off to send resources whose
+    /// instruction count you do not control.
     enforce_declared_resources: bool,
     /// Parsed contract code, shared by every `send` on this environment, built
     /// lazily so `new()` stays free. It is content-addressed by wasm hash, so it
@@ -412,12 +418,13 @@ impl SorobanEnv {
             mem_cost_params: None,
             cpu_limit: 100_000_000,
             mem_limit: 41_943_040,
-            enforce_declared_resources: false,
+            enforce_declared_resources: true,
             module_cache: None,
         }
     }
 
-    /// See `enforce_declared_resources`. Off by default.
+    /// See `enforce_declared_resources`. On by default; pass `false` to send
+    /// resources whose declared instruction count should not be enforced.
     #[wasm_bindgen(js_name = enforceDeclaredResources)]
     pub fn set_enforce_declared_resources(&mut self, on: bool) {
         self.enforce_declared_resources = on;
@@ -840,7 +847,7 @@ impl SorobanEnv {
         // count and reports INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED when
         // it is exceeded. Without this the declared resources are decorative.
         let budget = self.make_budget(if self.enforce_declared_resources {
-            Some(resources.instructions as u64)
+            Some((resources.instructions as u64).min(self.cpu_limit))
         } else {
             None
         })?;

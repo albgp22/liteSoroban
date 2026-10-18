@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { xdr, nativeToScVal, Keypair } from '@stellar/stellar-sdk';
 import { Ledger, createContractHostFn, invokeHostFn } from '../src/index.js';
 import { authorizeAndSend, smartAccountEd25519 } from '../src/auth.js';
+import { PROTOCOL_27_COST_PARAMS } from '../src/cost-params.js';
 
 const fixture = (n: string) =>
   new Uint8Array(readFileSync(fileURLToPath(new URL(`./fixtures/${n}`, import.meta.url))));
@@ -208,6 +209,10 @@ describe('the enforcing path has a module cache', () => {
         L2.putEntry(entry.toXDR('base64'), L.getEntryTtl(key));
       }
 
+      // The parse of these bytes is not in the declared count, which was recorded
+      // for the valid code; leave the count unenforced so the host's own error
+      // is the one reported.
+      L2.enforceDeclaredResources(false);
       let sent: ReturnType<Ledger['send']> | undefined;
       expect(() => {
         sent = L2.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
@@ -215,5 +220,80 @@ describe('the enforcing path has a module cache', () => {
       expect(sent!.ok).toBe(false);
       expect(sent!.error).toMatch(/WasmVm/);
     });
+  });
+});
+
+describe('the declared instruction count is enforced by default', () => {
+  // With no module cache the enforcing pass cost 1.7-2.9x what was recorded, so
+  // enforcing the declared (recorded + 4%) count failed every deploy with
+  // Error(Budget, ExceededLimit) and the harness shipped with it off.
+  let L: Ledger;
+  let source: string;
+  beforeEach(() => {
+    L = new Ledger();
+    source = L.fundAccount(1);
+  });
+
+  const withInstructions = (resourcesXdr: string, n: number) => {
+    const r = xdr.SorobanResources.fromXDR(resourcesXdr, 'base64');
+    r.instructions(n);
+    return r.toXDR('base64');
+  };
+
+  function deployData() {
+    const hf = createContractHostFn(source, L.seedWasm(CONTRACT_DATA), Buffer.alloc(32, 1));
+    const sim = L.simulate(hf, source);
+    const sent = L.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
+    expect(sent.ok, `deploy under the declared count: ${sent.error}`).toBe(true);
+    return {
+      sim, sent,
+      addr: xdr.ScVal.fromXDR(sent.returnValueXdr!, 'base64').address(),
+    };
+  }
+
+  it('deploys and invocations fit under the count they declared', () => {
+    const deployed = deployData();
+    const hf = invokeHostFn(deployed.addr, 'put_persistent', [sym('k'), u64(1n)]);
+    const sim = L.simulate(hf, source);
+    const sent = L.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
+    expect(sent.ok, sent.error).toBe(true);
+    for (const { sim: s, sent: r } of [deployed, { sim, sent }]) {
+      expect(Number(r.cpuInsns)).toBeLessThan(s.adjustedInstructions);
+    }
+  });
+
+  it('a transaction that under-declares fails with Budget and commits nothing', () => {
+    const { addr } = deployData();
+    const hf = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
+    const sim = L.simulate(hf, source);
+    const tiny = withInstructions(sim.resourcesXdr, 1_000);
+
+    const before = L.stateHash();
+    const sent = L.send(hf, source, tiny, sim.authXdr, sim.restoredRwEntryIndices);
+    expect(sent.ok).toBe(false);
+    expect(sent.error).toContain('Budget');
+    expect(L.stateHash()).toBe(before);
+
+    // the same bytes go through once the declared count is not enforced
+    L.enforceDeclaredResources(false);
+    const lenient = L.send(hf, source, tiny, sim.authXdr, sim.restoredRwEntryIndices);
+    expect(lenient.ok, lenient.error).toBe(true);
+  });
+
+  it('the configured cpuLimit still bounds send when the declared count is larger', () => {
+    const { addr } = deployData();
+    const hf = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
+    const sim = L.simulate(hf, source);
+    expect(sim.adjustedInstructions).toBeGreaterThan(10_000);
+
+    L.setCostParams(
+      PROTOCOL_27_COST_PARAMS.cpuInstructions,
+      PROTOCOL_27_COST_PARAMS.memoryBytes,
+      10_000n,
+      41_943_040n,
+    );
+    const sent = L.send(hf, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
+    expect(sent.ok).toBe(false);
+    expect(sent.error).toContain('Budget');
   });
 });
