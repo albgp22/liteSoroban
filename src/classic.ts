@@ -78,6 +78,12 @@ export interface TxOutcome {
   rejected?: boolean;
   /** For txFAILED decided by the classic layer rather than by the host. */
   opCode?: 'opBAD_AUTH' | 'opNO_ACCOUNT';
+  /** The inner result of an ExtendFootprintTTL / RestoreFootprint operation. */
+  footprintOpResult?:
+    | 'extendFootprintTtlSuccess'
+    | 'extendFootprintTtlMalformed'
+    | 'restoreFootprintSuccess'
+    | 'restoreFootprintMalformed';
 }
 
 // ---------------------------------------------------------------------------
@@ -724,9 +730,17 @@ function applyInner(
         opCode: 'opBAD_AUTH',
       };
     }
-    if (!checker.checkAllSignaturesUsed()) {
-      return fail('txBAD_AUTH_EXTRA', 'the envelope carries a signature no check consumed');
-    }
+  }
+
+  // The operation's own doCheckValidForSoroban, right after its signature
+  // check (OperationFrame::checkValid), so still at submission.
+  const footprintProblem = footprintOpMalformed(ledger, ops[0], sorobanData);
+  if (footprintProblem) {
+    return { ...fail('txFAILED', footprintProblem.detail), footprintOpResult: footprintProblem.code };
+  }
+
+  if (checker && !checker.checkAllSignaturesUsed()) {
+    return fail('txBAD_AUTH_EXTRA', 'the envelope carries a signature no check consumed');
   }
 
   // -- commit the classic side, then run the host --------------------------
@@ -745,14 +759,17 @@ function applyInner(
     };
   }
 
-  if (opType !== 'invokeHostFunction') {
-    // ExtendFootprintTTL / RestoreFootprint are validated above but not
-    // dispatched: the host entry points for them are not wired up in this spike.
+  if (opType === 'extendFootprintTtl' || opType === 'restoreFootprint') {
+    const changed =
+      opType === 'extendFootprintTtl'
+        ? applyExtendFootprintTtl(ledger, ops[0].body().extendFootprintTtlOp().extendTo(), sorobanData)
+        : applyRestoreFootprint(ledger, sorobanData);
     return {
-      code: 'txFAILED',
-      ok: false,
+      code: 'txSUCCESS',
+      ok: true,
       feeCharged: feeBumped ? 0n : totalFee,
-      detail: `${opType} is not dispatched by this harness yet`,
+      footprintOpResult: opType === 'extendFootprintTtl' ? 'extendFootprintTtlSuccess' : 'restoreFootprintSuccess',
+      changedKeys: changed,
     };
   }
 
@@ -778,6 +795,104 @@ function applyInner(
     feeCharged: feeBumped ? 0n : totalFee,
     error: sent.error,
   };
+}
+
+// ---------------------------------------------------------------------------
+// ExtendFootprintTTL / RestoreFootprint (stellar-core v29.0.0)
+// ---------------------------------------------------------------------------
+
+const isTtlKey = (k: xdr.LedgerKey) =>
+  k.switch().name === 'contractData' || k.switch().name === 'contractCode';
+
+const isPersistentKey = (k: xdr.LedgerKey) =>
+  k.switch().name === 'contractCode' ||
+  (k.switch().name === 'contractData' && k.contractData().durability().name === 'persistent');
+
+/**
+ * ExtendFootprintTTLOpFrame / RestoreFootprintOpFrame::doCheckValidForSoroban:
+ * the shape rules, checked at submission. Returns the MALFORMED inner result
+ * with core's diagnostic text, or null for any other operation.
+ */
+function footprintOpMalformed(
+  ledger: Ledger,
+  op: xdr.Operation,
+  sorobanData: xdr.SorobanTransactionData,
+): { code: NonNullable<TxOutcome['footprintOpResult']>; detail: string } | null {
+  const type = op.body().switch().name;
+  const fp = sorobanData.resources().footprint();
+  if (type === 'extendFootprintTtl') {
+    const malformed = (detail: string) => ({ code: 'extendFootprintTtlMalformed' as const, detail });
+    if (fp.readWrite().length > 0) {
+      return malformed('read-write footprint must be empty for ExtendFootprintTTL operation');
+    }
+    if (!fp.readOnly().every(isTtlKey)) {
+      return malformed('only entries with TTL (contract data or code entries) can have it extended');
+    }
+    const extendTo = op.body().extendFootprintTtlOp().extendTo();
+    const max = ledger.archivalSettings.maxEntryTtl - 1;
+    if (extendTo > max) return malformed(`TTL extension is too large: ${extendTo} > ${max}`);
+    return null;
+  }
+  if (type === 'restoreFootprint') {
+    const malformed = (detail: string) => ({ code: 'restoreFootprintMalformed' as const, detail });
+    if (fp.readOnly().length > 0) {
+      return malformed('read-only footprint must be empty for RestoreFootprint operation');
+    }
+    if (!fp.readWrite().every(isPersistentKey)) {
+      return malformed('only persistent Soroban entries can be restored');
+    }
+  }
+  return null;
+}
+
+/**
+ * ExtendFootprintTTLOpFrame apply (protocol 23+): each live read-only entry
+ * whose TTL ends before ledger + extendTo is raised to exactly that; missing,
+ * archived and already-long-enough entries are skipped (an archived one must be
+ * restored). Returns the keys whose TTL moved.
+ *
+ * NOT modelled: the rent fee charged against the refundable resource fee
+ * (EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE) and the network's entry
+ * size limits (RESOURCE_LIMIT_EXCEEDED).
+ */
+function applyExtendFootprintTtl(
+  ledger: Ledger,
+  extendTo: number,
+  sorobanData: xdr.SorobanTransactionData,
+): string[] {
+  const newLiveUntil = ledger.ledgerSeq + extendTo;
+  const changed: string[] = [];
+  for (const key of sorobanData.resources().footprint().readOnly()) {
+    const k = key.toXDR('base64');
+    const entry = ledger.getEntry(k);
+    const ttl = ledger.getEntryTtl(k);
+    if (!entry || ttl === undefined || ttl < ledger.ledgerSeq) continue; // missing, or not live
+    if (ttl >= newLiveUntil) continue;
+    ledger.putEntry(entry, newLiveUntil);
+    changed.push(k);
+  }
+  return changed;
+}
+
+/**
+ * RestoreFootprintOpFrame apply: each archived read-write entry gets TTL
+ * ledger + minPersistentTTL - 1 ("including the current ledger"); live and
+ * missing ones are skipped. Same rent / size caveat as extend. There is no hot
+ * archive here: an archived persistent entry stays in the store, expired.
+ */
+function applyRestoreFootprint(ledger: Ledger, sorobanData: xdr.SorobanTransactionData): string[] {
+  const restoredLiveUntil = ledger.ledgerSeq + ledger.archivalSettings.minPersistentTtl - 1;
+  const changed: string[] = [];
+  for (const key of sorobanData.resources().footprint().readWrite()) {
+    const k = key.toXDR('base64');
+    const entry = ledger.getEntry(k);
+    const ttl = ledger.getEntryTtl(k);
+    if (!entry || ttl === undefined) continue;
+    if (ttl >= ledger.ledgerSeq) continue; // live
+    ledger.putEntry(entry, restoredLiveUntil);
+    changed.push(k);
+  }
+  return changed;
 }
 
 /**

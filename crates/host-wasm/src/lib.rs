@@ -47,7 +47,7 @@ use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_env_host::xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, ExtensionPoint,
-    Liabilities, SponsorshipDescriptor, TimePoint,
+    LedgerFootprint, Liabilities, SponsorshipDescriptor, TimePoint,
     AccountId, HostFunction, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount,
     LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine, Limits, ReadXdr,
     ContractCostParams, ContractDataDurability, SorobanAuthorizationEntry, SorobanResources,
@@ -548,6 +548,37 @@ impl SorobanEnv {
         Ok(self.store.borrow().get(&Rc::new(key)).and_then(|(_, t)| *t))
     }
 
+    /// The state-archival settings `ledger_info()` hands the host, as
+    /// [min_temp_entry_ttl, min_persistent_entry_ttl, max_entry_ttl], so the
+    /// classic layer's ExtendFootprintTTL / RestoreFootprint use the same ones.
+    #[wasm_bindgen(js_name = archivalSettings)]
+    pub fn archival_settings(&self) -> Vec<u32> {
+        let li = self.ledger_info();
+        vec![li.min_temp_entry_ttl, li.min_persistent_entry_ttl, li.max_entry_ttl]
+    }
+
+    /// stellar-rpc's preflight for an ExtendFootprintTTL transaction, over its
+    /// read-only footprint. See `extend_ttl_resources`.
+    #[wasm_bindgen(js_name = simulateExtendTtl)]
+    pub fn simulate_extend_ttl(&self, keys_b64: Vec<String>, extend_to: u32) -> Result<JsValue, JsError> {
+        let keys = keys_b64
+            .iter()
+            .map(|k| from_xdr_b64::<LedgerKey>(k))
+            .collect::<Result<Vec<_>, _>>()?;
+        footprint_simulation(self.extend_ttl_resources(&keys, extend_to))
+    }
+
+    /// stellar-rpc's preflight for a RestoreFootprint transaction, over its
+    /// read-write footprint. See `restore_resources`.
+    #[wasm_bindgen(js_name = simulateRestore)]
+    pub fn simulate_restore(&self, keys_b64: Vec<String>) -> Result<JsValue, JsError> {
+        let keys = keys_b64
+            .iter()
+            .map(|k| from_xdr_b64::<LedgerKey>(k))
+            .collect::<Result<Vec<_>, _>>()?;
+        footprint_simulation(self.restore_resources(&keys))
+    }
+
     // -- requirement 4: isolation -------------------------------------------
 
     /// Snapshot the entire ledger. O(entries) memcpy of a BTreeMap -- this is
@@ -979,6 +1010,118 @@ impl SorobanEnv {
             max_entry_ttl: 10_000_000,
         }
     }
+}
+
+impl SorobanEnv {
+    /// soroban-simulation 29.0.2 `simulate_extend_ttl_op_resources`
+    /// (resources.rs): extend every live key whose TTL ends before
+    /// `ledger + extend_to`, skip missing and already-long-enough ones, refuse
+    /// an expired one. The footprint is the extended keys, sorted, and every
+    /// resource is 0; the rest of the cost is rent.
+    ///
+    /// One deliberate difference: stellar-rpc reads through an auto-restoring
+    /// snapshot, so for an EXPIRED persistent key it answers with a restore
+    /// preamble instead of this error. Both mean "restore it first".
+    fn extend_ttl_resources(&self, keys: &[LedgerKey], extend_to: u32) -> Result<SorobanResources, String> {
+        let current = self.ledger_seq;
+        let new_live_until = current.saturating_add(extend_to);
+        let store = self.store.borrow();
+        let mut extended = Vec::new();
+        for key in keys {
+            if !needs_ttl(key) {
+                return Err(format!(
+                    "Can't extend TTL for ledger entry with key `{key:?}`. Only entries with TTL (contract data or code entries) can have it extended"
+                ));
+            }
+            let Some((_, live_until)) = store.get(&Rc::new(key.clone())) else {
+                continue;
+            };
+            let live_until = live_until
+                .ok_or_else(|| format!("Internal error: missing TTL for ledger key that must have TTL: `{key:?}`"))?;
+            // An expired TEMPORARY entry does not exist as far as the protocol
+            // is concerned (nor does the auto-restoring snapshot return it).
+            if is_temporary(key) && live_until < current {
+                continue;
+            }
+            if new_live_until <= live_until {
+                continue;
+            }
+            if live_until < current {
+                return Err(format!(
+                    "Can't extend for an expired entry with key: {key:?}. The entry must be restored before it can be extended."
+                ));
+            }
+            extended.push(key.clone());
+        }
+        extended.sort();
+        Ok(SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: extended.try_into().map_err(|_| "too many keys".to_string())?,
+                read_write: Default::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        })
+    }
+
+    /// soroban-simulation 29.0.2 `simulate_restore_op_resources`: only
+    /// persistent keys, every one of them present; live ones are skipped. The
+    /// footprint is the restored keys, sorted, and both disk-read and write
+    /// bytes are their total XDR size.
+    fn restore_resources(&self, keys: &[LedgerKey]) -> Result<SorobanResources, String> {
+        let current = self.ledger_seq;
+        let store = self.store.borrow();
+        let mut restored = Vec::new();
+        let mut bytes = 0u32;
+        for key in keys {
+            let persistent = matches!(key, LedgerKey::ContractCode(_))
+                || matches!(key, LedgerKey::ContractData(d) if d.durability == ContractDataDurability::Persistent);
+            if !persistent {
+                return Err(format!(
+                    "Can't restore a ledger entry with key: {key:?}. Only persistent ledger entries with TTL can be restored."
+                ));
+            }
+            let Some((entry, live_until)) = store.get(&Rc::new(key.clone())) else {
+                return Err(format!("Missing entry to restore for key {key:?}"));
+            };
+            let live_until = live_until
+                .ok_or_else(|| format!("Internal error: missing TTL for ledger key that must have TTL: `{key:?}`"))?;
+            if live_until >= current {
+                continue;
+            }
+            restored.push(key.clone());
+            let size = entry.to_xdr(Limits::none()).map_err(|e| e.to_string())?.len();
+            bytes = bytes.saturating_add(u32::try_from(size).unwrap_or(u32::MAX));
+        }
+        restored.sort();
+        Ok(SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: Default::default(),
+                read_write: restored.try_into().map_err(|_| "too many keys".to_string())?,
+            },
+            instructions: 0,
+            disk_read_bytes: bytes,
+            write_bytes: bytes,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FootprintSimulation {
+    ok: bool,
+    error: Option<String>,
+    /// `SorobanResources` XDR for the transaction's `SorobanTransactionData`.
+    resources_xdr: Option<String>,
+}
+
+fn footprint_simulation(res: Result<SorobanResources, String>) -> Result<JsValue, JsError> {
+    let out = match res {
+        Ok(r) => FootprintSimulation { ok: true, error: None, resources_xdr: Some(to_xdr_b64(&r)?) },
+        Err(e) => FootprintSimulation { ok: false, error: Some(e), resources_xdr: None },
+    };
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
 }
 
 /// Exposed so a harness can assert the pinned protocol at startup.

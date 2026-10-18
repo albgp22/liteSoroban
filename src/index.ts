@@ -18,6 +18,13 @@ const wasm = require('../pkg/soroban_host.js');
 /** The protocol version the pinned soroban-env-host actually implements. */
 export const HOST_PROTOCOL: number = wasm.hostProtocolVersion();
 
+export interface FootprintSimulation {
+  ok: boolean;
+  error?: string;
+  /** `SorobanResources` XDR, when ok. */
+  resourcesXdr?: string;
+}
+
 export interface SimulateResult {
   ok: boolean;
   error?: string;
@@ -159,6 +166,24 @@ export class Ledger {
   }
   getEntryTtl(keyB64: string): number | undefined {
     return this.env.getEntryTtl(keyB64);
+  }
+
+  /** The state-archival settings the host runs with. */
+  get archivalSettings(): { minTemporaryTtl: number; minPersistentTtl: number; maxEntryTtl: number } {
+    const [minTemporaryTtl, minPersistentTtl, maxEntryTtl] = this.env.archivalSettings();
+    return { minTemporaryTtl, minPersistentTtl, maxEntryTtl };
+  }
+
+  /**
+   * stellar-rpc's preflight for ExtendFootprintTTL / RestoreFootprint
+   * (soroban-simulation's simulate_extend_ttl_op / simulate_restore_op): the
+   * SorobanResources to submit, or the reason there are none.
+   */
+  simulateExtendTtl(keysB64: string[], extendTo: number): FootprintSimulation {
+    return this.env.simulateExtendTtl(keysB64, extendTo);
+  }
+  simulateRestore(keysB64: string[]): FootprintSimulation {
+    return this.env.simulateRestore(keysB64);
   }
 
   /** Requirement 4: isolation. */

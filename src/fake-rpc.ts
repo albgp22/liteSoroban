@@ -68,6 +68,16 @@ function operationResults(outcome: TxOutcome): xdr.OperationResult[] {
   // Decided by the classic layer before the host ran: a bare op result code.
   if (outcome.opCode === 'opBAD_AUTH') return [xdr.OperationResult.opBadAuth()];
   if (outcome.opCode === 'opNO_ACCOUNT') return [xdr.OperationResult.opNoAccount()];
+  if (outcome.footprintOpResult) {
+    const extend = outcome.footprintOpResult.startsWith('extend');
+    const R: any = extend ? xdr.ExtendFootprintTtlResult : xdr.RestoreFootprintResult;
+    const tr: any = xdr.OperationResultTr;
+    return [
+      xdr.OperationResult.opInner(
+        tr[extend ? 'extendFootprintTtl' : 'restoreFootprint'](R[outcome.footprintOpResult]()),
+      ),
+    ];
+  }
   const returned = outcome.returnValueXdr
     ? sha256(Buffer.from(outcome.returnValueXdr, 'base64'))
     : Buffer.alloc(32);
@@ -502,6 +512,37 @@ export function attachInProcessRpc(
         const env = xdr.TransactionEnvelope.fromXDR(params.transaction, 'base64');
         const tx = env.v1().tx();
         const op = tx.operations()[0];
+
+        // ExtendFootprintTTL / RestoreFootprint: soroban-simulation's
+        // simulate_extend_ttl_op / simulate_restore_op over the transaction's
+        // own footprint, read-only and read-write respectively (stellar-rpc
+        // lib/preflight/src/shared.rs).
+        const opName = op.body().switch().name;
+        if (opName === 'extendFootprintTtl' || opName === 'restoreFootprint') {
+          const fp = tx.ext().switch() === 1 ? tx.ext().sorobanData().resources().footprint() : null;
+          const keys = (fp ? (opName === 'extendFootprintTtl' ? fp.readOnly() : fp.readWrite()) : []).map(
+            (k) => k.toXDR('base64'),
+          );
+          const footprintSim =
+            opName === 'extendFootprintTtl'
+              ? ledger.simulateExtendTtl(keys, op.body().extendFootprintTtlOp().extendTo())
+              : ledger.simulateRestore(keys);
+          if (!footprintSim.ok) return ok({ error: footprintSim.error, latestLedger: ledger.ledgerSeq });
+          const resources = xdr.SorobanResources.fromXDR(footprintSim.resourcesXdr!, 'base64');
+          // As crude as the invoke path's below: real fees need the network's rent config.
+          const fee = String(100_000 + resources.writeBytes() * 100);
+          const txData = new xdr.SorobanTransactionData({
+            ext: new (xdr as any).SorobanTransactionDataExt(0),
+            resources,
+            resourceFee: (xdr as any).Int64.fromString(fee),
+          });
+          return ok({
+            latestLedger: ledger.ledgerSeq,
+            minResourceFee: fee,
+            transactionData: txData.toXDR('base64'),
+          });
+        }
+
         const hostFn = op.body().invokeHostFunctionOp().hostFunction();
 
         const muxed: any = tx.sourceAccount();

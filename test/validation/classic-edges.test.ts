@@ -930,11 +930,11 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       expect(out.code).toBe('txMALFORMED');
     });
 
-    // The harness validates ExtendFootprintTTL / RestoreFootprint but never
-    // dispatches them (README "What this does NOT do"). core would return
-    // txSUCCESS and extend the TTL; the requirement here is only that the
-    // harness says so honestly instead of pretending to succeed.
-    it('reports ExtendFootprintTTL as a failure, never a silent success', () => {
+    // These used to pin an honest txFAILED, back when the harness validated
+    // ExtendFootprintTTL / RestoreFootprint without dispatching them. They are
+    // dispatched now, and do what core does (ExtendFootprintTTLOpFrame /
+    // RestoreFootprintOpFrame), checked against a local protocol-29 node.
+    it('applies ExtendFootprintTTL: the TTL becomes ledger + extendTo', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       // Write the entry first so there is a real TTL to observe.
@@ -957,14 +957,13 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
         ),
       );
 
-      expect(out.ok).toBe(false);
-      expect(out.code).not.toBe('txSUCCESS');
-      expect(out.detail ?? '').toMatch(/not dispatched/i);
-      // And nothing actually happened to the TTL.
-      expect(L.getEntryTtl(dataKey.toXDR('base64'))).toBe(ttlBefore);
+      expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'extendFootprintTtlSuccess']);
+      // extendTo 100_000 from this ledger outlives the TTL the write left.
+      expect(L.getEntryTtl(dataKey.toXDR('base64'))).toBe(L.ledgerSeq + 100_000);
+      expect(L.getEntryTtl(dataKey.toXDR('base64'))!).toBeGreaterThan(ttlBefore!);
     });
 
-    it('reports RestoreFootprint as a failure, never a silent success', () => {
+    it('applies RestoreFootprint: a key with nothing to restore is skipped, and it succeeds', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       const res = new xdr.SorobanResources({
@@ -976,9 +975,8 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { ops: [restoreOp()], sorobanData: sorobanData(RESOURCE_FEE, res) })), [a]),
       );
-      expect(out.ok).toBe(false);
-      expect(out.code).not.toBe('txSUCCESS');
-      expect(out.detail ?? '').toMatch(/not dispatched/i);
+      expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'restoreFootprintSuccess']);
+      expect(L.getEntry(RESOURCES.footprint().readWrite()[0].toXDR('base64'))).toBeUndefined();
     });
 
     // GAP CANDIDATE. OperationFrame::checkSignature (:217-256) and
