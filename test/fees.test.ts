@@ -30,28 +30,10 @@ import {
   xdr,
   type Transaction,
 } from '@stellar/stellar-sdk';
-import { LiteStellar, TESTNET_FEE_SETTINGS, type NetworkFeeSettings } from '../src/litestellar.js';
+import { LiteStellar, TESTNET_FEE_SETTINGS } from '../src/litestellar.js';
+import { QUICKSTART } from './quickstart-settings.js';
 import { Ledger } from '../src/index.js';
 
-/** The local quickstart's fee settings, read at ledger 7,920. */
-const QUICKSTART: NetworkFeeSettings = {
-  feeRatePerInstructionsIncrement: 7,
-  feeDiskReadLedgerEntry: 1563,
-  feeWriteLedgerEntry: 2500,
-  feeDiskRead1kb: 447,
-  sorobanStateTargetSizeBytes: 4_000_000_000,
-  rentFee1kbSorobanStateSizeLow: -17_000,
-  rentFee1kbSorobanStateSizeHigh: 10_000,
-  sorobanStateRentFeeGrowthFactor: 5000,
-  feeWrite1kb: 875,
-  feeHistorical1kb: 4059,
-  txMaxContractEventsSizeBytes: 16_384,
-  feeContractEvents1kb: 5000,
-  feeTxSize1kb: 406,
-  persistentRentRateDenominator: 1215,
-  tempRentRateDenominator: 2430,
-  averageSorobanStateSize: 4_074_449,
-};
 
 const PASS = 'Standalone Network ; February 2017';
 const fixture = (n: string) =>

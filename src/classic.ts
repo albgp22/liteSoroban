@@ -23,6 +23,7 @@ import {
   hash as sha256,
 } from '@stellar/stellar-sdk';
 import type { Ledger } from './index.js';
+import type { NetworkFeeSettings } from './fee-settings.js';
 
 /** Default: testnet's, so an app configured for testnet needs no change. */
 export const DEFAULT_PASSPHRASE = Networks.TESTNET;
@@ -99,9 +100,11 @@ export interface TxOutcome {
   footprintOpResult?:
     | 'extendFootprintTtlSuccess'
     | 'extendFootprintTtlMalformed'
+    | 'extendFootprintTtlResourceLimitExceeded'
     | 'extendFootprintTtlInsufficientRefundableFee'
     | 'restoreFootprintSuccess'
     | 'restoreFootprintMalformed'
+    | 'restoreFootprintResourceLimitExceeded'
     | 'restoreFootprintInsufficientRefundableFee';
 }
 
@@ -811,14 +814,21 @@ function applyInner(
     }
   }
 
-  // -- the declared resource fee against what the resources cost ------------
-  // commonValidPreSeqNum (TransactionFrame.cpp:1386-1410), right after the
-  // memo check and for a fee-bumped inner transaction too: the resource fee
-  // has to cover computeSorobanResourceFee of the DECLARED resources, priced
-  // on this envelope's size, with no events yet. The non-refundable part is
-  // charged whatever happens; the rest is the most rent and events may cost.
   const sorobanData = raw.ext().switch() === 1 ? raw.ext().sorobanData() : null;
   if (!sorobanData) return fail('txSOROBAN_INVALID', 'missing SorobanTransactionData');
+
+  // -- the declared resources against the network's limits ------------------
+  // commonValidPreSeqNum (TransactionFrame.cpp:1360), right after the memo
+  // check, fee bump or not, and whether or not fees are charged.
+  const overLimit = sorobanResourcesProblem(ledger.feeSettings, sorobanData, txSize, opType === 'restoreFootprint');
+  if (overLimit) return fail('txSOROBAN_INVALID', overLimit);
+
+  // -- the declared resource fee against what the resources cost ------------
+  // commonValidPreSeqNum (TransactionFrame.cpp:1386-1410), next: the resource
+  // fee has to cover computeSorobanResourceFee of the DECLARED resources,
+  // priced on this envelope's size, with no events yet. The non-refundable
+  // part is charged whatever happens; the rest is the most rent and events may
+  // cost.
   const resourceFee = BigInt(sorobanData.resourceFee().toString());
   let nonRefundable = 0n;
   if (charge) {
@@ -999,6 +1009,14 @@ function applyInner(
     const applied = extend
       ? applyExtendFootprintTtl(ledger, ops[0].body().extendFootprintTtlOp().extendTo(), sorobanData, refundableCap)
       : applyRestoreFootprint(ledger, sorobanData, refundableCap);
+    if (applied.overLimit) {
+      return settle({
+        code: 'txFAILED',
+        ok: false,
+        footprintOpResult: extend ? 'extendFootprintTtlResourceLimitExceeded' : 'restoreFootprintResourceLimitExceeded',
+        detail: applied.overLimit,
+      });
+    }
     if (applied.short) {
       return settle({
         code: 'txFAILED',
@@ -1048,6 +1066,148 @@ function applyInner(
     },
     sent.ok ? { refundable: BigInt(sent.refundableFeeConsumed), rent: BigInt(sent.rentFee) } : undefined,
   );
+}
+
+// ---------------------------------------------------------------------------
+// the network's resource limits (stellar-core v29.0.0, protocol 23+ rules)
+// ---------------------------------------------------------------------------
+
+const isAsciiAlphaNumeric = (b: number) =>
+  (b >= 0x61 && b <= 0x7a) || (b >= 0x41 && b <= 0x5a) || (b >= 0x30 && b <= 0x39);
+
+/**
+ * isAssetValid<TrustLineAsset> (stellar-core src/util/types.cpp:149): an
+ * asset code of ASCII letters and digits, zero-padded at the end only, at least
+ * one character for alphanum4 and five for alphanum12. Native and (protocol 18+)
+ * pool shares are valid.
+ */
+function trustLineAssetValid(asset: xdr.TrustLineAsset): boolean {
+  const kind = asset.switch().name;
+  if (kind === 'assetTypeNative' || kind === 'assetTypePoolShare') return true;
+  const code: Buffer =
+    kind === 'assetTypeCreditAlphanum4' ? asset.alphaNum4().assetCode() : asset.alphaNum12().assetCode();
+  let zeros = false;
+  let chars = 0;
+  for (const b of code) {
+    if (b === 0) zeros = true;
+    else if (zeros || b > 0x7f || !isAsciiAlphaNumeric(b)) return false;
+    else chars++;
+  }
+  return kind === 'assetTypeCreditAlphanum4' ? chars > 0 : chars > 4;
+}
+
+/** isIssuer (stellar-core src/util/types.h:69). */
+function isIssuerOf(account: xdr.AccountId, asset: xdr.TrustLineAsset): boolean {
+  const kind = asset.switch().name;
+  if (kind !== 'assetTypeCreditAlphanum4' && kind !== 'assetTypeCreditAlphanum12') return false;
+  const issuer = kind === 'assetTypeCreditAlphanum4' ? asset.alphaNum4().issuer() : asset.alphaNum12().issuer();
+  return issuer.toXDR().equals(account.toXDR());
+}
+
+/**
+ * TransactionFrame::checkSorobanResources (TransactionFrame.cpp:778-994): the
+ * DECLARED resources against the network's per-transaction limits, then each
+ * footprint key, the envelope's size, and the archived-entry indexes. Core's
+ * diagnostic text and values, or null. `txSize` is the XDR size of the (inner)
+ * envelope: a fee bump's own bytes do not count.
+ */
+function sorobanResourcesProblem(
+  limits: NetworkFeeSettings,
+  data: xdr.SorobanTransactionData,
+  txSize: number,
+  isRestore: boolean,
+): string | null {
+  const r = data.resources();
+  const readOnly = r.footprint().readOnly();
+  const readWrite = r.footprint().readWrite();
+  const over = (what: string, value: number, limit: number) => `${what}: ${value} > ${limit}`;
+
+  if (r.instructions() > limits.txMaxInstructions) {
+    return over('transaction instructions resources exceed network config limit', r.instructions(), limits.txMaxInstructions);
+  }
+  if (r.diskReadBytes() > limits.txMaxDiskReadBytes) {
+    return over('transaction byte-read resources exceed network config limit', r.diskReadBytes(), limits.txMaxDiskReadBytes);
+  }
+  if (r.writeBytes() > limits.txMaxWriteBytes) {
+    return over('transaction byte-write resources exceed network config limit', r.writeBytes(), limits.txMaxWriteBytes);
+  }
+  // getNumDiskReadEntries (TransactionFrame.cpp:67): every entry a restore
+  // names, otherwise the classic keys and the archived entries marked for
+  // restoring. Live Soroban state is in memory.
+  const archived = data.ext().switch() === 1 ? data.ext().resourceExt().archivedSorobanEntries() : [];
+  const diskReads = isRestore
+    ? readWrite.length
+    : [...readOnly, ...readWrite].filter((k) => !isTtlKey(k)).length + archived.length;
+  const footprintEntries = readOnly.length + readWrite.length;
+  if (footprintEntries > limits.txMaxFootprintEntries) {
+    return over(
+      'the number of entries in transaction footprint exceeds the network config limit',
+      footprintEntries,
+      limits.txMaxFootprintEntries,
+    );
+  }
+  if (diskReads > limits.txMaxDiskReadEntries) {
+    return over('transaction entry-disk-read resources exceed network config limit', diskReads, limits.txMaxDiskReadEntries);
+  }
+  if (readWrite.length > limits.txMaxWriteLedgerEntries) {
+    return over('transaction entry-write resources exceed network config limit', readWrite.length, limits.txMaxWriteLedgerEntries);
+  }
+
+  for (const key of [...readOnly, ...readWrite]) {
+    switch (key.switch().name) {
+      case 'account':
+      case 'contractData':
+      case 'contractCode':
+        break;
+      case 'trustline': {
+        const tl = key.trustLine();
+        const asset = tl.asset();
+        if (!trustLineAssetValid(asset) || asset.switch().name === 'assetTypeNative' || isIssuerOf(tl.accountId(), asset)) {
+          return 'transaction footprint contains invalid trustline asset';
+        }
+        break;
+      }
+      default:
+        return `transaction footprint contains unsupported ledger key type: ${key.switch().value}`;
+    }
+    const keySize = key.toXDR().length;
+    if (keySize > limits.maxContractDataKeySizeBytes) {
+      return over('transaction footprint key exceeds network config limit', keySize, limits.maxContractDataKeySizeBytes);
+    }
+  }
+
+  if (txSize > limits.txMaxSizeBytes) {
+    return over('total transaction size exceeds network config limit', txSize, limits.txMaxSizeBytes);
+  }
+
+  let last: number | undefined;
+  for (const index of archived) {
+    if (last !== undefined && index <= last) return 'archivedSorobanEntries must be sorted in ascending order';
+    last = index;
+    if (index >= readWrite.length) {
+      return `archivedSorobanEntries index is out of bounds: ${index} >= ${readWrite.length}`;
+    }
+    if (!isPersistentKey(readWrite[index])) {
+      return `archivedSorobanEntries index points to a non-persistent entry: ${index}, key type ${readWrite[index].switch().value}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * validateContractLedgerEntry (stellar-core TransactionUtils.cpp:2007): the
+ * network's cap on a ContractCode or ContractData entry's XDR size, checked at
+ * apply on every entry an operation reads or writes. Core's diagnostic, or
+ * null.
+ */
+function contractEntryTooLarge(limits: NetworkFeeSettings, key: xdr.LedgerKey, entrySize: number): string | null {
+  if (key.switch().name === 'contractCode' && limits.maxContractSizeBytes < entrySize) {
+    return `Wasm size exceeds network config maximum contract size: ${entrySize} > ${limits.maxContractSizeBytes}`;
+  }
+  if (key.switch().name === 'contractData' && limits.maxContractDataEntrySizeBytes < entrySize) {
+    return `ContractData size exceeds network config maximum size: ${entrySize} > ${limits.maxContractDataEntrySizeBytes}`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1265,8 @@ interface FootprintOpApplied {
   rent: bigint;
   /** Set when the refundable fee could not cover `rent`: nothing was written. */
   short?: string;
+  /** Set when an entry broke a size limit (RESOURCE_LIMIT_EXCEEDED): nothing was written. */
+  overLimit?: string;
 }
 
 /**
@@ -1143,9 +1305,12 @@ function moveTtls(
  * archived and already-long-enough entries are skipped (an archived one must be
  * restored). Each one moved is charged rent for the added ledgers at its rent
  * size (createEntryRentChangeWithoutModification), out of the refundable fee:
- * EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE when it falls short.
- *
- * NOT modelled: the network's entry size limits (RESOURCE_LIMIT_EXCEEDED).
+ * EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE when it falls short. An
+ * entry above the network's size limit fails the operation with
+ * EXTEND_FOOTPRINT_TTL_RESOURCE_LIMIT_EXCEEDED (ExtendFootprintTTLOpFrame.cpp
+ * :165). From protocol 23 the entries are in memory, so the declared
+ * diskReadBytes is not checked (the parallel apply helper's
+ * checkReadBytesResourceLimit returns true).
  */
 function applyExtendFootprintTtl(
   ledger: Ledger,
@@ -1161,6 +1326,8 @@ function applyExtendFootprintTtl(
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined || ttl < ledger.ledgerSeq) continue; // missing, or not live
     if (ttl >= newLiveUntil) continue;
+    const overLimit = contractEntryTooLarge(ledger.feeSettings, key, Buffer.from(entry, 'base64').length);
+    if (overLimit) return { changed: [], rent: 0n, overLimit };
     moves.push({ k, entry, oldLiveUntil: ttl, newLiveUntil });
   }
   return moveTtls(ledger, moves, maxRefundable);
@@ -1171,9 +1338,13 @@ function applyExtendFootprintTtl(
  * ledger + minPersistentTTL - 1 ("including the current ledger"); live and
  * missing ones are skipped. Rent is charged as for a new entry of that size
  * (old size and TTL 0), out of the refundable fee:
- * RESTORE_FOOTPRINT_INSUFFICIENT_REFUNDABLE_FEE when it falls short. Not
- * modelled: the read/write byte and entry size limits. There is no hot archive
- * here: an archived persistent entry stays in the store, expired.
+ * RESTORE_FOOTPRINT_INSUFFICIENT_REFUNDABLE_FEE when it falls short. Each one
+ * restored is read from disk and written back, so (RestoreFootprintOpFrame.cpp
+ * :198-232) the entries restored so far may not exceed the declared
+ * diskReadBytes, then each must fit the network's entry size limit, then their
+ * total may not exceed the declared writeBytes:
+ * RESTORE_FOOTPRINT_RESOURCE_LIMIT_EXCEEDED, nothing restored. There is no hot
+ * archive here: an archived persistent entry stays in the store, expired.
  */
 function applyRestoreFootprint(
   ledger: Ledger,
@@ -1181,13 +1352,36 @@ function applyRestoreFootprint(
   maxRefundable: bigint | undefined,
 ): FootprintOpApplied {
   const restoredLiveUntil = ledger.ledgerSeq + ledger.archivalSettings.minPersistentTtl - 1;
+  const resources = sorobanData.resources();
+  const limits = ledger.feeSettings;
+  let readBytes = 0;
+  let writeBytes = 0;
   const moves = [];
-  for (const key of sorobanData.resources().footprint().readWrite()) {
+  for (const key of resources.footprint().readWrite()) {
     const k = key.toXDR('base64');
     const entry = ledger.getEntry(k);
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined) continue;
     if (ttl >= ledger.ledgerSeq) continue; // live
+    const entrySize = Buffer.from(entry, 'base64').length;
+    readBytes += entrySize;
+    if (resources.diskReadBytes() < readBytes) {
+      return {
+        changed: [],
+        rent: 0n,
+        overLimit: `operation byte-read resources exceeds amount specified: ${readBytes} > ${resources.diskReadBytes()}`,
+      };
+    }
+    writeBytes += entrySize;
+    const overLimit = contractEntryTooLarge(limits, key, entrySize);
+    if (overLimit) return { changed: [], rent: 0n, overLimit };
+    if (resources.writeBytes() < writeBytes) {
+      return {
+        changed: [],
+        rent: 0n,
+        overLimit: `operation byte-write resources exceeds amount specified: ${writeBytes} > ${resources.writeBytes()}`,
+      };
+    }
     moves.push({ k, entry, oldLiveUntil: 0, newLiveUntil: restoredLiveUntil });
   }
   return moveTtls(ledger, moves, maxRefundable);

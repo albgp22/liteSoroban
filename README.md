@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 246 tests, ~800 ms
+npm test               # 273 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -116,6 +116,14 @@ recorded auth entries. Disk/write bytes match on five of six.
   a NEW entry (writes, uploads, deploys) matches only where the minimum TTLs
   are the node's, which the host's are not yet (see "Known gaps"). The default
   fee settings are testnet's.
+- **Network limits** — the per-transaction caps stellar-core checks at
+  submission (`txSOROBAN_INVALID`: instructions, read and write bytes, footprint,
+  disk-read and write entries, key types and sizes, envelope size, archived
+  indexes) and at apply (`*_RESOURCE_LIMIT_EXCEEDED`: an entry above the size
+  limit read, written, extended or restored; more bytes read or written than
+  declared). Every refusal's result code, diagnostic and fee matched a local
+  protocol-29 node (`test/resource-limits.test.ts`). The limits come with the
+  fee settings, so `loadFeeSettingsFromRpc` installs a node's too.
 
 ## What it is not good for
 
@@ -190,11 +198,12 @@ core's check order), fee-bump fee rules, fees as core charges them (inclusion
 fee capped at the base fee, refund of the unused refundable fee, rent, and the
 resource-fee and `*_INSUFFICIENT_REFUNDABLE_FEE` checks), the `AccountEntry`
 extension chain (promoted on a sequence bump; seen promoted by simulation, as
-stellar-rpc's preflight does), and `ExtendFootprintTTL` / `RestoreFootprint`
-(validated, applied and simulated) follow stellar-core and soroban-simulation and
-were checked scenario by scenario against a local protocol-29 node
-(`test/classic-validation.test.ts`, `test/preconditions.test.ts`,
-`test/footprint-ops.test.ts`, `test/fees.test.ts`). Still missing:
+stellar-rpc's preflight does), `ExtendFootprintTTL` / `RestoreFootprint`
+(validated, applied and simulated), and the network's per-transaction resource
+limits follow stellar-core and soroban-simulation and were checked scenario by
+scenario against a local protocol-29 node (`test/classic-validation.test.ts`,
+`test/preconditions.test.ts`, `test/footprint-ops.test.ts`, `test/fees.test.ts`,
+`test/resource-limits.test.ts`). Still missing:
 - `maxTime` is checked against the harness clock as it stands. A node checks it
   against the last close time plus twice its expected ledger close time plus the
   time since that close (`getUpperBoundCloseTimeOffset`), so an envelope a few
@@ -206,10 +215,12 @@ were checked scenario by scenario against a local protocol-29 node
   network's with `withFeeSettings(await loadFeeSettingsFromRpc(server))`. There
   is no surge pricing: the inclusion fee is always charged at the 100-stroop
   base fee.
-- Not checked against the network's limits, apart from the events size: the
-  per-transaction resource caps (core's `checkSorobanResources`, refused at
-  submission) and entry sizes or a restore's read/write bytes
-  (`RESOURCE_LIMIT_EXCEEDED` at apply).
+- The host's instruction ceiling is not the network's: simulation and apply
+  run under the cost parameters' `cpuLimit`, 100M by default, where testnet and
+  a local quickstart allow 400M per transaction (`txMaxInstructions`, which IS
+  checked at submission). A call needing more than 100M fails here unless
+  `withNetworkCostParams(await loadCostParamsFromRpc(server))` installs the
+  node's. Ledger-wide limits (`ledgerMax*`) are not modelled.
 - Simulating an extend over an expired persistent entry is an error here;
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
 

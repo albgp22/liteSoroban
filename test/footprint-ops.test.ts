@@ -7,11 +7,13 @@
  * stellar-core 29.0.0, stellar-rpc 29.0.1): extend by 200k, a shorter extend, a
  * missing key, every MALFORMED shape, restoring a live entry, and every
  * simulation result and error below matched the node. Restoring an ARCHIVED
- * entry follows core's source only: on that network a persistent entry needs
- * 120,960 ledgers to expire.
+ * entry follows core's source here: on that network a persistent entry needs
+ * 120,960 ledgers to expire. A private node started with minPersistentTTL 20
+ * later restored one, and refused one declaring fewer bytes than the entry
+ * (test/resource-limits.test.ts).
  *
- * Not modelled: rent charged against the refundable resource fee, and the
- * network's entry-size limits.
+ * Rent is pinned in test/fees.test.ts, the network's limits in
+ * test/resource-limits.test.ts.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -49,11 +51,16 @@ function world() {
     );
   const ttl = (k: xdr.LedgerKey) => svm.ledger.getEntryTtl(k.toXDR('base64'));
 
-  const build = async (op: xdr.Operation, fp: { ro?: xdr.LedgerKey[]; rw?: xdr.LedgerKey[] }) => {
+  const build = async (
+    op: xdr.Operation,
+    fp: { ro?: xdr.LedgerKey[]; rw?: xdr.LedgerKey[] },
+    bytes: { read?: number; write?: number } = {},
+  ) => {
     const acct = await server.getAccount(kp.publicKey());
     const data = new SorobanDataBuilder()
       .setReadOnly(fp.ro ?? [])
       .setReadWrite(fp.rw ?? [])
+      .setResources(0, bytes.read ?? 0, bytes.write ?? 0)
       .setResourceFee(10_000_000)
       .build();
     return new TransactionBuilder(acct, { fee: '10100000', networkPassphrase: svm.networkPassphrase })
@@ -176,7 +183,7 @@ describe('RestoreFootprint', () => {
       ro: 0, rw: 1, read: entryBytes, write: entryBytes, instructions: 0,
     });
     const ledger = w.svm.ledger.ledgerSeq;
-    const out = w.send(await w.build(restore(), { rw: [w.key('k')] }));
+    const out = w.send(await w.build(restore(), { rw: [w.key('k')] }, { read: entryBytes, write: entryBytes }));
     expect([out.code, out.footprintOpResult]).toEqual(['txSUCCESS', 'restoreFootprintSuccess']);
     expect(w.ttl(w.key('k'))).toBe(ledger + w.svm.ledger.archivalSettings.minPersistentTtl - 1);
   });

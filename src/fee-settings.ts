@@ -1,7 +1,8 @@
 /**
  * A network's Soroban fee settings: what its `ConfigSetting` entries say a
- * resource costs. The classic layer charges with them and the RPC facade quotes
- * `minResourceFee` with them; the arithmetic itself is soroban-env-host's
+ * resource costs, and how much of each one a transaction may use. The classic
+ * layer charges and enforces with them and the RPC facade quotes
+ * `minResourceFee` with them; the fee arithmetic itself is soroban-env-host's
  * `fees` module, the same code stellar-core and stellar-rpc run.
  *
  * Fees are a network parameter, not a protocol constant: testnet's rates are
@@ -15,7 +16,12 @@ import { xdr, rpc } from '@stellar/stellar-sdk';
 export interface NetworkFeeSettings {
   /** CONFIG_SETTING_CONTRACT_COMPUTE_V0 */
   feeRatePerInstructionsIncrement: number;
+  txMaxInstructions: number;
   /** CONFIG_SETTING_CONTRACT_LEDGER_COST_V0 */
+  txMaxDiskReadEntries: number;
+  txMaxDiskReadBytes: number;
+  txMaxWriteLedgerEntries: number;
+  txMaxWriteBytes: number;
   feeDiskReadLedgerEntry: number;
   feeWriteLedgerEntry: number;
   feeDiskRead1kb: number;
@@ -24,6 +30,7 @@ export interface NetworkFeeSettings {
   rentFee1kbSorobanStateSizeHigh: number;
   sorobanStateRentFeeGrowthFactor: number;
   /** CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT_V0 */
+  txMaxFootprintEntries: number;
   feeWrite1kb: number;
   /** CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0 */
   feeHistorical1kb: number;
@@ -31,7 +38,14 @@ export interface NetworkFeeSettings {
   txMaxContractEventsSizeBytes: number;
   feeContractEvents1kb: number;
   /** CONFIG_SETTING_CONTRACT_BANDWIDTH_V0 */
+  txMaxSizeBytes: number;
   feeTxSize1kb: number;
+  /** CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES: a ContractCode entry's XDR size. */
+  maxContractSizeBytes: number;
+  /** CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES: any footprint key's XDR size. */
+  maxContractDataKeySizeBytes: number;
+  /** CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES: a ContractData entry's XDR size. */
+  maxContractDataEntrySizeBytes: number;
   /** CONFIG_SETTING_STATE_ARCHIVAL */
   persistentRentRateDenominator: number;
   tempRentRateDenominator: number;
@@ -45,11 +59,19 @@ export interface NetworkFeeSettings {
 
 /**
  * Testnet's, read with getLedgerEntries from soroban-testnet.stellar.org on
- * 2026-10-18 at ledger 5,264,749 (protocol 29). Its live state then averaged
- * 3.72 GB, so rent costs 8,083 stroops per KB-period, not the floor.
+ * 2026-10-18 at ledger 5,264,749 (protocol 29); the limits at ledger
+ * 5,265,020 the same day. Its live state then averaged 3.72 GB, so rent costs
+ * 8,083 stroops per KB-period, not the floor. A local stellar/quickstart's
+ * limits were the same, apart from the ledger-wide ones this harness does not
+ * model.
  */
 export const TESTNET_FEE_SETTINGS: NetworkFeeSettings = {
   feeRatePerInstructionsIncrement: 3,
+  txMaxInstructions: 400_000_000,
+  txMaxDiskReadEntries: 200,
+  txMaxDiskReadBytes: 200_000,
+  txMaxWriteLedgerEntries: 200,
+  txMaxWriteBytes: 132_096,
   feeDiskReadLedgerEntry: 781,
   feeWriteLedgerEntry: 1250,
   feeDiskRead1kb: 223,
@@ -57,11 +79,16 @@ export const TESTNET_FEE_SETTINGS: NetworkFeeSettings = {
   rentFee1kbSorobanStateSizeLow: -17_000,
   rentFee1kbSorobanStateSizeHigh: 10_000,
   sorobanStateRentFeeGrowthFactor: 5000,
+  txMaxFootprintEntries: 400,
   feeWrite1kb: 437,
   feeHistorical1kb: 2029,
   txMaxContractEventsSizeBytes: 16_384,
   feeContractEvents1kb: 2500,
+  txMaxSizeBytes: 132_096,
   feeTxSize1kb: 203,
+  maxContractSizeBytes: 131_072,
+  maxContractDataKeySizeBytes: 250,
+  maxContractDataEntrySizeBytes: 65_536,
   persistentRentRateDenominator: 1215,
   tempRentRateDenominator: 2430,
   averageSorobanStateSize: 3_715_978_052,
@@ -75,13 +102,16 @@ const SETTINGS = [
   ID.configSettingContractHistoricalDataV0(),
   ID.configSettingContractEventsV0(),
   ID.configSettingContractBandwidthV0(),
+  ID.configSettingContractMaxSizeBytes(),
+  ID.configSettingContractDataKeySizeBytes(),
+  ID.configSettingContractDataEntrySizeBytes(),
   ID.configSettingStateArchival(),
   ID.configSettingLiveSorobanStateSizeWindow(),
 ];
 
 /**
- * Read a network's fee settings off a live node: mainnet, testnet or a local
- * quickstart, whichever the numbers need to match.
+ * Read a network's fee settings and limits off a live node: mainnet, testnet
+ * or a local quickstart, whichever the numbers need to match.
  */
 export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<NetworkFeeSettings> {
   const res = await server.getLedgerEntries(
@@ -97,8 +127,13 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
     switch (cs.switch().name) {
       case 'configSettingContractComputeV0':
         out.feeRatePerInstructionsIncrement = n(v.feeRatePerInstructionsIncrement());
+        out.txMaxInstructions = n(v.txMaxInstructions());
         break;
       case 'configSettingContractLedgerCostV0':
+        out.txMaxDiskReadEntries = n(v.txMaxDiskReadEntries());
+        out.txMaxDiskReadBytes = n(v.txMaxDiskReadBytes());
+        out.txMaxWriteLedgerEntries = n(v.txMaxWriteLedgerEntries());
+        out.txMaxWriteBytes = n(v.txMaxWriteBytes());
         out.feeDiskReadLedgerEntry = n(v.feeDiskReadLedgerEntry());
         out.feeWriteLedgerEntry = n(v.feeWriteLedgerEntry());
         out.feeDiskRead1kb = n(v.feeDiskRead1Kb());
@@ -108,6 +143,7 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
         out.sorobanStateRentFeeGrowthFactor = n(v.sorobanStateRentFeeGrowthFactor());
         break;
       case 'configSettingContractLedgerCostExtV0':
+        out.txMaxFootprintEntries = n(v.txMaxFootprintEntries());
         out.feeWrite1kb = n(v.feeWrite1Kb());
         break;
       case 'configSettingContractHistoricalDataV0':
@@ -118,7 +154,17 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
         out.feeContractEvents1kb = n(v.feeContractEvents1Kb());
         break;
       case 'configSettingContractBandwidthV0':
+        out.txMaxSizeBytes = n(v.txMaxSizeBytes());
         out.feeTxSize1kb = n(v.feeTxSize1Kb());
+        break;
+      case 'configSettingContractMaxSizeBytes':
+        out.maxContractSizeBytes = n(v);
+        break;
+      case 'configSettingContractDataKeySizeBytes':
+        out.maxContractDataKeySizeBytes = n(v);
+        break;
+      case 'configSettingContractDataEntrySizeBytes':
+        out.maxContractDataEntrySizeBytes = n(v);
         break;
       case 'configSettingStateArchival':
         out.persistentRentRateDenominator = n(v.persistentRentRateDenominator());

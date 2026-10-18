@@ -70,6 +70,11 @@ function e2eLedger(): Ledger {
     minPersistentTtl: MIN_PERSISTENT_ENTRY_TTL,
     maxEntryTtl: MAX_ENTRY_TTL,
   });
+  // Upstream's `resources()` declares 0 read and write bytes: the host never
+  // checks them. stellar-core does (InvokeHostFunctionOpFrame.cpp:368, :805), and
+  // so does `send` unless told not to. The declared instruction cap stays on,
+  // as in upstream's helper (e2e_tests.rs:375).
+  L.enforceDeclaredBytes(false);
   return L;
 }
 

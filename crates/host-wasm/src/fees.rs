@@ -51,6 +51,10 @@ pub(crate) struct NetworkFeeSettings {
     fee_contract_events_1kb: i64,
     // CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
     fee_tx_size_1kb: i64,
+    // CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
+    max_contract_size_bytes: u32,
+    // CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
+    max_contract_data_entry_size_bytes: u32,
     // CONFIG_SETTING_STATE_ARCHIVAL
     persistent_rent_rate_denominator: i64,
     temp_rent_rate_denominator: i64,
@@ -101,6 +105,24 @@ impl NetworkFeeSettings {
 
     pub(crate) fn tx_max_contract_events_size_bytes(&self) -> u32 {
         self.tx_max_contract_events_size_bytes
+    }
+
+    /// stellar-core TransactionUtils.cpp `validateContractLedgerEntry`: a
+    /// ContractCode entry may be at most maxContractSizeBytes and a
+    /// ContractData entry at most maxContractDataEntrySizeBytes, both as XDR.
+    /// Every other entry passes. The error is core's diagnostic text.
+    pub(crate) fn validate_contract_ledger_entry(&self, key: &LedgerKey, entry_size: usize) -> Result<(), String> {
+        match key {
+            LedgerKey::ContractCode(_) if (self.max_contract_size_bytes as usize) < entry_size => Err(format!(
+                "Wasm size exceeds network config maximum contract size: {entry_size} > {}",
+                self.max_contract_size_bytes
+            )),
+            LedgerKey::ContractData(_) if (self.max_contract_data_entry_size_bytes as usize) < entry_size => Err(format!(
+                "ContractData size exceeds network config maximum size: {entry_size} > {}",
+                self.max_contract_data_entry_size_bytes
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The refundable half of the resource fee for `events_size` bytes of

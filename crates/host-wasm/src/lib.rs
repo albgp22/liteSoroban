@@ -403,7 +403,8 @@ pub struct SorobanEnv {
     min_persistent_entry_ttl: u32,
     max_entry_ttl: u32,
     /// Cap the enforcing pass at the DECLARED instruction count, the way
-    /// stellar-core does. On by default.
+    /// stellar-core does. On by default. Off, the declared bytes go unchecked
+    /// too (`enforce_declared_bytes`); the network's limits apply either way.
     ///
     /// This used to be off, because the enforcing pass ran with
     /// `module_cache: None`: it paid the full `VmInstantiation` Wasm-parse cost
@@ -426,6 +427,12 @@ pub struct SorobanEnv {
     /// configured `cpu_limit`. Turn this off to send resources whose
     /// instruction count you do not control.
     enforce_declared_resources: bool,
+    /// Fail the enforcing pass when it reads more classic or restored entry
+    /// bytes than the transaction declares, or writes more, as stellar-core's
+    /// InvokeHostFunctionOpFrame does (`addReads` / `recordStorageChanges`).
+    /// On by default. The host itself never checks them: upstream's own e2e
+    /// tests declare 0 and pass.
+    enforce_declared_bytes: bool,
     /// Parsed contract code, shared by every `send` on this environment, built
     /// lazily so `new()` stays free. It is content-addressed by wasm hash, so it
     /// is deliberately NOT part of a snapshot: after `restore()` it can hold
@@ -456,6 +463,7 @@ impl SorobanEnv {
             min_persistent_entry_ttl: TESTNET_MIN_PERSISTENT_ENTRY_TTL,
             max_entry_ttl: TESTNET_MAX_ENTRY_TTL,
             enforce_declared_resources: true,
+            enforce_declared_bytes: true,
             module_cache: None,
             fee_settings: None,
         }
@@ -466,6 +474,12 @@ impl SorobanEnv {
     #[wasm_bindgen(js_name = enforceDeclaredResources)]
     pub fn set_enforce_declared_resources(&mut self, on: bool) {
         self.enforce_declared_resources = on;
+    }
+
+    /// See `enforce_declared_bytes`. On by default.
+    #[wasm_bindgen(js_name = enforceDeclaredBytes)]
+    pub fn set_enforce_declared_bytes(&mut self, on: bool) {
+        self.enforce_declared_bytes = on;
     }
 
     /// Install the network's real cost calibration, as base64
@@ -985,6 +999,13 @@ impl SorobanEnv {
         // this call restores, which it must not; see `prepare_module_cache`.
         let mut live_code: Vec<(Hash, Rc<LedgerEntry>)> = Vec::new();
         let mut restored_code: Vec<Hash> = Vec::new();
+        // stellar-core InvokeHostFunctionOpFrame `addReads`, key by key: an
+        // entry larger than the network allows fails the operation before the
+        // host runs (validateContractLedgerEntry), and so does reading more
+        // than the declared diskReadBytes (meterDiskReadResource). From
+        // protocol 23 only classic entries and the entries the call restores
+        // are disk reads; live Soroban state is in memory.
+        let mut disk_read_bytes: u32 = 0;
         {
             let store = self.store.borrow();
             // Entries the simulation marked for auto-restore, by read_write index.
@@ -1026,6 +1047,23 @@ impl SorobanEnv {
                 }
 
                 let encoded = entry.to_xdr(Limits::none()).map_err(xdr_err)?;
+                // Core fails an archived entry the call does not restore
+                // (ENTRY_ARCHIVED) before it would size it.
+                let archived = needs_ttl(key) && !restored.contains(key) && live_until.map_or(false, |t| t < self.ledger_seq);
+                if let (Some(fees), false) = (self.fee_settings.as_ref(), archived) {
+                    if let Err(message) = fees.validate_contract_ledger_entry(key, encoded.len()) {
+                        return self.failed_before_host(message);
+                    }
+                }
+                if self.checks_declared_bytes() && (!needs_ttl(key) || restored.contains(key)) {
+                    disk_read_bytes = disk_read_bytes.saturating_add(u32::try_from(encoded.len()).unwrap_or(u32::MAX));
+                    if resources.disk_read_bytes < disk_read_bytes {
+                        return self.failed_before_host(format!(
+                            "operation byte-read resources exceeds amount specified: {disk_read_bytes} > {}",
+                            resources.disk_read_bytes
+                        ));
+                    }
+                }
                 let ttl_meta = if needs_ttl(key) {
                     // Restoring is the EMBEDDER's job: core rewrites the TTL of
                     // an archived entry to ledgerSeq + minPersistentTTL - 1
@@ -1121,7 +1159,10 @@ impl SorobanEnv {
         let (mut rent_fee, mut contract_events_size_bytes, mut refundable_fee_consumed) = (0, 0, 0);
         let mut events_xdr: Vec<String> = res.encoded_contract_events.iter().map(|e| b64e(e)).collect();
         if let Ok(result_value) = &res.encoded_invoke_result {
-            match self.consume_refundable(&res, result_value.len(), max_refundable_fee) {
+            match self
+                .check_written_entries(&res, &resources)
+                .and_then(|()| self.consume_refundable(&res, result_value.len(), max_refundable_fee))
+            {
                 Ok((rent, size, consumed)) => {
                     rent_fee = rent;
                     contract_events_size_bytes = size;
@@ -1200,6 +1241,69 @@ impl SorobanEnv {
 }
 
 impl SorobanEnv {
+    fn checks_declared_bytes(&self) -> bool {
+        self.enforce_declared_resources && self.enforce_declared_bytes
+    }
+
+    /// An InvokeHostFunction that core fails while loading its footprint,
+    /// before the host runs: INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED,
+    /// nothing written, `message` its diagnostic.
+    fn failed_before_host(&self, message: String) -> Result<JsValue, JsError> {
+        let out = SendResult {
+            ok: false,
+            error: Some(message),
+            return_value_xdr: None,
+            changed_keys: Vec::new(),
+            removed_keys: Vec::new(),
+            events_xdr: Vec::new(),
+            diagnostic_events_xdr: Vec::new(),
+            cpu_insns: 0,
+            mem_bytes: 0,
+            ttl_changed_keys: Vec::new(),
+            result_code: Some("invokeHostFunctionResourceLimitExceeded".to_string()),
+            rent_fee: 0,
+            contract_events_size_bytes: 0,
+            refundable_fee_consumed: 0,
+        };
+        serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
+    }
+
+    /// stellar-core InvokeHostFunctionOpFrame `recordStorageChanges`, before
+    /// anything is written: each entry the call leaves in its read-write
+    /// footprint, in the host's order, must fit the network's entry size limits
+    /// (validateContractLedgerEntry), and together they may not exceed the
+    /// declared writeBytes. TTL entries are neither; their cost is rent.
+    fn check_written_entries(
+        &self,
+        res: &soroban_env_host::e2e_invoke::InvokeHostFunctionResult,
+        resources: &SorobanResources,
+    ) -> Result<(), (&'static str, String)> {
+        const LIMIT: &str = "invokeHostFunctionResourceLimitExceeded";
+        let mut write_bytes: u32 = 0;
+        for ch in &res.ledger_changes {
+            let (false, Some(new_value)) = (ch.read_only, ch.encoded_new_value.as_ref()) else {
+                continue;
+            };
+            if let Some(fees) = self.fee_settings.as_ref() {
+                let key = LedgerKey::from_xdr(&ch.encoded_key, Limits::none()).map_err(|e| (LIMIT, format!("{e:?}")))?;
+                fees.validate_contract_ledger_entry(&key, new_value.len()).map_err(|m| (LIMIT, m))?;
+            }
+            if self.checks_declared_bytes() {
+                write_bytes = write_bytes.saturating_add(u32::try_from(new_value.len()).unwrap_or(u32::MAX));
+                if resources.write_bytes < write_bytes {
+                    return Err((
+                        LIMIT,
+                        format!(
+                            "operation byte-write resources exceeds amount specified: {write_bytes} > {}",
+                            resources.write_bytes
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// stellar-core InvokeHostFunctionOpFrame::invokeHostFunction, when the
     /// host fails: RESOURCE_LIMIT_EXCEEDED if it burned more instructions than
     /// declared or more memory than the network allows, TRAPPED otherwise.

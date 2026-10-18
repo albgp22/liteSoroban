@@ -212,9 +212,24 @@ export class Ledger {
    * Pass `false` to see that error, or to send resources whose instruction count
    * you do not control. The cap is the smaller of the declared count and the
    * `cpuLimit` given to `setCostParams`.
+   *
+   * Off, the declared bytes go unchecked too (`enforceDeclaredBytes`). The
+   * network's limits apply either way.
    */
   enforceDeclaredResources(on: boolean): void {
     this.env.enforceDeclaredResources(on);
+  }
+
+  /**
+   * Fail `send()` with INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED when it
+   * reads more classic or restored entry bytes than the transaction's
+   * `diskReadBytes`, or writes more than its `writeBytes`, as stellar-core
+   * does (InvokeHostFunctionOpFrame.cpp:368, :805). On by default. The host
+   * never checks them itself, so turn this off to replay soroban-env-host's own
+   * e2e tests, which declare 0 bytes.
+   */
+  enforceDeclaredBytes(on: boolean): void {
+    this.env.enforceDeclaredBytes(on);
   }
 
   /** Hash of the ENTIRE ledger. Equal hashes mean byte-identical state. */
