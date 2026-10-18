@@ -71,7 +71,7 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     expect(scValToNative(xdr.ScVal.fromXDR(read.returnValueXdr!, 'base64'))).toBe(42n);
   });
 
-  it('consumes the sequence number and charges the fee', async () => {
+  it('consumes the sequence number and charges what core charges, not the bid', async () => {
     const before = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
     expect(before.seqNum().toString()).toBe('0');
     const balanceBefore = BigInt(before.balance().toString());
@@ -80,12 +80,25 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const tx = build(account, invokeHostFn(addr, 'put_persistent', [sym('a'), u64(1n)]));
     const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
     assembled.sign(kp);
-    await server.sendTransaction(assembled);
+    const sent = await server.sendTransaction(assembled);
+    const got = (await server.pollTransaction(sent.hash)) as rpc.Api.GetSuccessfulTransactionResponse;
 
     const after = loadAccount(L, accountIdFromPublicKey(kp.publicKey()))!;
     expect(after.seqNum().toString()).toBe('1');
-    expect(BigInt(after.balance().toString())).toBeLessThan(balanceBefore);
-    expect(balanceBefore - BigInt(after.balance().toString())).toBe(BigInt(assembled.fee));
+    const debited = balanceBefore - BigInt(after.balance().toString());
+    // What leaves the account is what the result reports: the non-refundable
+    // resource fee, the rent and events fee the call consumed, and the
+    // 1000-stroop inclusion bid capped at the 100-stroop base fee. The rest of
+    // the declared resource fee comes back.
+    expect(debited).toBe(BigInt(got.resultXdr.feeCharged().toString()));
+    const fee = got.resultMetaXdr.v4().sorobanMeta()!.ext().v1();
+    expect(debited).toBe(
+      BigInt(fee.totalNonRefundableResourceFeeCharged().toString()) +
+        BigInt(fee.totalRefundableResourceFeeCharged().toString()) +
+        100n,
+    );
+    expect(BigInt(fee.rentFeeCharged().toString())).toBeGreaterThan(0n);
+    expect(debited).toBeLessThan(BigInt(assembled.fee) - 900n);
   });
 
   it('rejects a replayed sequence number with txBAD_SEQ', async () => {

@@ -65,11 +65,17 @@ import {
   loadArchivalSettingsFromRpc,
   type ArchivalSettings,
 } from './state-archival.js';
+import {
+  TESTNET_FEE_SETTINGS,
+  loadFeeSettingsFromRpc,
+  type NetworkFeeSettings,
+} from './fee-settings.js';
 import type { AuthProofBuilder } from './auth.js';
 
 export { XLM, PROTOCOL_27_COST_PARAMS, loadCostParamsFromRpc };
 export { TESTNET_ARCHIVAL_SETTINGS, loadArchivalSettingsFromRpc };
-export type { CostParams, ArchivalSettings };
+export { TESTNET_FEE_SETTINGS, loadFeeSettingsFromRpc };
+export type { CostParams, ArchivalSettings, NetworkFeeSettings };
 export type { Wallet, Token, AuthProofBuilder };
 
 // ---------------------------------------------------------------------------
@@ -333,6 +339,15 @@ export class LiteStellar {
    */
   withArchivalSettings(settings: ArchivalSettings): this {
     this.ledger.setArchivalSettings(settings);
+    return this;
+  }
+
+  /**
+   * Charge and quote fees with a network's own settings instead of testnet's,
+   * e.g. `await loadFeeSettingsFromRpc(server)` for a local quickstart.
+   */
+  withFeeSettings(settings: NetworkFeeSettings): this {
+    this.ledger.setFeeSettings(settings);
     return this;
   }
 

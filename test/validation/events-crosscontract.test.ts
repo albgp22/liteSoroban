@@ -519,12 +519,15 @@ describe('events through the rpc.Server facade', () => {
     const sim = L.simulate(hf, w.accountIdB64);
     expect(sim.ok, sim.error).toBe(true);
     const r = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
+    // The declared resource fee must cover the resources, or core refuses the
+    // envelope (txSOROBAN_INVALID): declare what preflight quotes.
     const tx = await buildInvoke(
       hf,
       new SorobanDataBuilder()
         .setResources(r.instructions(), r.diskReadBytes(), r.writeBytes())
         .setReadOnly(r.footprint().readOnly())
         .setReadWrite(r.footprint().readWrite())
+        .setResourceFee(sim.minResourceFee)
         .build(),
     );
     tx.sign(w.keypair);
@@ -551,6 +554,7 @@ describe('events through the rpc.Server facade', () => {
         .setResources(r.instructions(), r.diskReadBytes(), r.writeBytes())
         .setReadOnly(r.footprint().readOnly())
         .setReadWrite(r.footprint().readWrite())
+        .setResourceFee(sim.minResourceFee)
         .build(),
     );
     tx.sign(w.keypair);

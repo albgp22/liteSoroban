@@ -306,7 +306,15 @@ describe('the full app-shaped flow', () => {
     expect(ok.feeBump).toBe(false);
     expect(ok.applicationOrder).toBe(1);
     expect(ok.resultXdr.result().switch().name).toBe('txSuccess');
-    expect(ok.resultXdr.feeCharged().toBigInt()).toBe(BigInt(assembled.fee));
+    // Charged as core charges: the resource fee it consumed plus the base
+    // fee, not the bid (the meta carries the split).
+    const fees = ok.resultMetaXdr.v4().sorobanMeta()!.ext().v1();
+    expect(ok.resultXdr.feeCharged().toBigInt()).toBe(
+      fees.totalNonRefundableResourceFeeCharged().toBigInt() +
+        fees.totalRefundableResourceFeeCharged().toBigInt() +
+        100n,
+    );
+    expect(ok.resultXdr.feeCharged().toBigInt()).toBeLessThan(BigInt(assembled.fee));
     expect(ok.envelopeXdr.v1().tx().seqNum().toString()).toBe('1');
     expect(ok.resultMetaXdr.switch()).toBe(4);
     // put_persistent returns void, and that is what the meta must say.
@@ -314,7 +322,7 @@ describe('the full app-shaped flow', () => {
 
     // 9. the ledger really moved
     expect(w.sequence()).toBe(1n);
-    expect(w.balance()).toBe(balanceBefore - BigInt(assembled.fee));
+    expect(w.balance()).toBe(balanceBefore - ok.resultXdr.feeCharged().toBigInt());
 
     // 10. read it back through the same flow: the value the contract returns
     //     must be the value the first transaction wrote.

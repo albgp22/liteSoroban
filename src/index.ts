@@ -11,6 +11,7 @@ import { xdr, Networks, hash as sha256 } from '@stellar/stellar-sdk';
 import { applyTransaction, fundAccount as classicFundAccount } from './classic.js';
 import type { TxOutcome, FundOptions } from './classic.js';
 import type { ArchivalSettings } from './state-archival.js';
+import { TESTNET_FEE_SETTINGS, type NetworkFeeSettings } from './fee-settings.js';
 
 const require = createRequire(import.meta.url);
 // wasm-pack --target nodejs emits CommonJS.
@@ -24,6 +25,8 @@ export interface FootprintSimulation {
   error?: string;
   /** `SorobanResources` XDR, when ok. */
   resourcesXdr?: string;
+  /** stellar-rpc's `minResourceFee` for those resources, when ok. */
+  minResourceFee?: number;
 }
 
 export interface SimulateResult {
@@ -45,6 +48,12 @@ export interface SimulateResult {
   diagnosticEventsXdr: string[];
   /** Instruction count padded the way stellar-rpc pads it; this is in resourcesXdr. */
   adjustedInstructions: number;
+  /**
+   * stellar-rpc's `minResourceFee` for this invocation (soroban-simulation's
+   * preflight under its default adjustments, priced with the installed fee
+   * settings). 0 when the call failed.
+   */
+  minResourceFee: number;
 }
 
 export interface SendResult {
@@ -59,6 +68,28 @@ export interface SendResult {
   memBytes: bigint;
   /** Entries that only had their TTL bumped — invisible in changedKeys. */
   ttlChangedKeys: string[];
+  /**
+   * For a failed call, the InvokeHostFunctionResult arm stellar-core would
+   * report: 'invokeHostFunctionTrapped', '...ResourceLimitExceeded' or
+   * '...InsufficientRefundableFee'.
+   */
+  resultCode?: string;
+  /** On success: the rent the call's ledger changes cost, in stroops. */
+  rentFee: number;
+  /** On success: contract events plus return value, in XDR bytes. */
+  contractEventsSizeBytes: number;
+  /** On success: rent plus the events fee, the refundable fee it consumed. */
+  refundableFeeConsumed: number;
+}
+
+/** One entry's TTL change, for `Ledger.computeRentFee`. */
+export interface RentChange {
+  keyB64: string;
+  /** `Ledger.entrySizeForRent` of the entry. */
+  size: number;
+  /** Its TTL before; 0 for an entry coming back from the archive. */
+  oldLiveUntil: number;
+  newLiveUntil: number;
 }
 
 export class Ledger {
@@ -67,7 +98,13 @@ export class Ledger {
   readonly networkPassphrase: string;
 
   constructor(
-    opts: { protocolVersion?: number; ledgerSeq?: number; networkPassphrase?: string } = {},
+    opts: {
+      protocolVersion?: number;
+      ledgerSeq?: number;
+      networkPassphrase?: string;
+      /** Defaults to testnet's; see src/fee-settings.ts. */
+      feeSettings?: NetworkFeeSettings;
+    } = {},
   ) {
     this.networkPassphrase = opts.networkPassphrase ?? Networks.TESTNET;
     const want = opts.protocolVersion ?? HOST_PROTOCOL;
@@ -82,6 +119,62 @@ export class Ledger {
     // Keep the host's network id in step with the passphrase, or every
     // custom-account __check_auth will reject a correctly signed payload.
     this.env.setNetworkId(sha256(this.networkPassphrase));
+    this.setFeeSettings(opts.feeSettings ?? TESTNET_FEE_SETTINGS);
+  }
+
+  private fees!: NetworkFeeSettings;
+
+  /**
+   * Install a network's fee settings (`loadFeeSettingsFromRpc` reads a live
+   * one). Transactions are charged, and simulations quoted, with them.
+   */
+  setFeeSettings(settings: NetworkFeeSettings): void {
+    this.env.setFeeSettings(settings);
+    this.fees = { ...settings };
+  }
+
+  get feeSettings(): NetworkFeeSettings {
+    return { ...this.fees };
+  }
+
+  /** The rent rate per KB the installed settings imply at their state size. */
+  get feePerRent1kb(): bigint {
+    return BigInt(this.env.feePerRent1kb);
+  }
+
+  /**
+   * stellar-core's `computeSorobanResourceFee` for a transaction's declared
+   * resources: what it costs up front (`nonRefundable`) and its events fee
+   * (`refundable`). `txSize` is the XDR size of the (inner) envelope.
+   */
+  computeResourceFee(
+    sorobanData: xdr.SorobanTransactionData,
+    txSize: number,
+    eventsSize = 0,
+    isRestore = false,
+  ): { nonRefundable: bigint; refundable: bigint } {
+    const [nonRefundable, refundable] = this.env.computeResourceFee(
+      sorobanData.toXDR('base64'),
+      txSize,
+      eventsSize,
+      isRestore,
+    );
+    return { nonRefundable, refundable };
+  }
+
+  /** stellar-core's `ledgerEntrySizeForRent` of a stored entry, or undefined. */
+  entrySizeForRent(keyB64: string): number | undefined {
+    return this.env.entrySizeForRent(keyB64);
+  }
+
+  /** soroban-env-host's `compute_rent_fee` at the current ledger. */
+  computeRentFee(changes: RentChange[]): bigint {
+    return this.env.computeRentFee(
+      changes.map((c) => c.keyB64),
+      Uint32Array.from(changes.map((c) => c.size)),
+      Uint32Array.from(changes.map((c) => c.oldLiveUntil)),
+      Uint32Array.from(changes.map((c) => c.newLiveUntil)),
+    );
   }
 
   get protocolVersion(): number {
@@ -250,13 +343,18 @@ export class Ledger {
     return this.env.simulateWithAuth(hostFn.toXDR('base64'), sourceB64, authB64, instructionLeeway, ledgerSeq);
   }
 
-  /** Requirement 1. */
+  /**
+   * Requirement 1. With `maxRefundableFee` (the declared resource fee minus
+   * its non-refundable part) a call whose rent and events cost more fails with
+   * INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE and changes nothing.
+   */
   send(
     hostFn: xdr.HostFunction,
     sourceB64: string,
     resourcesB64: string,
     authB64: string[],
     restored: number[] = [],
+    maxRefundableFee?: bigint,
   ): SendResult {
     return this.env.send(
       hostFn.toXDR('base64'),
@@ -264,6 +362,7 @@ export class Ledger {
       resourcesB64,
       authB64,
       Uint32Array.from(restored),
+      maxRefundableFee,
     );
   }
 

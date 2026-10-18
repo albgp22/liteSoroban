@@ -787,9 +787,13 @@ describe('round-2 layer gaps, each pinned against a live stellar-core v27.1.0', 
       const b = Keypair.random();
       L.fund(a.publicKey());
       L.fund(b.publicKey());
+      // From the same state: the first put_persistent of 'k' pays rent for a
+      // new entry, a second one would overwrite it for free.
+      const snap = L.snapshot();
       const cheap = L.sendTransaction(
         signed(rawTx(spec(a, { fee: RESOURCE_FEE + 100n })), [a]),
       );
+      L.restore(snap);
       const rich = L.sendTransaction(
         signed(rawTx(spec(b, { fee: RESOURCE_FEE + 1_000_000n })), [b]),
       );

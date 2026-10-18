@@ -60,13 +60,28 @@ export interface TxOutcome {
   removedKeys?: string[];
   /**
    * TransactionResult.feeCharged, as core reports it. For an applied
-   * transaction it is what was debited. For a `rejected` one NOTHING was
-   * debited: core seeds the result with getFee(header, baseFee, applying =
-   * false) = declared resource fee + baseFee * max(1, ops), or 0 when it
-   * rejected the XDR before seeding (createTxError), or the fee it would need
-   * for a fee bump that does not raise the rate.
+   * transaction it is what was debited, net of the refund: the non-refundable
+   * resource fee, the rent and events fee the operation consumed (nothing if
+   * it failed), and the inclusion fee capped at baseFee per operation. For a
+   * `rejected` one NOTHING was debited: core seeds the result with
+   * getFee(header, baseFee, applying = false) = declared resource fee +
+   * baseFee * max(1, ops), or 0 when it rejected the XDR before seeding
+   * (createTxError), or the fee it would need for a fee bump that does not
+   * raise the rate.
    */
   feeCharged: bigint;
+  /**
+   * For an applied transaction while fees are charged, the Soroban part of
+   * feeCharged as core records it in SorobanTransactionMeta ext v1
+   * (totalNonRefundableResourceFeeCharged, totalRefundableResourceFeeCharged,
+   * rentFeeCharged). `refundable` includes `rent`.
+   */
+  sorobanFee?: { nonRefundable: bigint; refundable: bigint; rent: bigint };
+  /** Why an InvokeHostFunction operation failed, as its result arm. */
+  invokeResult?:
+    | 'invokeHostFunctionTrapped'
+    | 'invokeHostFunctionResourceLimitExceeded'
+    | 'invokeHostFunctionInsufficientRefundableFee';
   /** Populated for fee bumps. */
   innerCode?: TxResultCode;
   error?: string;
@@ -84,8 +99,10 @@ export interface TxOutcome {
   footprintOpResult?:
     | 'extendFootprintTtlSuccess'
     | 'extendFootprintTtlMalformed'
+    | 'extendFootprintTtlInsufficientRefundableFee'
     | 'restoreFootprintSuccess'
-    | 'restoreFootprintMalformed';
+    | 'restoreFootprintMalformed'
+    | 'restoreFootprintInsufficientRefundableFee';
 }
 
 // ---------------------------------------------------------------------------
@@ -517,13 +534,6 @@ function xdrProvidesValidFee(raw: xdr.Transaction): string | null {
 }
 
 /**
- * Validate and apply a transaction envelope, exactly as an app would submit it.
- *
- * Fee handling note: stellar-core charges the full bid up front and refunds the
- * unused refundable resource fee after execution. Refunds are NOT modelled here;
- * the full `tx.fee` is debited, which is conservative.
- */
-/**
  * Switches that turn OFF parts of classic validation, in the spirit of
  * LiteSVM's `withSigverify(false)`. A test about contract logic should not have
  * to satisfy the transaction envelope rules it is not testing.
@@ -533,7 +543,11 @@ export interface ValidationOptions {
   sigverify?: boolean;
   /** Enforce strict seqNum + 1, or the range a PRECOND_V2 minSeqNum allows. Default true. */
   sequenceCheck?: boolean;
-  /** Debit fees from the source account. Default true. */
+  /**
+   * Charge fees. Default true. Off, nothing is debited and nothing about the
+   * resource fee is checked: neither its declared value against the
+   * resources' cost, nor whether it covers the rent and events.
+   */
   feeCharging?: boolean;
   /**
    * Enforce the preconditions that read the ledger clock: time bounds, and
@@ -542,6 +556,14 @@ export interface ValidationOptions {
   timebounds?: boolean;
 }
 
+/**
+ * Validate and apply a transaction envelope, exactly as an app would submit it.
+ *
+ * Fees as stellar-core v29.0.0 charges them: getFee(applying = true) up front
+ * (the declared resource fee plus the inclusion fee capped at baseFee per
+ * operation), then a refund of the refundable resource fee the operation did
+ * not consume on rent and events, all of it if the operation failed.
+ */
 export function applyTransaction(
   ledger: Ledger,
   envelopeB64: string,
@@ -573,10 +595,55 @@ function applyEnvelope(
   const raw = envelope.v1().tx();
   const badFee = xdrProvidesValidFee(raw);
   if (badFee) return malformed(badFee);
+  const queueFee = negativeInclusionFee(BigInt(raw.fee().toString()), declaredResourceFee(raw));
+  if (queueFee) return malformed(queueFee);
 
   // -- fee source is the tx source for a plain v1 envelope
-  const feeSourceId = muxedToAccountId(raw.sourceAccount());
-  return applyInner(ledger, tx, raw, feeSourceId, passphrase, false, validation);
+  const charge =
+    validation.feeCharging !== false
+      ? {
+          payer: muxedToAccountId(raw.sourceAccount()),
+          upfront: feeToCharge(BigInt(raw.fee().toString()), declaredResourceFee(raw), raw.operations().length),
+        }
+      : null;
+  return applyInner(ledger, tx, raw, passphrase, false, validation, envelope.toXDR().length, charge);
+}
+
+const declaredResourceFee = (raw: xdr.Transaction): bigint =>
+  raw.ext().switch() === 1 ? BigInt(raw.ext().sorobanData().resourceFee().toString()) : 0n;
+
+/**
+ * TransactionQueue::canAdd (stellar-core v29.0.0 herder/TransactionQueue.cpp
+ * :347-352), which a submission meets before checkValid: a negative full or
+ * inclusion fee is txMALFORMED with nothing seeded. So a resource fee above the
+ * full fee never reaches commonValidPreSeqNum's txSOROBAN_INVALID; a local
+ * protocol-29 node answers txMALFORMED, feeCharged 0.
+ */
+function negativeInclusionFee(fullFee: bigint, resourceFee: bigint): string | null {
+  if (fullFee < 0n || fullFee - resourceFee < 0n) {
+    return `inclusion fee ${fullFee - resourceFee} is negative: resource fee ${resourceFee} exceeds the full fee ${fullFee}`;
+  }
+  return null;
+}
+
+/**
+ * getFee(header, baseFee, applying = true), stellar-core v29.0.0
+ * TransactionFrame.cpp:417 and FeeBumpTransactionFrame.cpp:592: the declared
+ * resource fee plus the inclusion fee, capped at baseFee * max(1, operations),
+ * where a fee bump counts innerOps + 1. The inclusion fee is a bid; a ledger
+ * that is not surge pricing charges its base fee. This is what leaves the fee
+ * source before the operation runs (processFeeSeqNum).
+ */
+function feeToCharge(fullFee: bigint, resourceFee: bigint, operations: number): bigint {
+  const inclusionFee = fullFee - resourceFee;
+  const cap = BigInt(BASE_FEE) * BigInt(Math.max(1, operations));
+  return resourceFee + (inclusionFee < cap ? inclusionFee : cap);
+}
+
+/** Who pays, and getFee(applying = true) of what they pay for. */
+interface FeeCharge {
+  payer: xdr.AccountId;
+  upfront: bigint;
 }
 
 /**
@@ -623,6 +690,8 @@ function applyFeeBump(
   const innerOps = BigInt(innerRaw.operations().length);
   const minInclusion = (ops: bigint) => BigInt(BASE_FEE) * (ops > 1n ? ops : 1n);
   const inclusionFee = totalFee - resourceFee;
+  const queueFee = negativeInclusionFee(totalFee, resourceFee);
+  if (queueFee) return malformed(queueFee);
   if (inclusionFee < minInclusion(innerOps + 1n)) {
     return fail(
       'txINSUFFICIENT_FEE',
@@ -669,7 +738,14 @@ function applyFeeBump(
 
   // The inner transaction is validated without charging its own fee. If it is
   // rejected, the whole fee bump is rejected at submission: nobody pays.
-  const inner = applyInner(ledger, innerTx, innerRaw, feeSourceId, passphrase, true, validation);
+  // Applied, the fee source pays getFee(applying = true) of the BUMP and gets
+  // the refund (FeeBumpTransactionFrame::processPostTxSetApply forwards it).
+  // The resource fee is priced on the INNER envelope's size: core computes it
+  // on the inner TransactionFrame.
+  const charge = charging
+    ? { payer: feeSourceId, upfront: feeToCharge(totalFee, resourceFee, Number(innerOps) + 1) }
+    : null;
+  const inner = applyInner(ledger, innerTx, innerRaw, passphrase, true, validation, innerEnvelope.toXDR().length, charge);
   if (inner.rejected) {
     return {
       ...inner,
@@ -679,13 +755,10 @@ function applyFeeBump(
     };
   }
 
-  if (charging) debit(ledger, feeSourceId, totalFee);
-
   return {
     ...inner,
     code: inner.ok ? 'txFEE_BUMP_INNER_SUCCESS' : 'txFEE_BUMP_INNER_FAILED',
     innerCode: inner.code,
-    feeCharged: charging ? totalFee : 0n,
   };
 }
 
@@ -693,10 +766,11 @@ function applyInner(
   ledger: Ledger,
   tx: Transaction,
   raw: xdr.Transaction,
-  feeSourceId: xdr.AccountId,
   passphrase: string,
   feeBumped: boolean,
   validation: ValidationOptions,
+  txSize: number,
+  charge: FeeCharge | null,
 ): TxOutcome {
   const ops = raw.operations();
 
@@ -737,9 +811,33 @@ function applyInner(
     }
   }
 
+  // -- the declared resource fee against what the resources cost ------------
+  // commonValidPreSeqNum (TransactionFrame.cpp:1386-1410), right after the
+  // memo check and for a fee-bumped inner transaction too: the resource fee
+  // has to cover computeSorobanResourceFee of the DECLARED resources, priced
+  // on this envelope's size, with no events yet. The non-refundable part is
+  // charged whatever happens; the rest is the most rent and events may cost.
+  const sorobanData = raw.ext().switch() === 1 ? raw.ext().sorobanData() : null;
+  if (!sorobanData) return fail('txSOROBAN_INVALID', 'missing SorobanTransactionData');
+  const resourceFee = BigInt(sorobanData.resourceFee().toString());
+  let nonRefundable = 0n;
+  if (charge) {
+    const actual = ledger.computeResourceFee(sorobanData, txSize, 0, opType === 'restoreFootprint');
+    nonRefundable = actual.nonRefundable;
+    if (resourceFee < actual.nonRefundable + actual.refundable) {
+      return fail(
+        'txSOROBAN_INVALID',
+        'transaction `sorobanData.resourceFee` is lower than the actual Soroban resource fee: ' +
+          `${resourceFee} < ${actual.nonRefundable + actual.refundable}`,
+      );
+    }
+  }
+  const maxRefundable = resourceFee - nonRefundable;
+
   // -- time and ledger bounds (isTooEarly, isTooLate) ----------------------
-  // Still commonValidPreSeqNum: before the source account is even loaded, so
-  // an expired envelope is txTOO_LATE whatever its sequence number.
+  // Still commonValidPreSeqNum, right after the Soroban checks above and
+  // before the source account is even loaded, so an expired envelope is
+  // txTOO_LATE whatever its sequence number.
   if (validation.timebounds !== false) {
     const bounds = boundsProblem(ledger, raw);
     if (bounds) return fail(bounds.code, bounds.detail);
@@ -809,9 +907,6 @@ function applyInner(
 
   // -- fees ----------------------------------------------------------------
   const totalFee = BigInt(raw.fee().toString());
-  const sorobanData = raw.ext().switch() === 1 ? raw.ext().sorobanData() : null;
-  if (!sorobanData) return fail('txSOROBAN_INVALID', 'missing SorobanTransactionData');
-  const resourceFee = BigInt(sorobanData.resourceFee().toString());
   const inclusionFee = totalFee - resourceFee;
 
   // From protocol 23 a fee-bumped inner tx may carry an insufficient full fee
@@ -820,9 +915,9 @@ function applyInner(
     return fail('txINSUFFICIENT_FEE', `inclusion fee ${inclusionFee} below ${BASE_FEE}`);
   }
 
-  const payer = feeBumped || validation.feeCharging === false ? null : sourceId;
-  if (payer) {
-    const payerAccount = loadAccount(ledger, payer)!;
+  // A fee bump checked its own fee source's balance.
+  if (charge && !feeBumped) {
+    const payerAccount = loadAccount(ledger, charge.payer)!;
     if (availableBalance(payerAccount) < totalFee) {
       return fail('txINSUFFICIENT_BALANCE', 'source cannot cover the fee');
     }
@@ -869,30 +964,62 @@ function applyInner(
   if (validation.sequenceCheck !== false) bumpSequence(ledger, sourceId, txSeq);
   else bumpSequence(ledger, sourceId, currentSeq + 1n);
 
-  if (payer) debit(ledger, payer, totalFee);
+  if (charge) debit(ledger, charge.payer, charge.upfront);
+
+  // After the operation, the fee source gets back the refundable fee it did
+  // not consume (TransactionFrame::refundSorobanFee). A failed operation
+  // consumes none: any error resets the RefundableFeeTracker
+  // (MutableTransactionResult.cpp, setError -> resetConsumedFee).
+  const settle = (
+    outcome: Omit<TxOutcome, 'feeCharged'>,
+    consumed: { refundable: bigint; rent: bigint } = { refundable: 0n, rent: 0n },
+  ): TxOutcome => {
+    if (!charge) return { ...outcome, feeCharged: 0n };
+    const refund = maxRefundable - consumed.refundable;
+    if (refund > 0n) debit(ledger, charge.payer, -refund);
+    return {
+      ...outcome,
+      feeCharged: charge.upfront - refund,
+      sorobanFee: { nonRefundable, refundable: consumed.refundable, rent: consumed.rent },
+    };
+  };
+  const refundableCap = charge ? maxRefundable : undefined;
 
   if (!opAccount) {
-    return {
+    return settle({
       code: 'txFAILED',
       ok: false,
       opCode: 'opNO_ACCOUNT',
-      feeCharged: feeBumped ? 0n : totalFee,
       detail: 'operation source account does not exist (opNO_ACCOUNT)',
-    };
+    });
   }
 
   if (opType === 'extendFootprintTtl' || opType === 'restoreFootprint') {
-    const changed =
-      opType === 'extendFootprintTtl'
-        ? applyExtendFootprintTtl(ledger, ops[0].body().extendFootprintTtlOp().extendTo(), sorobanData)
-        : applyRestoreFootprint(ledger, sorobanData);
-    return {
-      code: 'txSUCCESS',
-      ok: true,
-      feeCharged: feeBumped ? 0n : totalFee,
-      footprintOpResult: opType === 'extendFootprintTtl' ? 'extendFootprintTtlSuccess' : 'restoreFootprintSuccess',
-      changedKeys: changed,
-    };
+    const extend = opType === 'extendFootprintTtl';
+    const applied = extend
+      ? applyExtendFootprintTtl(ledger, ops[0].body().extendFootprintTtlOp().extendTo(), sorobanData, refundableCap)
+      : applyRestoreFootprint(ledger, sorobanData, refundableCap);
+    if (applied.short) {
+      return settle({
+        code: 'txFAILED',
+        ok: false,
+        footprintOpResult: extend
+          ? 'extendFootprintTtlInsufficientRefundableFee'
+          : 'restoreFootprintInsufficientRefundableFee',
+        detail: applied.short,
+      });
+    }
+    // consumeRefundableSorobanResources(0, rentFee): no events, so the
+    // refundable fee consumed is the rent alone.
+    return settle(
+      {
+        code: 'txSUCCESS',
+        ok: true,
+        footprintOpResult: extend ? 'extendFootprintTtlSuccess' : 'restoreFootprintSuccess',
+        changedKeys: applied.changed,
+      },
+      { refundable: applied.rent, rent: applied.rent },
+    );
   }
 
   const hostFn = ops[0].body().invokeHostFunctionOp().hostFunction();
@@ -905,18 +1032,22 @@ function applyInner(
     resources.toXDR('base64'),
     auth.map((a) => a.toXDR('base64')),
     [],
+    refundableCap,
   );
 
-  return {
-    code: sent.ok ? 'txSUCCESS' : 'txFAILED',
-    ok: sent.ok,
-    returnValueXdr: sent.returnValueXdr,
-    eventsXdr: sent.eventsXdr,
-    changedKeys: sent.changedKeys,
-    removedKeys: sent.removedKeys,
-    feeCharged: feeBumped ? 0n : totalFee,
-    error: sent.error,
-  };
+  return settle(
+    {
+      code: sent.ok ? 'txSUCCESS' : 'txFAILED',
+      ok: sent.ok,
+      returnValueXdr: sent.returnValueXdr,
+      eventsXdr: sent.eventsXdr,
+      changedKeys: sent.changedKeys,
+      removedKeys: sent.removedKeys,
+      invokeResult: sent.ok ? undefined : (sent.resultCode as TxOutcome['invokeResult']),
+      error: sent.error,
+    },
+    sent.ok ? { refundable: BigInt(sent.refundableFeeConsumed), rent: BigInt(sent.rentFee) } : undefined,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -967,54 +1098,99 @@ function footprintOpMalformed(
   return null;
 }
 
+/** What an ExtendFootprintTTL / RestoreFootprint did, or why it did nothing. */
+interface FootprintOpApplied {
+  changed: string[];
+  /** compute_rent_fee over the TTLs it moved. */
+  rent: bigint;
+  /** Set when the refundable fee could not cover `rent`: nothing was written. */
+  short?: string;
+}
+
+/**
+ * Price the TTL moves, then make them only if the refundable fee covers the
+ * rent (RefundableFeeTracker::consumeRefundableSorobanResources(0, rentFee));
+ * otherwise the operation fails and the ledger is untouched. `maxRefundable`
+ * undefined means fees are not being charged.
+ */
+function moveTtls(
+  ledger: Ledger,
+  moves: { k: string; entry: string; oldLiveUntil: number; newLiveUntil: number }[],
+  maxRefundable: bigint | undefined,
+): FootprintOpApplied {
+  const rent = ledger.computeRentFee(
+    moves.map((m) => ({
+      keyB64: m.k,
+      size: ledger.entrySizeForRent(m.k)!,
+      oldLiveUntil: m.oldLiveUntil,
+      newLiveUntil: m.newLiveUntil,
+    })),
+  );
+  if (maxRefundable !== undefined && maxRefundable < rent) {
+    return {
+      changed: [],
+      rent: 0n,
+      short: `refundable resource fee was not sufficient to cover the ledger storage rent: ${rent} > ${maxRefundable}`,
+    };
+  }
+  for (const m of moves) ledger.putEntry(m.entry, m.newLiveUntil);
+  return { changed: moves.map((m) => m.k), rent };
+}
+
 /**
  * ExtendFootprintTTLOpFrame apply (protocol 23+): each live read-only entry
  * whose TTL ends before ledger + extendTo is raised to exactly that; missing,
  * archived and already-long-enough entries are skipped (an archived one must be
- * restored). Returns the keys whose TTL moved.
+ * restored). Each one moved is charged rent for the added ledgers at its rent
+ * size (createEntryRentChangeWithoutModification), out of the refundable fee:
+ * EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE when it falls short.
  *
- * NOT modelled: the rent fee charged against the refundable resource fee
- * (EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE) and the network's entry
- * size limits (RESOURCE_LIMIT_EXCEEDED).
+ * NOT modelled: the network's entry size limits (RESOURCE_LIMIT_EXCEEDED).
  */
 function applyExtendFootprintTtl(
   ledger: Ledger,
   extendTo: number,
   sorobanData: xdr.SorobanTransactionData,
-): string[] {
+  maxRefundable: bigint | undefined,
+): FootprintOpApplied {
   const newLiveUntil = ledger.ledgerSeq + extendTo;
-  const changed: string[] = [];
+  const moves = [];
   for (const key of sorobanData.resources().footprint().readOnly()) {
     const k = key.toXDR('base64');
     const entry = ledger.getEntry(k);
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined || ttl < ledger.ledgerSeq) continue; // missing, or not live
     if (ttl >= newLiveUntil) continue;
-    ledger.putEntry(entry, newLiveUntil);
-    changed.push(k);
+    moves.push({ k, entry, oldLiveUntil: ttl, newLiveUntil });
   }
-  return changed;
+  return moveTtls(ledger, moves, maxRefundable);
 }
 
 /**
  * RestoreFootprintOpFrame apply: each archived read-write entry gets TTL
  * ledger + minPersistentTTL - 1 ("including the current ledger"); live and
- * missing ones are skipped. Same rent / size caveat as extend. There is no hot
- * archive here: an archived persistent entry stays in the store, expired.
+ * missing ones are skipped. Rent is charged as for a new entry of that size
+ * (old size and TTL 0), out of the refundable fee:
+ * RESTORE_FOOTPRINT_INSUFFICIENT_REFUNDABLE_FEE when it falls short. Not
+ * modelled: the read/write byte and entry size limits. There is no hot archive
+ * here: an archived persistent entry stays in the store, expired.
  */
-function applyRestoreFootprint(ledger: Ledger, sorobanData: xdr.SorobanTransactionData): string[] {
+function applyRestoreFootprint(
+  ledger: Ledger,
+  sorobanData: xdr.SorobanTransactionData,
+  maxRefundable: bigint | undefined,
+): FootprintOpApplied {
   const restoredLiveUntil = ledger.ledgerSeq + ledger.archivalSettings.minPersistentTtl - 1;
-  const changed: string[] = [];
+  const moves = [];
   for (const key of sorobanData.resources().footprint().readWrite()) {
     const k = key.toXDR('base64');
     const entry = ledger.getEntry(k);
     const ttl = ledger.getEntryTtl(k);
     if (!entry || ttl === undefined) continue;
     if (ttl >= ledger.ledgerSeq) continue; // live
-    ledger.putEntry(entry, restoredLiveUntil);
-    changed.push(k);
+    moves.push({ k, entry, oldLiveUntil: 0, newLiveUntil: restoredLiveUntil });
   }
-  return changed;
+  return moveTtls(ledger, moves, maxRefundable);
 }
 
 /**

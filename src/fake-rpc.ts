@@ -85,7 +85,7 @@ function operationResults(outcome: TxOutcome): xdr.OperationResult[] {
     : Buffer.alloc(32);
   const inner = outcome.ok
     ? xdr.InvokeHostFunctionResult.invokeHostFunctionSuccess(returned)
-    : xdr.InvokeHostFunctionResult.invokeHostFunctionTrapped();
+    : (xdr.InvokeHostFunctionResult as any)[outcome.invokeResult ?? 'invokeHostFunctionTrapped']();
   return [xdr.OperationResult.opInner(xdr.OperationResultTr.invokeHostFunction(inner))];
 }
 
@@ -131,8 +131,22 @@ function transactionMeta(outcome: TxOutcome): xdr.TransactionMeta {
   const returnValue = outcome.returnValueXdr
     ? xdr.ScVal.fromXDR(outcome.returnValueXdr, 'base64')
     : xdr.ScVal.scvVoid();
+  // Core's fee breakdown (TransactionMetaBuilder::setNonRefundableResourceFee
+  // and maybeSetRefundableFeeMeta), which is where an app reads what the
+  // resources and the rent cost.
+  const fee = outcome.sorobanFee;
   const sorobanMeta = new xdr.SorobanTransactionMetaV2({
-    ext: new xdr.SorobanTransactionMetaExt(0),
+    ext: fee
+      ? new xdr.SorobanTransactionMetaExt(
+          1,
+          new xdr.SorobanTransactionMetaExtV1({
+            ext: new xdr.ExtensionPoint(0),
+            totalNonRefundableResourceFeeCharged: new xdr.Int64(fee.nonRefundable),
+            totalRefundableResourceFeeCharged: new xdr.Int64(fee.refundable),
+            rentFeeCharged: new xdr.Int64(fee.rent),
+          }),
+        )
+      : new xdr.SorobanTransactionMetaExt(0),
     returnValue,
   });
   return new xdr.TransactionMeta(
@@ -551,8 +565,7 @@ export function attachInProcessRpc(
               : ledger.simulateRestore(keys, lastClosed());
           if (!footprintSim.ok) return ok({ error: footprintSim.error, latestLedger: lastClosed() });
           const resources = xdr.SorobanResources.fromXDR(footprintSim.resourcesXdr!, 'base64');
-          // As crude as the invoke path's below: real fees need the network's rent config.
-          const fee = String(100_000 + resources.writeBytes() * 100);
+          const fee = String(footprintSim.minResourceFee);
           const txData = new xdr.SorobanTransactionData({
             ext: new (xdr as any).SorobanTransactionDataExt(0),
             resources,
@@ -611,18 +624,18 @@ export function attachInProcessRpc(
         }
 
         const resources = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');
-        // A crude resource fee. Real fee parity needs soroban-simulation's
-        // NetworkConfig; this is enough to exercise the assembly path.
-        const resourceFee = 100_000 + sim.instructions / 10 + sim.writeBytes * 100;
+        // soroban-simulation's own fee for these resources, priced with the
+        // ledger's fee settings (see Ledger.setFeeSettings).
+        const resourceFee = String(sim.minResourceFee);
         const txData = new xdr.SorobanTransactionData({
           ext: new (xdr as any).SorobanTransactionDataExt(0),
           resources,
-          resourceFee: (xdr as any).Int64.fromString(String(Math.ceil(resourceFee))),
+          resourceFee: (xdr as any).Int64.fromString(resourceFee),
         });
 
         return ok({
           latestLedger: lastClosed(),
-          minResourceFee: String(Math.ceil(resourceFee)),
+          minResourceFee: resourceFee,
           transactionData: txData.toXDR('base64'),
           // The RPC contract for this field is DiagnosticEvent, not
           // ContractEvent — the SDK does DiagnosticEvent.fromXDR here, and a

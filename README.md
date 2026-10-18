@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 236 tests, ~800 ms
+npm test               # 246 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -106,11 +106,20 @@ recorded auth entries. Disk/write bytes match on five of six.
 - **Footprints** — recorded *and* enforced; stripping a footprint fails.
 - **Error codes** — nine `HostError` variants reachable and distinguishable.
 - **Isolation** — a fresh environment costs 3 µs; `snapshot()`/`restore()` is free.
+- **Fees** — debited as stellar-core debits them: the declared resource fee plus
+  the inclusion fee capped at the base fee, less the refund of whatever rent and
+  events did not consume (all of it when the operation fails). `minResourceFee`
+  is soroban-simulation's. Given a local protocol-29 node's fee settings, the
+  debit, `feeCharged`, `minResourceFee` and meta fee split matched that node to
+  the stroop for invocations (overbid or not), a fee bump, a failed call, and
+  `ExtendFootprintTTL` with and short of rent (`test/fees.test.ts`). The rent of
+  a NEW entry (writes, uploads, deploys) matches only where the minimum TTLs
+  are the node's, which the host's are not yet (see "Known gaps"). The default
+  fee settings are testnet's.
 
 ## What it is not good for
 
-- Fee and rent assertions (`minResourceFee` is synthetic), and instruction or memory
-  counts for anything beyond the scenarios measured above.
+- Instruction or memory counts for anything beyond the scenarios measured above.
 - Explicit `RestoreFootprint` / `ExtendFootprintTTL` operations, which are validated
   but not dispatched (see "Known gaps"). Auto-restore *inside* an invocation works,
   and the applied count matches the recorded one to within 1%.
@@ -136,7 +145,7 @@ Both SDK entry points work unchanged: `rpc.Server` (simulate →
 new LiteStellar()
   .withSigverify(false)      // don't verify envelope signatures
   .withSequenceCheck(false)  // don't enforce seqNum + 1 (or minSeqNum's range)
-  .withFeeCharging(false)    // don't debit fees
+  .withFeeCharging(false)    // don't charge fees or check the resource fee
   .withTimebounds(false)     // don't enforce time/ledger bounds, minSeqAge, minSeqLedgerGap
   .withoutClassicChecks();   // all of the above
 ```
@@ -180,22 +189,30 @@ table since 28.0.0, see above) and the enforcing path's missing module cache (se
 **Classic layer** — signatures (every signer type, consumption, `txBAD_AUTH_EXTRA`,
 operation thresholds, `extraSigners`), PRECOND_V2 preconditions (time and ledger
 bounds, `minSeqNum`, `minSeqAge`, `minSeqLedgerGap`, `extraSigners` validity, in
-core's check order), fee-bump fee rules, and the `AccountEntry` extension chain
-(promoted on a sequence bump; seen promoted by simulation, as stellar-rpc's
-preflight does), and `ExtendFootprintTTL` / `RestoreFootprint` (validated, applied
-and simulated) follow stellar-core and soroban-simulation and were checked
-scenario by scenario against a local protocol-29 node
+core's check order), fee-bump fee rules, fees as core charges them (inclusion
+fee capped at the base fee, refund of the unused refundable fee, rent, and the
+resource-fee and `*_INSUFFICIENT_REFUNDABLE_FEE` checks), the `AccountEntry`
+extension chain (promoted on a sequence bump; seen promoted by simulation, as
+stellar-rpc's preflight does), and `ExtendFootprintTTL` / `RestoreFootprint`
+(validated, applied and simulated) follow stellar-core and soroban-simulation and
+were checked scenario by scenario against a local protocol-29 node
 (`test/classic-validation.test.ts`, `test/preconditions.test.ts`,
-`test/footprint-ops.test.ts`). Still missing:
+`test/footprint-ops.test.ts`, `test/fees.test.ts`). Still missing:
 - `maxTime` is checked against the harness clock as it stands. A node checks it
   against the last close time plus twice its expected ledger close time plus the
   time since that close (`getUpperBoundCloseTimeOffset`), so an envelope a few
   seconds from expiry is txTOO_LATE there and accepted here: on the local node
   `maxTime = close time + 1` was txTOO_LATE, `+ 30` was accepted. Same for
   PRECOND_TIME.
-- The fee taken is the full bid: no inclusion-fee discount, no refund of the
-  unused refundable resource fee, and Extend/Restore charge no rent, so
-  `INSUFFICIENT_REFUNDABLE_FEE` never happens.
+- Fees use ONE network's fee settings: testnet's as read on 2026-10-18 by
+  default, whose rent rate moves with testnet's state size. Charge another
+  network's with `withFeeSettings(await loadFeeSettingsFromRpc(server))`. There
+  is no surge pricing: the inclusion fee is always charged at the 100-stroop
+  base fee.
+- Not checked against the network's limits, apart from the events size: the
+  per-transaction resource caps (core's `checkSorobanResources`, refused at
+  submission) and entry sizes or a restore's read/write bytes
+  (`RESOURCE_LIMIT_EXCEEDED` at apply).
 - Simulating an extend over an expired persistent entry is an error here;
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
 
@@ -346,6 +363,7 @@ src/fixtures.ts           wallets, tokens, trustlines
 src/fake-rpc.ts           rpc.Server adapter
 src/cost-params.ts        network cost calibration
 src/state-archival.ts     network state-archival TTLs
+src/fee-settings.ts       network fee settings (testnet's by default)
 test/                     the green suite
 test/guide.test.ts        executes every snippet in GUIDE.md
 test/factory.test.ts      factory -> smart account -> passkey auth, end to end

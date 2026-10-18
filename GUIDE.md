@@ -376,6 +376,12 @@ constructor, `Client.from` and `Client.fromWasmHash` all honour it.
 `client.js:36-38` and reaches the network. There is a test pinning that, so if
 upstream fixes the leak we find out.
 
+Fees are charged as stellar-core charges them: what leaves the account is the
+non-refundable resource fee, the rent and events the call consumed, and the base
+fee, not the bid; `getTransaction`'s `resultMetaXdr` carries the split. They are
+priced with testnet's fee settings unless `withFeeSettings` installs another
+network's (`loadFeeSettingsFromRpc(server)` reads them off a node).
+
 When a test is not about envelopes, turn the classic rules off:
 
 ```ts
@@ -428,6 +434,6 @@ protocol.
 
 ## What this does not do
 
-Classic operations (Payment, CreateAccount, ChangeTrust), fee refunds,
+Classic operations (Payment, CreateAccount, ChangeTrust),
 `ExtendFootprintTTL` / `RestoreFootprint` dispatch, and five RPC methods. See
 "Known gaps" in [README.md](README.md).

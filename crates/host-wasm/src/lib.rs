@@ -37,9 +37,10 @@ use wasm_bindgen::prelude::*;
 
 use soroban_env_host::budget::{AsBudget, Budget};
 use soroban_env_host::e2e_invoke::{
-    entry_size_for_rent, invoke_host_function, invoke_host_function_in_recording_mode,
-    RecordingInvocationAuthMode, TtlLedgerEntryMeta,
+    entry_size_for_rent, extract_rent_changes, invoke_host_function,
+    invoke_host_function_in_recording_mode, RecordingInvocationAuthMode, TtlLedgerEntryMeta,
 };
+use soroban_env_host::fees::{compute_rent_fee, LedgerEntryRentChange};
 use soroban_env_host::e2e_testutils::{
     account_entry, get_account_id, get_wasm_hash, get_wasm_key, wasm_entry, DEFAULT_NETWORK_ID,
 };
@@ -50,7 +51,8 @@ use soroban_env_host::xdr::{
     LedgerFootprint, Liabilities, SponsorshipDescriptor, TimePoint,
     AccountId, HostFunction, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount,
     LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine, Limits, ReadXdr,
-    ContractCostParams, ContractDataDurability, Hash, SorobanAuthorizationEntry,
+    ContractCostParams, ContractDataDurability, ExtendFootprintTtlOp, Hash,
+    InvokeHostFunctionOp, OperationBody, RestoreFootprintOp, SorobanAuthorizationEntry,
     SorobanResources, WriteXdr,
 };
 use soroban_env_host::{
@@ -58,6 +60,8 @@ use soroban_env_host::{
 };
 
 use sha2::{Digest, Sha256};
+
+mod fees;
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -317,6 +321,9 @@ struct SimulateResult {
     instructions: u32,
     /// Padded the way stellar-rpc pads it; this is what `resources_xdr` carries.
     adjusted_instructions: u32,
+    /// stellar-rpc's `minResourceFee` for these resources; 0 when the call
+    /// failed. See `fees::preflight_resource_fee`.
+    min_resource_fee: i64,
     read_bytes: u32,
     write_bytes: u32,
     cpu_insns: u64,
@@ -345,6 +352,15 @@ struct SendResult {
     /// TTL bumps applied to entries that were otherwise untouched. Invisible in
     /// changed_keys, because nothing about the entry itself changed.
     ttl_changed_keys: Vec<String>,
+    /// The InvokeHostFunctionResultCode stellar-core would report for a failed
+    /// call, as the js-xdr arm name; None on success.
+    result_code: Option<String>,
+    /// On success: the rent the ledger changes cost (`compute_rent_fee`), the
+    /// size of the contract events plus the return value, and what the call
+    /// consumed of the refundable resource fee (rent + events fee). 0 otherwise.
+    rent_fee: i64,
+    contract_events_size_bytes: u32,
+    refundable_fee_consumed: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +432,8 @@ pub struct SorobanEnv {
     /// modules whose code is gone from the ledger, and the host checks storage
     /// before it trusts a cache hit. `None` until the first contract call.
     module_cache: Option<ModuleCache>,
+    /// The network's fee settings; see `fees.rs`. The TS layer installs them.
+    fee_settings: Option<fees::NetworkFeeSettings>,
 }
 
 #[wasm_bindgen]
@@ -439,6 +457,7 @@ impl SorobanEnv {
             max_entry_ttl: TESTNET_MAX_ENTRY_TTL,
             enforce_declared_resources: true,
             module_cache: None,
+            fee_settings: None,
         }
     }
 
@@ -673,7 +692,8 @@ impl SorobanEnv {
             .map(|k| from_xdr_b64::<LedgerKey>(k))
             .collect::<Result<Vec<_>, _>>()?;
         let ledger_seq = ledger_seq.unwrap_or(self.ledger_seq);
-        footprint_simulation(self.extend_ttl_resources(&keys, extend_to, ledger_seq))
+        let op = OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp { ext: ExtensionPoint::V0, extend_to });
+        self.footprint_simulation(self.extend_ttl_resources(&keys, extend_to, ledger_seq), op, ledger_seq)
     }
 
     /// stellar-rpc's preflight for a RestoreFootprint transaction, over its
@@ -689,7 +709,9 @@ impl SorobanEnv {
             .iter()
             .map(|k| from_xdr_b64::<LedgerKey>(k))
             .collect::<Result<Vec<_>, _>>()?;
-        footprint_simulation(self.restore_resources(&keys, ledger_seq.unwrap_or(self.ledger_seq)))
+        let ledger_seq = ledger_seq.unwrap_or(self.ledger_seq);
+        let op = OperationBody::RestoreFootprint(RestoreFootprintOp { ext: ExtensionPoint::V0 });
+        self.footprint_simulation(self.restore_resources(&keys, ledger_seq), op, ledger_seq)
     }
 
     // -- requirement 4: isolation -------------------------------------------
@@ -836,6 +858,7 @@ impl SorobanEnv {
                     restored_rw_entry_indices: Vec::new(),
                     instructions: 0,
                     adjusted_instructions: 0,
+                    min_resource_fee: 0,
                     read_bytes: 0,
                     write_bytes: 0,
                     cpu_insns: budget.get_cpu_insns_consumed().unwrap_or(0),
@@ -859,6 +882,27 @@ impl SorobanEnv {
         let mut submitted_resources = res.resources.clone();
         submitted_resources.instructions = adjust_instructions(raw_instructions, instruction_leeway);
 
+        // soroban-simulation only prices a successful invocation.
+        let min_resource_fee = if let (true, Some(settings)) = (ok, self.fee_settings.as_ref()) {
+            let operation = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: host_fn.clone(),
+                auth: res.auth.clone().try_into().map_err(xdr_err)?,
+            });
+            fees::preflight_resource_fee(
+                settings,
+                operation,
+                &submitted_resources,
+                &res.restored_rw_entry_indices,
+                res.contract_events_and_return_value_size,
+                &extract_rent_changes(&res.ledger_changes),
+                // the ledger this simulation ran in, as stellar-rpc prices it
+                ledger_seq,
+            )
+            .map_err(|e| JsError::new(&e))?
+        } else {
+            0
+        };
+
         let out = SimulateResult {
             ok,
             error,
@@ -872,6 +916,7 @@ impl SorobanEnv {
             restored_rw_entry_indices: res.restored_rw_entry_indices.clone(),
             instructions: raw_instructions,
             adjusted_instructions: submitted_resources.instructions,
+            min_resource_fee,
             read_bytes: res.resources.disk_read_bytes,
             write_bytes: res.resources.write_bytes,
             cpu_insns: budget.get_cpu_insns_consumed().map_err(host_err)?,
@@ -905,6 +950,12 @@ impl SorobanEnv {
     /// Enforcing mode. The footprint in `resources_b64` is a hard constraint:
     /// touching anything outside it fails the call. Applies the resulting
     /// `LedgerEntryChange`s back into the ledger.
+    ///
+    /// `max_refundable_fee` is what the transaction left for rent and events
+    /// (declared resource fee minus the non-refundable part). Given, a call
+    /// whose rent and events cost more fails with
+    /// INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE and changes nothing,
+    /// as in core; omitted, nothing is checked.
     pub fn send(
         &mut self,
         host_fn_b64: &str,
@@ -912,6 +963,7 @@ impl SorobanEnv {
         resources_b64: &str,
         auth_b64: Vec<String>,
         restored_rw_entry_indices: Vec<u32>,
+        max_refundable_fee: Option<i64>,
     ) -> Result<JsValue, JsError> {
         let resources: SorobanResources = from_xdr_b64(resources_b64)?;
 
@@ -1032,6 +1084,8 @@ impl SorobanEnv {
         let res = match res {
             Ok(r) => r,
             Err(e) => {
+                let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
+                let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
                 let out = SendResult {
                     ok: false,
                     error: Some(format!("{e:?}")),
@@ -1040,19 +1094,50 @@ impl SorobanEnv {
                     removed_keys: Vec::new(),
                     events_xdr: Vec::new(),
                     diagnostic_events_xdr: encode_diagnostics(&diagnostics),
-                    cpu_insns: budget.get_cpu_insns_consumed().unwrap_or(0),
-                    mem_bytes: budget.get_mem_bytes_consumed().unwrap_or(0),
+                    cpu_insns,
+                    mem_bytes,
                     ttl_changed_keys: Vec::new(),
+                    result_code: Some(self.failed_call_code(&resources, cpu_insns, mem_bytes).to_string()),
+                    rent_fee: 0,
+                    contract_events_size_bytes: 0,
+                    refundable_fee_consumed: 0,
                 };
                 return serde_wasm_bindgen::to_value(&out)
                     .map_err(|e| JsError::new(&format!("serialize: {e}")));
             }
         };
 
-        let (ok, error, return_value_xdr) = match &res.encoded_invoke_result {
+        let (mut ok, mut error, mut return_value_xdr) = match &res.encoded_invoke_result {
             Ok(v) => (true, None, Some(b64e(v))),
             Err(e) => (false, Some(format!("{e:?}")), None),
         };
+        let cpu_insns = budget.get_cpu_insns_consumed().map_err(host_err)?;
+        let mem_bytes = budget.get_mem_bytes_consumed().map_err(host_err)?;
+
+        // stellar-core InvokeHostFunctionOpFrame::doApply, after the host
+        // returns: collectEvents, then consumeRefundableResources. Either can
+        // still fail the operation, and then none of its changes land.
+        let mut result_code = None;
+        let (mut rent_fee, mut contract_events_size_bytes, mut refundable_fee_consumed) = (0, 0, 0);
+        let mut events_xdr: Vec<String> = res.encoded_contract_events.iter().map(|e| b64e(e)).collect();
+        if let Ok(result_value) = &res.encoded_invoke_result {
+            match self.consume_refundable(&res, result_value.len(), max_refundable_fee) {
+                Ok((rent, size, consumed)) => {
+                    rent_fee = rent;
+                    contract_events_size_bytes = size;
+                    refundable_fee_consumed = consumed;
+                }
+                Err((code, message)) => {
+                    ok = false;
+                    error = Some(message);
+                    return_value_xdr = None;
+                    events_xdr = Vec::new();
+                    result_code = Some(code.to_string());
+                }
+            }
+        } else {
+            result_code = Some(self.failed_call_code(&resources, cpu_insns, mem_bytes).to_string());
+        }
 
         let mut changed_keys = Vec::new();
         let mut removed_keys = Vec::new();
@@ -1100,17 +1185,90 @@ impl SorobanEnv {
             return_value_xdr,
             changed_keys,
             removed_keys,
-            events_xdr: res.encoded_contract_events.iter().map(|e| b64e(e)).collect(),
+            events_xdr,
             diagnostic_events_xdr: encode_diagnostics(&diagnostics),
-            cpu_insns: budget.get_cpu_insns_consumed().map_err(host_err)?,
-            mem_bytes: budget.get_mem_bytes_consumed().map_err(host_err)?,
+            cpu_insns,
+            mem_bytes,
             ttl_changed_keys,
+            result_code,
+            rent_fee,
+            contract_events_size_bytes,
+            refundable_fee_consumed,
         };
         serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
     }
 }
 
 impl SorobanEnv {
+    /// stellar-core InvokeHostFunctionOpFrame::invokeHostFunction, when the
+    /// host fails: RESOURCE_LIMIT_EXCEEDED if it burned more instructions than
+    /// declared or more memory than the network allows, TRAPPED otherwise.
+    fn failed_call_code(&self, resources: &SorobanResources, cpu_insns: u64, mem_bytes: u64) -> &'static str {
+        if (resources.instructions as u64) < cpu_insns || self.mem_limit < mem_bytes {
+            "invokeHostFunctionResourceLimitExceeded"
+        } else {
+            "invokeHostFunctionTrapped"
+        }
+    }
+
+    /// stellar-core InvokeHostFunctionOpFrame `collectEvents` and
+    /// `consumeRefundableResources` (-> RefundableFeeTracker::
+    /// consumeRefundableSorobanResources) for a call the host completed.
+    /// Events count with the return value against txMaxContractEventsSizeBytes;
+    /// rent is core's rust bridge, `compute_rent_fee(extract_rent_changes(..))`.
+    /// Returns (rent fee, events size, refundable fee consumed), or the
+    /// failure code and core's diagnostic text.
+    fn consume_refundable(
+        &self,
+        res: &soroban_env_host::e2e_invoke::InvokeHostFunctionResult,
+        return_value_size: usize,
+        max_refundable_fee: Option<i64>,
+    ) -> Result<(i64, u32, i64), (&'static str, String)> {
+        const LIMIT: &str = "invokeHostFunctionResourceLimitExceeded";
+        const SHORT: &str = "invokeHostFunctionInsufficientRefundableFee";
+        // Without fee settings there is nothing to price or enforce.
+        let Some(fees) = self.fee_settings.as_ref() else {
+            return Ok((0, 0, 0));
+        };
+        let max_events = fees.tx_max_contract_events_size_bytes();
+        let mut events_size: u32 = 0;
+        for e in &res.encoded_contract_events {
+            events_size = events_size.saturating_add(u32::try_from(e.len()).unwrap_or(u32::MAX));
+            if max_events < events_size {
+                return Err((LIMIT, format!("total events size exceeds network config maximum: {events_size} > {max_events}")));
+            }
+        }
+        events_size = events_size.saturating_add(u32::try_from(return_value_size).unwrap_or(u32::MAX));
+        if max_events < events_size {
+            return Err((
+                LIMIT,
+                format!("return value pushes events size above network config maximum: {events_size} > {max_events}"),
+            ));
+        }
+
+        let rent_changes: Vec<LedgerEntryRentChange> = extract_rent_changes(&res.ledger_changes);
+        let rent = compute_rent_fee(&rent_changes, &fees.rent_fee_configuration(), self.ledger_seq);
+        let events_fee = fees.events_fee(events_size);
+        if let Some(max) = max_refundable_fee {
+            if max < rent {
+                return Err((
+                    SHORT,
+                    format!("refundable resource fee was not sufficient to cover the ledger storage rent: {rent} > {max}"),
+                ));
+            }
+            if max < rent.saturating_add(events_fee) {
+                return Err((
+                    SHORT,
+                    format!(
+                        "refundable resource fee was not sufficient to cover the events fee after paying for ledger storage rent: {events_fee} > {}",
+                        max - rent
+                    ),
+                ));
+            }
+        }
+        Ok((rent, events_size, rent.saturating_add(events_fee)))
+    }
+
     /// The module cache for one enforcing call: every live contract in the
     /// footprint parsed and ready, nothing the call restores.
     ///
@@ -1217,15 +1375,18 @@ impl SorobanEnv {
     /// One deliberate difference: stellar-rpc reads through an auto-restoring
     /// snapshot, so for an EXPIRED persistent key it answers with a restore
     /// preamble instead of this error. Both mean "restore it first".
+    ///
+    /// Also returns each extended entry's rent change, which is what its fee is.
     fn extend_ttl_resources(
         &self,
         keys: &[LedgerKey],
         extend_to: u32,
         current: u32,
-    ) -> Result<SorobanResources, String> {
+    ) -> Result<(SorobanResources, Vec<LedgerEntryRentChange>), String> {
         let new_live_until = current.saturating_add(extend_to);
         let store = self.store.borrow();
         let mut extended = Vec::new();
+        let mut rent_changes = Vec::new();
         for key in keys {
             if !needs_ttl(key) {
                 return Err(format!(
@@ -1251,9 +1412,12 @@ impl SorobanEnv {
                 ));
             }
             extended.push(key.clone());
+            let entry = store.get(&Rc::new(key.clone())).map(|(e, _)| Rc::clone(e)).ok_or("entry vanished")?;
+            let size = self.entry_size_for_rent_of(&entry).map_err(|_| "entry size for rent".to_string())?;
+            rent_changes.push(fees::rent_change_without_modification(key, size, Some(live_until), new_live_until));
         }
         extended.sort();
-        Ok(SorobanResources {
+        let resources = SorobanResources {
             footprint: LedgerFootprint {
                 read_only: extended.try_into().map_err(|_| "too many keys".to_string())?,
                 read_write: Default::default(),
@@ -1261,16 +1425,27 @@ impl SorobanEnv {
             instructions: 0,
             disk_read_bytes: 0,
             write_bytes: 0,
-        })
+        };
+        Ok((resources, rent_changes))
     }
 
     /// soroban-simulation 29.0.2 `simulate_restore_op_resources`: only
     /// persistent keys, every one of them present; live ones are skipped. The
     /// footprint is the restored keys, sorted, and both disk-read and write
-    /// bytes are their total XDR size.
-    fn restore_resources(&self, keys: &[LedgerKey], current: u32) -> Result<SorobanResources, String> {
+    /// bytes are their total XDR size. Also returns each entry's rent change.
+    fn restore_resources(
+        &self,
+        keys: &[LedgerKey],
+        current: u32,
+    ) -> Result<(SorobanResources, Vec<LedgerEntryRentChange>), String> {
+        // Preflight runs in `current` (the last closed ledger, as stellar-rpc
+        // does), so the restored TTL counts from there.
+        let restored_live_until = LedgerInfo { sequence_number: current, ..self.ledger_info() }
+            .min_live_until_ledger_checked(ContractDataDurability::Persistent)
+            .ok_or("minimum persistent live until ledger overflows")?;
         let store = self.store.borrow();
         let mut restored = Vec::new();
+        let mut rent_changes = Vec::new();
         let mut bytes = 0u32;
         for key in keys {
             let persistent = matches!(key, LedgerKey::ContractCode(_))
@@ -1291,9 +1466,11 @@ impl SorobanEnv {
             restored.push(key.clone());
             let size = entry.to_xdr(Limits::none()).map_err(|e| e.to_string())?.len();
             bytes = bytes.saturating_add(u32::try_from(size).unwrap_or(u32::MAX));
+            let rent_size = self.entry_size_for_rent_of(entry).map_err(|_| "entry size for rent".to_string())?;
+            rent_changes.push(fees::rent_change_without_modification(key, rent_size, None, restored_live_until));
         }
         restored.sort();
-        Ok(SorobanResources {
+        let resources = SorobanResources {
             footprint: LedgerFootprint {
                 read_only: Default::default(),
                 read_write: restored.try_into().map_err(|_| "too many keys".to_string())?,
@@ -1301,7 +1478,33 @@ impl SorobanEnv {
             instructions: 0,
             disk_read_bytes: bytes,
             write_bytes: bytes,
-        })
+        };
+        Ok((resources, rent_changes))
+    }
+
+    /// The resources plus the `minResourceFee` stellar-rpc quotes for them
+    /// (soroban-simulation `simulate_extend_ttl_op` / `simulate_restore_op`:
+    /// no events, no restored entries).
+    fn footprint_simulation(
+        &self,
+        res: Result<(SorobanResources, Vec<LedgerEntryRentChange>), String>,
+        operation: OperationBody,
+        ledger_seq: u32,
+    ) -> Result<JsValue, JsError> {
+        let out = match res {
+            Ok((r, rent_changes)) => {
+                let fee = match self.fee_settings.as_ref() {
+                    Some(settings) => Some(
+                        fees::preflight_resource_fee(settings, operation, &r, &[], 0, &rent_changes, ledger_seq)
+                            .map_err(|e| JsError::new(&e))?,
+                    ),
+                    None => None,
+                };
+                FootprintSimulation { ok: true, error: None, resources_xdr: Some(to_xdr_b64(&r)?), min_resource_fee: fee }
+            }
+            Err(e) => FootprintSimulation { ok: false, error: Some(e), resources_xdr: None, min_resource_fee: None },
+        };
+        serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
     }
 }
 
@@ -1312,14 +1515,8 @@ struct FootprintSimulation {
     error: Option<String>,
     /// `SorobanResources` XDR for the transaction's `SorobanTransactionData`.
     resources_xdr: Option<String>,
-}
-
-fn footprint_simulation(res: Result<SorobanResources, String>) -> Result<JsValue, JsError> {
-    let out = match res {
-        Ok(r) => FootprintSimulation { ok: true, error: None, resources_xdr: Some(to_xdr_b64(&r)?) },
-        Err(e) => FootprintSimulation { ok: false, error: Some(e), resources_xdr: None },
-    };
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
+    /// stellar-rpc's `minResourceFee` for it.
+    min_resource_fee: Option<i64>,
 }
 
 /// Exposed so a harness can assert the pinned protocol at startup.

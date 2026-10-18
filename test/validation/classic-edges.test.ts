@@ -603,6 +603,11 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
   //    core: getInclusionFee = fullFee - declaredSorobanResourceFee (:401-414)
   //          getMinInclusionFee = baseFee * max(1, numOps) (TransactionUtils.cpp:1994)
   //          baseFee == 100 on every Stellar network.
+  //    Validation wants the FULL fee available (commonValid feeToPay =
+  //    getFullFee()); what is then debited is getFee(applying = true) minus
+  //    the refund of the unused refundable resource fee, which a local
+  //    protocol-29 node confirms (test/fees.test.ts). So these check the
+  //    balance against `fee` but the debit against `feeCharged`.
   // =========================================================================
   describe('fees', () => {
     it('accepts an inclusion fee of exactly BASE_FEE', () => {
@@ -623,16 +628,19 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       expect(out.code).toBe('txINSUFFICIENT_FEE');
     });
 
-    // GAP CANDIDATE. TransactionFrame.cpp:1374-1385: a declared resourceFee
-    // above the full transaction fee is txSOROBAN_INVALID, checked well before
-    // the inclusion-fee comparison at :1489.
-    it('reports txSOROBAN_INVALID when resourceFee exceeds the full fee', () => {
+    // TransactionFrame.cpp:1374-1385 makes a declared resourceFee above the
+    // full fee txSOROBAN_INVALID, but a submission never gets that far:
+    // TransactionQueue::canAdd (herder/TransactionQueue.cpp:347-352) refuses a
+    // negative inclusion fee first, unseeded. LIVE (local protocol-29 node,
+    // add(1,2) with fee = resourceFee - 1): ERROR txMalformed, feeCharged 0.
+    it('reports txMALFORMED, feeCharged 0, when resourceFee exceeds the full fee', () => {
       const a = Keypair.random();
       L.fund(a.publicKey());
       const out = L.sendTransaction(
         signed(rawTx(spec(a, { fee: RESOURCE_FEE - 1n, sorobanData: sorobanData(RESOURCE_FEE) })), [a]),
       );
-      expect(out.code).toBe('txSOROBAN_INVALID');
+      expect(out.code).toBe('txMALFORMED');
+      expect(out.feeCharged).toBe(0n);
     });
 
     it('accepts a balance exactly equal to reserve + fee', () => {
@@ -642,7 +650,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       L.fund(a.publicKey(), { balance: reserve + fee });
       const out = L.sendTransaction(signed(rawTx(spec(a, { fee })), [a]));
       expect(out.code).toBe('txSUCCESS');
-      expect(balOf(a)).toBe(reserve);
+      // The unused refundable fee came back on top of the reserve.
+      expect(out.feeCharged).toBeLessThan(fee);
+      expect(balOf(a)).toBe(reserve + fee - out.feeCharged);
     });
 
     it('rejects a balance one stroop short of reserve + fee', () => {
@@ -656,7 +666,10 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
     });
 
     it('charges the fee even when the host call itself fails', () => {
-      // core takes the fee in processFeeSeqNum before applying the operation.
+      // core takes the fee in processFeeSeqNum before applying the operation;
+      // a failed operation then gets its whole refundable fee back, so what
+      // stays charged is the non-refundable part and the base fee (LIVE on a
+      // protocol-29 node: 5,806 + 100 for a put_persistent out of budget).
       const a = Keypair.random();
       L.fund(a.publicKey());
       const before = balOf(a);
@@ -667,7 +680,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const bad = invokeHostFn(addr, 'get_persistent', [sym('k')]);
       const out = L.sendTransaction(signed(rawTx(spec(a, { fee, ops: [ihfOp(bad)] })), [a]));
       expect(out.code).toBe('txFAILED');
-      expect(balOf(a)).toBe(before - fee);
+      expect(out.sorobanFee!.nonRefundable).toBeGreaterThan(0n);
+      expect(out.feeCharged).toBe(out.sorobanFee!.nonRefundable + BigInt(BASE_FEE));
+      expect(balOf(a)).toBe(before - out.feeCharged);
       expect(seqOf(a)).toBe(1n);
     });
   });
@@ -692,7 +707,7 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       fundWithSubEntries(a.publicKey(), reserve + fee, 3);
       const ok = L.sendTransaction(signed(rawTx(spec(a, { fee })), [a]));
       expect(ok.code).toBe('txSUCCESS');
-      expect(balOf(a)).toBe(reserve);
+      expect(balOf(a)).toBe(reserve + fee - ok.feeCharged);
     });
 
     it('a balance above the raw fee but below reserve + fee is still insufficient', () => {
@@ -729,7 +744,11 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       const out = L.sendTransaction(fb);
       expect(out.code).toBe('txFEE_BUMP_INNER_SUCCESS');
       expect(seqOf(a)).toBe(1n);
-      expect(balOf(a)).toBe(before - (RESOURCE_FEE + 200n));
+      // Charged once, as the bump: its resource fee consumption plus
+      // baseFee * (innerOps + 1).
+      const { nonRefundable, refundable } = out.sorobanFee!;
+      expect(out.feeCharged).toBe(nonRefundable + refundable + 200n);
+      expect(balOf(a)).toBe(before - out.feeCharged);
     });
 
     it('cannot fee bump a fee bump: the XDR union admits only ENVELOPE_TYPE_TX', () => {
@@ -1103,8 +1122,9 @@ describe('classic layer: exhaustive edge cases against stellar-core', () => {
       L.fund(s.publicKey());
       const before = balOf(s);
       const innerEnv = signed(rawTx(spec(a, { fee: RESOURCE_FEE + 100n })), [a]);
-      L.sendTransaction(feeBumpEnvelope(muxed(s.publicKey(), 9n), RESOURCE_FEE + 200n, innerEnv, [s]));
-      expect(balOf(s)).toBe(before - (RESOURCE_FEE + 200n));
+      const out = L.sendTransaction(feeBumpEnvelope(muxed(s.publicKey(), 9n), RESOURCE_FEE + 200n, innerEnv, [s]));
+      expect(out.feeCharged).toBeGreaterThan(0n);
+      expect(balOf(s)).toBe(before - out.feeCharged);
     });
   });
 });
