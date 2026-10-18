@@ -279,8 +279,10 @@ describe('rpc facade: the four-step custom-account round trip', () => {
     expect(rpc.Api.isSimulationError(sim3), 'step 3 should simulate cleanly').toBe(false);
 
     const back = (sim3 as rpc.Api.SimulateTransactionSuccessResponse).result!.auth;
+    // SDK 17 asks step 1 for CAP-71 V2 credentials (useUpgradedAuth), as a
+    // node records them, and signing keeps the arm.
     expect(
-      xdr.expectUnionVariant(back[0].credentials, 'sorobanCredentialsAddress').address.signature.type,
+      xdr.expectUnionVariant(back[0].credentials, 'sorobanCredentialsAddressV2').addressV2.signature.type,
       'step 3 must return the SIGNED entries back (the live node does); this ' +
         'harness returns them with the signature stripped to scvVoid, proving ' +
         'it re-recorded instead of enforcing',

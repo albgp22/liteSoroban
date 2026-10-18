@@ -26,6 +26,7 @@ import {
   Networks,
   rpc,
   hash as sha256,
+  buildAuthorizationEntryPreimage,
   nativeToScVal,
   scValToNative,
 } from '@stellar/stellar-sdk';
@@ -127,61 +128,61 @@ function hostFailure(prefix: string, raw: string | undefined): HostFailure {
  * Sign recorded auth entries WITHOUT going async.
  *
  * The SDK's `authorizeEntry` is async purely because it awaits the signer
- * callback. Rebuilding the preimage is a dozen lines, and keeping the whole API
- * synchronous is worth it — LiteSVM's ergonomics depend on it.
+ * callback. Everything around that await is synchronous, and keeping the whole
+ * API synchronous is worth it — LiteSVM's ergonomics depend on it.
  *
- * Mirrors base/auth.js:165 (buildAuthorizationEntryPreimage): legacy `Address`
- * credentials use the plain SorobanAuthorization preimage; `AddressV2` and
- * `AddressWithDelegates` (CAP-71) bind the address in via the WithAddress preimage.
+ * Does what base/auth.js `authorizeEntry` (SDK 17.2.1) does for a signer that
+ * returns `{ signatureScVal }`, with no `forAddress`. The payload hashes the
+ * SDK's own `buildAuthorizationEntryPreimage`: the plain SorobanAuthorization
+ * preimage for legacy `Address` credentials, the WithAddress one for CAP-71
+ * `AddressV2` and `AddressWithDelegates`. The signed entry keeps its arm, and
+ * only its top-level credentials take the expiration and the signature;
+ * delegates stay as they are (applyExpirationAndSignature).
  */
 export function signAuthEntriesSync(
   entriesB64: string[],
   opts: { sign: (payload: Buffer) => xdr.ScVal; networkPassphrase: string; validUntilLedgerSeq: number },
 ): string[] {
-  const networkId = sha256(Buffer.from(opts.networkPassphrase));
-
   return entriesB64.map((b64) => {
     const entry = xdr.SorobanAuthorizationEntry.fromXdr(b64, 'base64');
     const credentials = entry.credentials;
     // Source-account credentials carry no signature at all.
     if (credentials.type === 'sorobanCredentialsSourceAccount') return b64;
 
-    // Read whatever the arm, as js-xdr v4's `credentials.address()` was: only
-    // legacy Address credentials get past it (test/validation/facade-api DEFECT 6).
-    const addr = (credentials as xdr.SorobanCredentialsAddress).address;
-
-    let preimage: xdr.HashIdPreimage;
-    if (credentials.type === 'sorobanCredentialsAddress') {
-      preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
-        new xdr.HashIdPreimageSorobanAuthorization({
-          networkId,
-          nonce: addr.nonce,
-          signatureExpirationLedger: opts.validUntilLedgerSeq,
-          invocation: entry.rootInvocation,
-        }),
-      );
-    } else {
-      preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorizationWithAddress(
-        new xdr.HashIdPreimageSorobanAuthorizationWithAddress({
-          networkId,
-          address: addr.address,
-          nonce: addr.nonce,
-          signatureExpirationLedger: opts.validUntilLedgerSeq,
-          invocation: entry.rootInvocation,
-        }),
-      );
-    }
-
+    const preimage = buildAuthorizationEntryPreimage(entry, opts.validUntilLedgerSeq, opts.networkPassphrase);
     const signature = opts.sign(Buffer.from(sha256(preimage.toXdr())));
+    const signed = (addr: xdr.SorobanAddressCredentials) =>
+      new xdr.SorobanAddressCredentials({
+        address: addr.address,
+        nonce: addr.nonce,
+        signatureExpirationLedger: opts.validUntilLedgerSeq,
+        signature,
+      });
+
+    let signedCredentials: xdr.SorobanCredentials;
+    switch (credentials.type) {
+      case 'sorobanCredentialsAddress':
+        signedCredentials = xdr.SorobanCredentials.sorobanCredentialsAddress(signed(credentials.address));
+        break;
+      case 'sorobanCredentialsAddressV2':
+        signedCredentials = xdr.SorobanCredentials.sorobanCredentialsAddressV2(signed(credentials.addressV2));
+        break;
+      case 'sorobanCredentialsAddressWithDelegates': {
+        const withDelegates = credentials.addressWithDelegates;
+        signedCredentials = xdr.SorobanCredentials.sorobanCredentialsAddressWithDelegates(
+          new xdr.SorobanAddressCredentialsWithDelegates({
+            addressCredentials: signed(withDelegates.addressCredentials),
+            delegates: withDelegates.delegates,
+          }),
+        );
+        break;
+      }
+      default:
+        throw new Error(`unsupported credential type ${(credentials as { type: string }).type}`);
+    }
     return new xdr.SorobanAuthorizationEntry({
       rootInvocation: entry.rootInvocation,
-      credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
-        new xdr.SorobanAddressCredentials({
-          ...addr,
-          signatureExpirationLedger: opts.validUntilLedgerSeq,
-          signature,
-        }),
-      ),
+      credentials: signedCredentials,
     }).toXdr('base64');
   });
 }

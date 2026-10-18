@@ -334,18 +334,21 @@ describe('signAuthEntriesSync vs the SDK', () => {
   });
 
   /**
-   * DEFECT 6. litestellar.ts:139 reads `credentials.address` UNCONDITIONALLY,
-   * before the arm test on line 143. Any other arm has no `address` field (it
-   * is undefined, and the next read through it throws), so the CAP-71
-   * `envelopeTypeSorobanAuthorizationWithAddress` branch on lines 152-161 is
-   * unreachable dead code — the exact case its comment (lines 122-125) claims
-   * to handle.
+   * DEFECT 6 (fixed). signAuthEntriesSync read `credentials.address`
+   * UNCONDITIONALLY, before testing the arm. Any other arm has no `address`
+   * field (it is undefined, and the next read through it throws), so its CAP-71
+   * `envelopeTypeSorobanAuthorizationWithAddress` branch was unreachable dead
+   * code — the exact case its comment claimed to handle. It also rebuilt every
+   * signed entry as legacy Address credentials.
    *
    * The SDK gets this right by dispatching first
    * (stellar-sdk/lib/esm/base/auth.js:251-262, getAddressCredentials):
    *   Address        -> credentials.address
    *   AddressV2      -> credentials.addressV2
    *   WithDelegates  -> credentials.addressWithDelegates.addressCredentials
+   * signAuthEntriesSync now dispatches the same way, hashes the SDK's own
+   * buildAuthorizationEntryPreimage, and keeps the arm; test/rpc-upgraded-auth
+   * compares whole signed entries with authorizeEntry's.
    */
   it('matches the SDK for AddressV2 (CAP-71) credentials', async () => {
     const entry = entryFor(xdr.SorobanCredentials.sorobanCredentialsAddressV2(addrCreds()));

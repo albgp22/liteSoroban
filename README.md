@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 281 tests, ~800 ms
+npm test               # 296 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -227,8 +227,23 @@ checks the SDK-parsed result of each. Ledger numbers are a node's: every
 `latestLedger` is the last closed ledger (`svm.ledgerSequence - 1`), simulation
 runs in it as stellar-rpc's preflight does, and a submission is validated against
 and applied in the next one, so `getTransaction().ledger` is `latest + 1`. Checked
-against a local protocol-29 node (`test/rpc-ledger-numbers.test.ts`). Still wrong,
-found by review round 2:
+against a local protocol-29 node (`test/rpc-ledger-numbers.test.ts`).
+
+`simulateTransaction` records the credentials `useUpgradedAuth` asks for, as
+stellar-rpc 29.0.1 does: CAP-71 `sorobanCredentialsAddressV2` when it is true,
+which SDK 17 sends unless told otherwise, and legacy `sorobanCredentialsAddress`
+when it is false, omitted or null (a plain Go `bool` in go-stellar-sdk v0.7.2). A
+non-boolean is refused with the node's `-32602` error. Only the arm changes: the
+footprint and resources are the same. `signAuthEntriesSync` signs all three
+address arms as the SDK's `authorizeEntry` does and keeps the arm. Checked against
+a local protocol-29 node (`test/rpc-upgraded-auth.test.ts`; live in
+`test/validation/differential.test.ts`), where entries of each arm it signed
+applied. `LiteStellar`'s own path (`contract.invoke`, `svm.ledger.simulate`) is
+not an RPC request, so it keeps recording legacy credentials, which is what a node
+records when the flag is absent; `ledger.simulate(fn, source, leeway, seq, true)`
+records V2.
+
+Still wrong, found by review round 2:
 - `getTransaction` carries an applied invocation's diagnostics, the host's and,
   for a call past its budget, core's own, but not the `core_metrics` events core
   adds to every invocation or the `host_fn_failed` it adds to a failed one; a
@@ -237,6 +252,12 @@ found by review round 2:
   next transaction is validated and applied at, so once a transaction applies,
   `getLatestLedger` names its ledger with a close time 5 s after its `createdAt`.
   On a node the two are the same.
+
+`authMode` is ignored as well: recording always allows non-root authorization
+(`record_allow_nonroot`), where stellar-rpc defaults an envelope without auth to
+`record`, which disables it (simulate_transaction.go `validateAuthMode`,
+lib/preflight/src/shared.rs, v29.0.1). This comes from reading the source; no
+node scenario reproduces it yet.
 
 `getLedgerEntries` also serves no `ConfigSetting` entries, so neither the
 state-archival settings nor the cost tables can be read back through

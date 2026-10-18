@@ -804,12 +804,18 @@ impl SorobanEnv {
     /// the open one (`ledger_seq`) by default. stellar-rpc preflights in the
     /// last closed ledger, one before the one a submission applies in
     /// (simulate_transaction.go, `LedgerSeq: latestLedger`, v29.0.1).
+    /// `use_address_v2` is stellar-rpc's `useUpgradedAuth`: record CAP-71
+    /// `SOROBAN_CREDENTIALS_ADDRESS_V2` credentials instead of legacy `Address`
+    /// ones. Off by default, as when the request omits it (go-stellar-sdk
+    /// v0.7.2 protocols/rpc: a plain `bool`); preflight passes it straight to
+    /// `RecordingInvocationAuthMode::recording` (lib/preflight/src/lib.rs).
     pub fn simulate(
         &self,
         host_fn_b64: &str,
         source_b64: &str,
         instruction_leeway: Option<u32>,
         ledger_seq: Option<u32>,
+        use_address_v2: Option<bool>,
     ) -> Result<JsValue, JsError> {
         self.simulate_inner(
             host_fn_b64,
@@ -817,6 +823,7 @@ impl SorobanEnv {
             None,
             instruction_leeway.unwrap_or(0),
             ledger_seq.unwrap_or(self.ledger_seq),
+            use_address_v2.unwrap_or(false),
         )
     }
 
@@ -841,6 +848,8 @@ impl SorobanEnv {
             Some(auth_b64),
             instruction_leeway.unwrap_or(0),
             ledger_seq.unwrap_or(self.ledger_seq),
+            // enforcing auth records nothing, so there is no arm to choose
+            false,
         )
     }
 }
@@ -854,6 +863,7 @@ impl SorobanEnv {
         auth_b64: Option<Vec<String>>,
         instruction_leeway: u32,
         ledger_seq: u32,
+        use_address_v2: bool,
     ) -> Result<JsValue, JsError> {
         let host_fn: HostFunction = from_xdr_b64(host_fn_b64)?;
         let source: AccountId = from_xdr_b64(source_b64)?;
@@ -866,7 +876,7 @@ impl SorobanEnv {
                     .collect::<Result<Vec<_>, _>>()?;
                 RecordingInvocationAuthMode::Enforcing(parsed)
             }
-            None => RecordingInvocationAuthMode::recording(false, false),
+            None => RecordingInvocationAuthMode::recording(false, use_address_v2),
         };
 
         let budget = self.simulation_budget()?;

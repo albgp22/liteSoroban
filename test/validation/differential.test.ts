@@ -10,6 +10,9 @@
  *   - the returned ScVal
  *   - contract events
  *   - the ScError on failure paths (footprint violation, budget exhaustion)
+ *   - which credentials `simulateTransaction` records for `useUpgradedAuth`
+ *     (CAP-71), node vs the RPC facade (`svm.rpcServer()`), and whether entries
+ *     signed with `signAuthEntriesSync` apply
  *
  * ---------------------------------------------------------------------------
  * WHAT IS NORMALISED, AND WHY
@@ -65,6 +68,8 @@ import {
   Asset,
   Address,
   BASE_FEE,
+  StrKey,
+  hash,
   nativeToScVal,
 } from '@stellar/stellar-sdk';
 import {
@@ -75,6 +80,7 @@ import {
   type SimulateResult,
 } from '../../src/index.js';
 import { wrapWallet, type Wallet } from '../../src/fixtures.js';
+import { LiteStellar, signAuthEntriesSync } from '../../src/litestellar.js';
 
 // ---------------------------------------------------------------------------
 // the live network
@@ -1017,5 +1023,234 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
         'ConfigSettingContractCostParamsCpuInstructions on a protocol-29 node. Differing entries:\n' +
         differences.join('\n'),
     ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CAP-71: the credentials simulateTransaction records (useUpgradedAuth)
+// ---------------------------------------------------------------------------
+
+/** One recording simulation of `do_auth`, reduced to what is compared. */
+interface Recorded {
+  error?: string;
+  /** Credentials arm of each recorded entry. */
+  arms: string[];
+  /** Each entry with its nonce zeroed: the nonce is fresh per simulation. */
+  entries: string[];
+  resources?: { instructions: number; diskReadBytes: number; writeBytes: number; readOnly: string[] };
+}
+
+function withoutNonce(e: xdr.SorobanAuthorizationEntry): string {
+  const zero = (c: xdr.SorobanAddressCredentials) =>
+    new xdr.SorobanAddressCredentials({
+      address: c.address,
+      nonce: 0n,
+      signatureExpirationLedger: c.signatureExpirationLedger,
+      signature: c.signature,
+    });
+  const c = e.credentials;
+  const credentials =
+    c.type === 'sorobanCredentialsAddress'
+      ? xdr.SorobanCredentials.sorobanCredentialsAddress(zero(c.address))
+      : c.type === 'sorobanCredentialsAddressV2'
+        ? xdr.SorobanCredentials.sorobanCredentialsAddressV2(zero(c.addressV2))
+        : c;
+  return new xdr.SorobanAuthorizationEntry({ rootInvocation: e.rootInvocation, credentials }).toXdr('base64');
+}
+
+function recorded(auth: xdr.SorobanAuthorizationEntry[], data: xdr.SorobanTransactionData): Recorded {
+  const r = data.resources;
+  return {
+    arms: auth.map((e) => e.credentials.type),
+    entries: auth.map(withoutNonce),
+    resources: {
+      instructions: r.instructions,
+      diskReadBytes: r.diskReadBytes,
+      writeBytes: r.writeBytes,
+      readOnly: sorted(r.footprint.readOnly.map((k) => k.toXdr('base64'))),
+    },
+  };
+}
+
+/** The ScVal an ed25519 account's auth entry carries: vec[map{public_key, signature}]. */
+const accountSignature = (kp: Keypair) => (payload: Buffer) =>
+  xdr.ScVal.scvVec([
+    nativeToScVal(
+      { public_key: StrKey.decodeEd25519PublicKey(kp.publicKey()), signature: kp.sign(payload) },
+      { type: { public_key: ['symbol', null], signature: ['symbol', null] } },
+    ),
+  ]);
+
+describe.skipIf(!NODE.up)('CAP-71 recorded credentials: the node vs the RPC facade', () => {
+  // The same deployer, salt and signer on both sides give the same contract id,
+  // invocation and signer address, so the recorded entries compare whole, nonce
+  // aside. The signer is not the source: its authorization is an address entry.
+  const AUTH_TEST = fixture('auth_test_contract.wasm');
+  const deployer = Keypair.random();
+  const signer = Keypair.random();
+  const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+  const svm = new LiteStellar({ networkPassphrase: PASSPHRASE });
+  const servers = { node: server, facade: svm.rpcServer() };
+  type Target = keyof typeof servers;
+  let contractId = '';
+  let setupError: unknown;
+
+  async function doAuthTx(target: Target, auth: xdr.SorobanAuthorizationEntry[] = []) {
+    const acct = await servers[target].getAccount(deployer.publicKey());
+    return new TransactionBuilder(acct, { fee: '1000000', networkPassphrase: PASSPHRASE })
+      .addOperation(
+        Operation.invokeContractFunction({
+          contract: contractId,
+          function: 'do_auth',
+          args: [new Address(signer.publicKey()).toScVal(), nativeToScVal(1, { type: 'u32' })],
+          auth,
+        }),
+      )
+      .setTimeout(120)
+      .build();
+  }
+
+  /** As the SDK sends it: rpc.Server fills in useUpgradedAuth = true. */
+  async function sdkSimulate(target: Target): Promise<Recorded> {
+    const sim = await servers[target].simulateTransaction(await doAuthTx(target));
+    if (!rpc.Api.isSimulationSuccess(sim)) return { error: sim.error, arms: [], entries: [] };
+    return recorded(sim.result!.auth, sim.transactionData.build());
+  }
+
+  /** Raw JSON-RPC, so the request can omit the flag or give it any JSON type. */
+  async function rawSimulate(target: Target, extra: Record<string, unknown>): Promise<any> {
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'simulateTransaction',
+      params: { transaction: (await doAuthTx(target)).toXdr(), ...extra },
+    });
+    if (target === 'node') {
+      const res = await fetch(RPC_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+      return res.json();
+    }
+    const res = await (servers.facade as any).httpClient.defaults.adapter({ url: 'https://in-process.invalid', data: body });
+    return res.data;
+  }
+
+  function fromRaw(body: any): Recorded {
+    if (body.error) return { error: JSON.stringify(body.error), arms: [], entries: [] };
+    if (body.result.error) return { error: body.result.error, arms: [], entries: [] };
+    return recorded(
+      body.result.results[0].auth.map((a: string) => xdr.SorobanAuthorizationEntry.fromXdr(a, 'base64')),
+      xdr.SorobanTransactionData.fromXdr(body.result.transactionData, 'base64'),
+    );
+  }
+
+  /** Record (SDK default), sign with signAuthEntriesSync, prepare, send. */
+  async function signedRoundTrip(target: Target): Promise<{ arms: string[]; status: string }> {
+    const S = servers[target];
+    const sim = await S.simulateTransaction(await doAuthTx(target));
+    if (!rpc.Api.isSimulationSuccess(sim)) return { arms: [], status: `simulation: ${sim.error}` };
+    const latest = (await S.getLatestLedger()).sequence;
+    const signed = signAuthEntriesSync(
+      sim.result!.auth.map((e) => e.toXdr('base64')),
+      { sign: accountSignature(signer), networkPassphrase: PASSPHRASE, validUntilLedgerSeq: latest + 100 },
+    ).map((e) => xdr.SorobanAuthorizationEntry.fromXdr(e, 'base64'));
+    const tx = await S.prepareTransaction(await doAuthTx(target, signed));
+    tx.sign(deployer);
+    const sent = await S.sendTransaction(tx);
+    const arms = signed.map((e) => e.credentials.type);
+    if (sent.status !== 'PENDING') return { arms, status: `send ${sent.status}` };
+    const got = await S.pollTransaction(sent.hash, { attempts: 60, sleepStrategy: () => 500 });
+    return { arms, status: got.status };
+  }
+
+  const cases: { label: string; expected: string; run: (t: Target) => Promise<Recorded> }[] = [
+    { label: 'the SDK default (SDK 17 sends true)', expected: 'sorobanCredentialsAddressV2', run: sdkSimulate },
+    {
+      label: 'useUpgradedAuth: true',
+      expected: 'sorobanCredentialsAddressV2',
+      run: async (t) => fromRaw(await rawSimulate(t, { useUpgradedAuth: true })),
+    },
+    {
+      label: 'useUpgradedAuth: false',
+      expected: 'sorobanCredentialsAddress',
+      run: async (t) => fromRaw(await rawSimulate(t, { useUpgradedAuth: false })),
+    },
+    {
+      label: 'useUpgradedAuth omitted',
+      expected: 'sorobanCredentialsAddress',
+      run: async (t) => fromRaw(await rawSimulate(t, {})),
+    },
+  ];
+  const results: Record<string, { node: Recorded; facade: Recorded }> = {};
+  let mistyped: { node: any; facade: any } | undefined;
+  let roundTrip: { node: { arms: string[]; status: string }; facade: { arms: string[]; status: string } } | undefined;
+
+  beforeAll(async () => {
+    try {
+      await friendbot(deployer.publicKey());
+      await friendbot(signer.publicKey());
+      const deployerB64 = xdr.AccountId.publicKeyTypeEd25519(deployer.rawPublicKey()).toXdr('base64');
+      const wasmHash = Buffer.from(hash(Buffer.from(AUTH_TEST))).toString('base64');
+      const uploaded = await nodeApply(deployer, uploadWasmHostFn(AUTH_TEST));
+      expect(uploaded.status, 'node upload').toBe('SUCCESS');
+      const created = await nodeApply(deployer, createContractHostFn(deployerB64, wasmHash, salt));
+      expect(created.status, 'node deploy').toBe('SUCCESS');
+
+      for (const kp of [deployer, signer]) svm.ledger.fund(kp.publicKey(), { balance: 10_000n * 10_000_000n });
+      contractId = svm.deployContract(AUTH_TEST, { as: wrapWallet(svm.ledger, deployer), salt }).contractId;
+      const onNode = await server.getLedgerEntries(instanceKey(contractId));
+      expect(onNode.entries.length, 'the same deployer and salt must name the same contract on both sides').toBe(1);
+
+      for (const c of cases) results[c.label] = { node: await c.run('node'), facade: await c.run('facade') };
+      mistyped = {
+        node: await rawSimulate('node', { useUpgradedAuth: 'true' }),
+        facade: await rawSimulate('facade', { useUpgradedAuth: 'true' }),
+      };
+      roundTrip = { node: await signedRoundTrip('node'), facade: await signedRoundTrip('facade') };
+    } catch (e) {
+      setupError = e;
+    }
+  }, 600_000);
+
+  it('the setup completed', () => {
+    if (setupError) throw setupError;
+    expect(Object.keys(results)).toEqual(cases.map((c) => c.label));
+  });
+
+  for (const c of cases) {
+    describe(c.label, () => {
+      it(`both sides record ${c.expected}`, () => {
+        const r = results[c.label];
+        expect(r, 'scenario missing — see "the setup completed"').toBeDefined();
+        expect(r.node.error, 'node').toBeUndefined();
+        expect(r.facade.error, 'facade').toBeUndefined();
+        expect(r.node.arms).toEqual([c.expected]);
+        expect(r.facade.arms).toEqual(r.node.arms);
+      });
+
+      it('the recorded entries are identical, nonce aside', () => {
+        const r = results[c.label];
+        expect(r.facade.entries).toEqual(r.node.entries);
+      });
+    });
+  }
+
+  it('V2 and legacy record the same resources and read-only footprint, on each side', () => {
+    for (const target of ['node', 'facade'] as const) {
+      const v2 = results['useUpgradedAuth: true'][target].resources;
+      const legacy = results['useUpgradedAuth: false'][target].resources;
+      expect(v2, target).toBeDefined();
+      expect(v2, target).toEqual(legacy);
+    }
+  });
+
+  it('a non-boolean useUpgradedAuth is refused with the same JSON-RPC error', () => {
+    expect(mistyped, 'setup did not run').toBeDefined();
+    expect(mistyped!.node.error.code).toBe(-32602);
+    expect(mistyped!.facade.error).toEqual(mistyped!.node.error);
+  });
+
+  it('V2 entries signed with signAuthEntriesSync apply on both', () => {
+    expect(roundTrip, 'setup did not run').toBeDefined();
+    expect(roundTrip!.node).toEqual({ arms: ['sorobanCredentialsAddressV2'], status: 'SUCCESS' });
+    expect(roundTrip!.facade).toEqual(roundTrip!.node);
   });
 });

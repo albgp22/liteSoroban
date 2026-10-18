@@ -350,14 +350,19 @@ export class Ledger {
    * returned instructions are padded by max(50_000, leeway), or x1.04 if larger.
    * `ledgerSeq` is the ledger to simulate in, `ledgerSeq` (the open one) by
    * default; stellar-rpc preflights in the last closed one, `ledgerSeq - 1`.
+   * `useAddressV2` is stellar-rpc's `useUpgradedAuth`: record CAP-71
+   * `sorobanCredentialsAddressV2` entries instead of legacy
+   * `sorobanCredentialsAddress` ones. Off by default, as a node does when the
+   * request omits it.
    */
   simulate(
     hostFn: xdr.HostFunction,
     sourceB64: string,
     instructionLeeway?: number,
     ledgerSeq?: number,
+    useAddressV2?: boolean,
   ): SimulateResult {
-    return this.env.simulate(hostFn.toXdr('base64'), sourceB64, instructionLeeway, ledgerSeq);
+    return this.env.simulate(hostFn.toXdr('base64'), sourceB64, instructionLeeway, ledgerSeq, useAddressV2);
   }
 
   /**

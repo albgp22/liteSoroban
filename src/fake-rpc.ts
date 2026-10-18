@@ -547,6 +547,26 @@ export function attachInProcessRpc(
       }
 
       case 'simulateTransaction': {
+        // useUpgradedAuth (CAP-71) records SOROBAN_CREDENTIALS_ADDRESS_V2
+        // instead of legacy Address credentials. stellar-rpc decodes it as a
+        // plain Go bool (go-stellar-sdk v0.7.2 protocols/rpc), so omitted and
+        // null mean false, and any other JSON type fails the whole request
+        // before the transaction is read; the error below is what a local
+        // stellar-rpc 29.0.1 answers, verbatim. SDK 17 sends true unless told
+        // otherwise. Enforcing auth (an envelope that carries auth) and the
+        // footprint operations record nothing, so it changes nothing there.
+        const rawUpgradedAuth = params.useUpgradedAuth ?? false;
+        if (typeof rawUpgradedAuth !== 'boolean') {
+          const jsonType = Array.isArray(rawUpgradedAuth) ? 'array' : typeof rawUpgradedAuth;
+          return rpcError(
+            -32602,
+            'invalid parameters',
+            `json: cannot unmarshal ${jsonType} into Go struct field ` +
+              'SimulateTransactionRequest.useUpgradedAuth of type bool',
+          );
+        }
+        const useUpgradedAuth: boolean = rawUpgradedAuth;
+
         const env = xdr.TransactionEnvelope.fromXdr(params.transaction, 'base64');
         const tx = xdr.expectUnionVariant(env, 'envelopeTypeTx').v1.tx;
         const body = tx.operations[0].body;
@@ -618,7 +638,7 @@ export function attachInProcessRpc(
                 leeway,
                 lastClosed(),
               )
-            : ledger.simulate(hostFn, sourceAccountId.toXdr('base64'), leeway, lastClosed());
+            : ledger.simulate(hostFn, sourceAccountId.toXdr('base64'), leeway, lastClosed(), useUpgradedAuth);
         if (!sim.ok) {
           return ok({ error: sim.error, latestLedger: lastClosed() });
         }

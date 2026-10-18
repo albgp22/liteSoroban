@@ -380,6 +380,12 @@ then closes: `getTransaction().ledger` is `latest + 1`, and `getLatestLedger`
 reports it from then on. Bounds a client writes from `latest` mean what they
 would on a network.
 
+Auth entries are a node's too. SDK 17 simulates with `useUpgradedAuth: true`, so
+an address that is not the source comes back as a CAP-71
+`sorobanCredentialsAddressV2` entry, as from stellar-rpc; pass `false` to
+`simulateTransaction` for a legacy `sorobanCredentialsAddress` one. The SDK's
+`authorizeEntry` and `signAuthEntriesSync` sign either and keep the arm.
+
 `contract.Client` works the same way — pass `server` in `ClientOptions`; the
 constructor, `Client.from`, `Client.fromWasmHash` and, since SDK 17.0.0,
 `Client.deploy` (`client.js:71`) all honour it. Through 16.2.0 `Client.deploy`
