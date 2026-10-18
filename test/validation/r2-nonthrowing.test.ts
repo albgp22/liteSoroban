@@ -70,9 +70,9 @@ describe('ROUND 2 — fix 11: non-throwing failures', () => {
   it('HOLDS: send() returns ok:false when the declared instruction budget is exceeded', () => {
     const L = new Ledger();
     const { src, addr } = scaffold(L);
-    // Turned on only AFTER the deploy: the crate documents that enforcing the
-    // declared count makes every deploy fail (module cache is not wired up).
-    (L as any).env.enforceDeclaredResources(true);
+    // On by default now that the enforcing path has a module cache (it used to
+    // make every deploy fail); explicit here because this test is about it.
+    L.enforceDeclaredResources(true);
     const fn = invokeHostFn(addr, 'put_persistent', [sym('k'), u64(1n)]);
     const sim = L.simulate(fn, src);
     const res = xdr.SorobanResources.fromXDR(sim.resourcesXdr, 'base64');

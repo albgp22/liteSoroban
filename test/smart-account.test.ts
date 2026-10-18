@@ -83,10 +83,24 @@ describe('custom account: signing auth entries for __check_auth', () => {
   it('sending the recorded (unsigned) auth entry is rejected by __check_auth', () => {
     const fn = invokeHostFn(addr, 'add_signer', [adminSigner(Keypair.random())]);
     const sim = L.simulate(fn, source);
+    // The recording never ran __check_auth, so the instruction count it declares
+    // does not cover it. Enforcing that count (the default) kills the call with
+    // Budget first, as on a network; switch it off to reach the host's own
+    // rejection of the signature.
+    L.enforceDeclaredResources(false);
     const sent = L.send(fn, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
 
     expect(sent.ok).toBe(false);
     expect(sent.error).toContain('Auth');
+  });
+
+  it('with the declared limit enforced, the same mistake runs out of budget before __check_auth rejects it', () => {
+    const fn = invokeHostFn(addr, 'add_signer', [adminSigner(Keypair.random())]);
+    const sim = L.simulate(fn, source);
+    const sent = L.send(fn, source, sim.resourcesXdr, sim.authXdr, sim.restoredRwEntryIndices);
+
+    expect(sent.ok).toBe(false);
+    expect(sent.error).toContain('Budget');
   });
 
   // Skipping the enforcing re-simulation is the mistake that costs an afternoon.
