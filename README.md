@@ -62,12 +62,12 @@ table moves away from the host's defaults; to match a specific network exactly
 svm.withNetworkCostParams(await loadCostParamsFromRpc(mainnetServer));
 ```
 
-**Re-measured against a protocol-29 node for seven scenarios** (see "Apply-path
-metering" below); the rest of the pinned numbers are still protocol-27. The
-differential numbers in this table were measured with host 27.0.1 against a live
-protocol-27 node
+The differential numbers in this table were measured with host 27.0.1 against a
+live protocol-27 node
 (stellar-rpc 27.1.1, captive-core 27.1.0), in-process raw vs the node's implied
-raw, with the protocol-27 table installed:
+raw, with the protocol-27 table installed. They are kept as the record of the
+27 to 29 drift; the node numbers pinned in `test/validation/` have since been
+re-captured against a protocol-29 node (below):
 
 | scenario | protocol-27 node | host 27.0.1 | host 29.0.2 |
 |---|---:|---:|---:|
@@ -78,9 +78,19 @@ raw, with the protocol-27 table installed:
 
 The host 29.0.2 column is the same table against the same protocol-27 node, so
 the drift is the host's own metering moving between versions, not calibration.
-Against a protocol-29 node the recorded counts are exact: see "Apply-path
-metering". The `test/validation/` calibration constants are still the
-protocol-27 ones and stay red until they are re-pinned.
+Against a protocol-29 node (stellar-rpc 29.0.1, stellar-core v29.0.0,
+re-captured 2026-10-18) the recorded counts are exact, to the instruction, on
+every scenario whose footprint is pure Soroban: an upload, a deploy, `add`,
+`put_persistent`, `get_persistent`, a 10 KB write, a cross-contract call and a
+custom account's `__check_auth` round trip. The `test/validation/` calibration
+constants are pinned to that node. Footprints holding a classic `AccountEntry`
+now simulate within 0.5% too (a native SAC transfer between two G-accounts:
+159,818 against the node's 159,028, with disk and write bytes exact), since
+simulation reads accounts promoted to ext v3 the way stellar-rpc's preflight
+does, and `instructionLeeway` is exact. One residue: that transfer's APPLIED
+memory through the low-level `Ledger.send` is ~7% under the node, because that
+path never bumps the payer's sequence, which on a network promotes it to ext v3;
+an envelope through `sendTransaction` does get the promotion.
 
 What *was* byte-identical to the protocol-27 node on all six scenarios: footprints
 (read-only and read-write key sets), return `ScVal`s, contract events, and
@@ -213,10 +223,10 @@ live protocol-29 node (stellar-core 29.0.0, stellar-rpc 29.0.1, measured
 Applied memory (`mem_byte`) is now exact on all seven (it was 2.9-9.9% high), and
 the recorded counts equal the node's implied raw counts exactly. A custom
 account's `__check_auth` was +219.6% CPU and +53.1% memory; against the
-protocol-27 node, with host 27.0.1, the same change brings it to +0.5% and +0.0%
-(not re-run on a protocol-29 node). Uploads of bytes the node had already stored
-differ by 1-3% in both directions; that is the existing-code artifact described in
-`test/validation/differential.test.ts`, not the cache.
+protocol-29 node the same change brings it to +0.06-0.08% and +0.0%. Uploads of
+bytes the node had already stored differ by 1-3% in both directions; that is the
+existing-code artifact described in `test/validation/differential.test.ts`, not
+the cache.
 
 That also made it safe to enforce the instruction count a transaction declares,
 which is now **on by default** (`ledger.enforceDeclaredResources(false)` turns it

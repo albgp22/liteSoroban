@@ -75,7 +75,6 @@ import {
   type SimulateResult,
 } from '../../src/index.js';
 import { wrapWallet, type Wallet } from '../../src/fixtures.js';
-import { PROTOCOL_27_COST_PARAMS } from '../../src/cost-params.js';
 
 // ---------------------------------------------------------------------------
 // the live network
@@ -406,24 +405,109 @@ async function mirror(L: Ledger, keys: xdr.LedgerKey[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// ground truth: the pinned host's `Budget::default()` CPU cost model. Since
-// soroban-env-host 28.0.0 that is the live calibration; on 29.0.2 it equals the
-// shipped protocol-27 table entry for entry (test/cost-params.test.ts asserts
-// it). An earlier version hard-coded 27.0.1's defaults here, which were
-// stellar-core's protocol-20 `initialCpuCostParamsEntryForV20`, and so failed
-// against any network running the current host.
+// ground truth: soroban-env-host 29.0.2 `Budget::default()` CPU cost model
+// (src/budget.rs, `impl Default for BudgetImpl`), in XDR ContractCostType order,
+// as (const_term, lin_term). This is what the in-process harness meters with. A
+// real network meters with ConfigSettingContractCostParamsCpuInstructions read
+// from the ledger.
+//
+// Up to 27.0.1 these defaults were the protocol-20 calibration
+// (`initialCpuCostParamsEntryForV20`: ValDeser 59_052, VmInstantiation 451_626);
+// 28.0.0 replaced them with the live network calibration. Pinned here:
+// all 86 entries parsed out of the 29.0.2 source and checked against the
+// protocol-29 quickstart node (stellar-rpc 29.0.1 / stellar-core v29.0.0,
+// 2026-10-18), which carries the same table and also the one shipped in
+// src/costparams/protocol27.json.
 // ---------------------------------------------------------------------------
 
-const HOST_DEFAULT_CPU_COST_PARAMS: ReadonlyArray<readonly [string, number, number]> = (
-  xdr.ContractCostParams.fromXDR(PROTOCOL_27_COST_PARAMS.cpuInstructions, 'base64') as any[]
-).map(
-  (e, i) =>
-    [
-      (xdr.ContractCostType as any).fromValue(i).name as string,
-      Number(e.constTerm().toString()),
-      Number(e.linearTerm().toString()),
-    ] as const,
-);
+const HOST_DEFAULT_CPU_COST_PARAMS: ReadonlyArray<readonly [string, number, number]> = [
+  ['WasmInsnExec', 4, 0],
+  ['MemAlloc', 434, 16],
+  ['MemCpy', 42, 16],
+  ['MemCmp', 44, 16],
+  ['DispatchHostFunction', 295, 0],
+  ['VisitObject', 60, 0],
+  ['ValSer', 221, 26],
+  ['ValDeser', 331, 4369],
+  ['ComputeSha256Hash', 3636, 7013],
+  ['ComputeEd25519PubKey', 40256, 0],
+  ['VerifyEd25519Sig', 377551, 4059],
+  ['VmInstantiation', 417482, 45712],
+  ['VmCachedInstantiation', 41142, 634],
+  ['InvokeVmFunction', 1945, 0],
+  ['ComputeKeccak256Hash', 6481, 5943],
+  ['DecodeEcdsaCurve256Sig', 711, 0],
+  ['RecoverEcdsaSecp256k1Key', 2314804, 0],
+  ['Int256AddSub', 4176, 0],
+  ['Int256Mul', 4716, 0],
+  ['Int256Div', 4680, 0],
+  ['Int256Pow', 4256, 0],
+  ['Int256Shift', 884, 0],
+  ['ChaCha20DrawBytes', 1059, 502],
+  ['ParseWasmInstructions', 73077, 25410],
+  ['ParseWasmFunctions', 0, 540752],
+  ['ParseWasmGlobals', 0, 176363],
+  ['ParseWasmTableEntries', 0, 29989],
+  ['ParseWasmTypes', 0, 1061449],
+  ['ParseWasmDataSegments', 0, 237336],
+  ['ParseWasmElemSegments', 0, 328476],
+  ['ParseWasmImports', 0, 701845],
+  ['ParseWasmExports', 0, 429383],
+  ['ParseWasmDataSegmentBytes', 0, 28],
+  ['InstantiateWasmInstructions', 43030, 0],
+  ['InstantiateWasmFunctions', 0, 7556],
+  ['InstantiateWasmGlobals', 0, 10711],
+  ['InstantiateWasmTableEntries', 0, 3300],
+  ['InstantiateWasmTypes', 0, 0],
+  ['InstantiateWasmDataSegments', 0, 23038],
+  ['InstantiateWasmElemSegments', 0, 42488],
+  ['InstantiateWasmImports', 0, 828974],
+  ['InstantiateWasmExports', 0, 297100],
+  ['InstantiateWasmDataSegmentBytes', 0, 14],
+  ['Sec1DecodePointUncompressed', 1882, 0],
+  ['VerifyEcdsaSecp256r1Sig', 3000906, 0],
+  ['Bls12381EncodeFp', 661, 0],
+  ['Bls12381DecodeFp', 985, 0],
+  ['Bls12381G1CheckPointOnCurve', 1934, 0],
+  ['Bls12381G1CheckPointInSubgroup', 730510, 0],
+  ['Bls12381G2CheckPointOnCurve', 5921, 0],
+  ['Bls12381G2CheckPointInSubgroup', 1057822, 0],
+  ['Bls12381G1ProjectiveToAffine', 92642, 0],
+  ['Bls12381G2ProjectiveToAffine', 100742, 0],
+  ['Bls12381G1Add', 7689, 0],
+  ['Bls12381G1Mul', 2458985, 0],
+  ['Bls12381G1Msm', 2347584, 94135478],
+  ['Bls12381MapFpToG1', 1020885, 0],
+  ['Bls12381HashToG1', 2638451, 6803],
+  ['Bls12381G2Add', 25207, 0],
+  ['Bls12381G2Mul', 7873219, 0],
+  ['Bls12381G2Msm', 7663880, 298580871],
+  ['Bls12381MapFp2ToG2', 1856539, 0],
+  ['Bls12381HashToG2', 6315452, 7232],
+  ['Bls12381Pairing', 10558948, 632860943],
+  ['Bls12381FrFromU256', 1994, 0],
+  ['Bls12381FrToU256', 1155, 0],
+  ['Bls12381FrAddSub', 74, 0],
+  ['Bls12381FrMul', 332, 0],
+  ['Bls12381FrPow', 691, 74558],
+  ['Bls12381FrInv', 35421, 0],
+  ['Bn254EncodeFp', 344, 0],
+  ['Bn254DecodeFp', 476, 0],
+  ['Bn254G1CheckPointOnCurve', 904, 0],
+  ['Bn254G2CheckPointOnCurve', 2811, 0],
+  ['Bn254G2CheckPointInSubgroup', 1706052, 0],
+  ['Bn254G1ProjectiveToAffine', 61, 0],
+  ['Bn254G1Add', 3623, 0],
+  ['Bn254G1Mul', 1150435, 0],
+  ['Bn254Pairing', 5263916, 392472814],
+  ['Bn254FrFromU256', 2052, 0],
+  ['Bn254FrToU256', 1133, 0],
+  ['Bn254FrAddSub', 74, 0],
+  ['Bn254FrMul', 332, 0],
+  ['Bn254FrPow', 755, 68930],
+  ['Bn254FrInv', 33151, 0],
+  ['Bn254G1Msm', 1185193, 41568084],
+];
 
 // ---------------------------------------------------------------------------
 // ground-truth anchor — no node required
@@ -904,9 +988,11 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
     expect(live.length, 'cost parameter table length').toBe(HOST_DEFAULT_CPU_COST_PARAMS.length);
     expect(
       differences,
-      'The in-process host meters with the pinned soroban-env-host `Budget::default()`. A network ' +
-        'meters with its ConfigSettingContractCostParamsCpuInstructions; where they differ, load it ' +
-        'with withNetworkCostParams(await loadCostParamsFromRpc(server)). Differing entries:\n' +
+      'The in-process host builds its budget with soroban-env-host `Budget::default()`. Up to ' +
+        "27.0.1 that was stellar-core's `initialCpuCostParamsEntryForV20()` (the protocol-20 " +
+        'calibration, which a network only carries until its first settings upgrade); from ' +
+        "28.0.0 it is the live network's calibration, so on the pinned 29.0.2 it must equal " +
+        'ConfigSettingContractCostParamsCpuInstructions on a protocol-29 node. Differing entries:\n' +
         differences.join('\n'),
     ).toEqual([]);
   });
