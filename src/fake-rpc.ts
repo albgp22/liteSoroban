@@ -156,7 +156,8 @@ function transactionMeta(outcome: TxOutcome): xdr.TransactionMeta {
       txChangesAfter: [],
       sorobanMeta,
       events: [],
-      diagnosticEvents: [],
+      // Core records them here; stellar-rpc's getTransaction reads them back.
+      diagnosticEvents: (outcome.diagnosticEventsXdr ?? []).map((e) => xdr.DiagnosticEvent.fromXdr(e, 'base64')),
     }),
   );
 }
@@ -219,6 +220,9 @@ function rawTransaction(tx: SubmittedTx, latestLedger: number) {
     envelopeXdr: tx.envelopeB64,
     resultXdr: tx.resultXdr,
     resultMetaXdr: tx.resultMetaXdr,
+    // The meta's diagnostic events (stellar-rpc 29.0.1 db/transaction.go
+    // GetDiagnosticEvents -> methods/get_transaction.go), `omitempty`.
+    ...(tx.outcome.diagnosticEventsXdr?.length ? { diagnosticEventsXdr: tx.outcome.diagnosticEventsXdr } : {}),
     ledger: tx.ledger,
     createdAt: String(tx.createdAt),
     events: { contractEventsXdr: [tx.outcome.eventsXdr ?? []] },

@@ -18,8 +18,9 @@
  * - The host's budget: an applied invocation runs under its DECLARED
  *   instructions and txMemoryLimit (InvokeHostFunctionOpFrame.cpp:51, :690;
  *   rust bridge soroban_proto_any.rs:446 Budget::try_from_configs), and fails
- *   RESOURCE_LIMIT_EXCEEDED past either (:737-753). stellar-rpc 29.0.1's
- *   preflight simulates under txMaxInstructions and txMemoryLimit
+ *   RESOURCE_LIMIT_EXCEEDED past either, with core's own diagnostic after the
+ *   host's (:737-753). stellar-rpc 29.0.1's preflight simulates under
+ *   txMaxInstructions and txMemoryLimit
  *   (preflight/src/shared.rs:134 NetworkConfig::load_from_snapshot ->
  *   soroban-simulation simulation.rs:133 -> network_config.rs:152-166, the same
  *   in 29.0.1 and 29.0.2). Both come from ContractComputeV0.
@@ -31,9 +32,11 @@
  * restore and oversized-entry cases on a private one started with testnet's
  * limits but minPersistentTTL 20, then upgraded to contractDataEntrySizeBytes
  * 2,000. The host-budget cases ran on the shared node through
- * .probe-live-ceiling.mts. Core puts the values in its diagnostic's arguments;
- * `detail` writes them `value > limit`. Successful calls are not compared on fees here: their
- * rent follows the state-archival TTLs, which are not yet the node's.
+ * .probe-live-ceiling.mts and .probe-live-insns.mts, and on a private one
+ * upgraded to txMemoryLimit 2,000,000 through .probe-live-mem.mts. Core puts
+ * the values in its diagnostic's arguments; `detail` writes them
+ * `value > limit`. Successful calls are not compared on fees here: their rent
+ * follows the state-archival TTLs, which are not yet the node's.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -132,13 +135,17 @@ function submit(tx: Transaction | FeeBumpTransaction, payer = a) {
   return { ...out, debited: before - balance(payer) };
 }
 
+/** The getTransaction response `run` last polled. */
+let polled: any;
+
 /** Through rpc.Server, as an app sees it. */
 async function run(tx: Transaction, payer = a) {
   tx.sign(payer);
   const before = balance(payer);
+  polled = undefined;
   const sent = await S.sendTransaction(tx);
   if (sent.status === 'ERROR') return { status: `ERROR ${sent.errorResult!.result.type}`, op: '', fee: 0n, debited: 0n };
-  const got: any = await S.pollTransaction(sent.hash);
+  const got: any = (polled = await S.pollTransaction(sent.hash));
   const result: xdr.TransactionResult = got.resultXdr;
   return {
     status: got.status as string,
@@ -166,6 +173,24 @@ const dataKey = (k: xdr.ScVal, durability: 'persistent' | 'temporary' = 'persist
       durability: xdr.ContractDataDurability[durability],
     }),
   );
+const firstTopic = (d: xdr.DiagnosticEvent) =>
+  xdr.expectUnionVariant(xdr.expectUnionVariant(d.event.body, 'v0').v0.topics[0], 'scvSymbol').sym.toString();
+/**
+ * A diagnostic as core's DiagnosticEventManager::pushError builds it (topics
+ * `["error", Error(type, code)]`, data `[message, ...u64]`), as
+ * [type, code, message, ...values].
+ */
+const coreError = (d: xdr.DiagnosticEvent) => {
+  const body = xdr.expectUnionVariant(d.event.body, 'v0').v0;
+  const err = xdr.expectUnionVariant(body.topics[1], 'scvError').error;
+  const [message, ...args] = xdr.expectUnionVariant(body.data, 'scvVec').vec!;
+  return [
+    err.type,
+    xdr.expectUnionVariant(err, 'sceBudget').code.name,
+    xdr.expectUnionVariant(message, 'scvString').str.toString(),
+    ...args.map((v) => xdr.expectUnionVariant(v, 'scvU64').u64),
+  ];
+};
 const accountKey = (k: Keypair) => xdr.LedgerKey.account(new xdr.LedgerKeyAccount({ accountId: k.xdrAccountId() }));
 const call = (fn: string, args: xdr.ScVal[]) => Operation.invokeContractFunction({ contract: store, function: fn, args });
 const put = (k: string) => call('put_persistent', [sym(k), u64(1n)]);
@@ -531,6 +556,51 @@ describe("the host's budget: txMaxInstructions and txMemoryLimit", () => {
     });
   });
 
+  it("stops a host charge past the declared instructions, and says so in core's own diagnostic", async () => {
+    // The shared node, settings untouched (.probe-live-insns.mts): loadgen's
+    // host cycles are u256_add host calls, so a HOST charge, not guest fuel,
+    // passes the declared count. Core then fails the operation and pushes
+    // ["operation instructions exceeds amount specified", consumed, declared]
+    // after the host's events (InvokeHostFunctionOpFrame.cpp:737-745); its
+    // getTransaction serves the meta's list as diagnosticEventsXdr. The node's
+    // list also has the rust bridge's host_fn_failed just before core's event
+    // (soroban_proto_any.rs:537) and 19 core_metrics after it; the harness
+    // emits neither.
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    const op = Operation.invokeContractFunction({
+      contract: loadgen, function: 'do_cpu_only_work', args: [u32(0), u32(5_000), u32(0)],
+    });
+    const full = await prepared(op);
+    expect(declared(full)).toBe(25_684_205);
+    const declaring = async (instructions: number) => withData(op, withResources(sorobanData(full), { instructions }));
+    const limit = 'invokeHostFunctionResourceLimitExceeded';
+    const message = 'operation instructions exceeds amount specified';
+    for (const [instructions, consumed, fee, host] of [
+      [20_000_000, 20_003_942n, 16_930n, ['fn_call', 'error']],
+      [2_000_000, 2_000_567n, 4_330n, ['fn_call', 'error']],
+      // Out before the guest runs, on the module's instantiation: no host error.
+      [100_000, 151_745n, 3_000n, ['fn_call']],
+    ] as const) {
+      expect(await run(await declaring(instructions))).toEqual({ status: 'FAILED', op: limit, fee, debited: fee });
+      const diagnostics: xdr.DiagnosticEvent[] = polled.diagnosticEventsXdr;
+      expect(diagnostics.map(firstTopic), `${instructions}`).toEqual([...host, 'error']);
+      expect(coreError(diagnostics.at(-1)!)).toEqual(['sceBudget', 'scecExceededLimit', message, consumed, BigInt(instructions)]);
+      expect(polled.resultMetaXdr.v4.diagnosticEvents.map((e: xdr.DiagnosticEvent) => e.toXdr('base64'))).toEqual(
+        diagnostics.map((e) => e.toXdr('base64')),
+      );
+    }
+    // The node's event for 20,000,000, byte for byte.
+    expect(submit(await declaring(20_000_000)).diagnosticEventsXdr!.at(-1)).toBe(
+      'AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAACAAAADwAAAAVlcnJvcgAAAAAAAAIAAAAHAAAABQAAABAAAAABAAAAAwAAAA4AAAAvb3BlcmF0aW9uIGluc3RydWN0aW9ucyBleGNlZWRzIGFtb3VudCBzcGVjaWZpZWQAAAAABQAAAAABMTxmAAAABQAAAAABMS0A',
+    );
+    // The classic layer: `detail` is core's diagnostic, `error` still the host's.
+    expect(submit(await declaring(2_000_000))).toMatchObject({
+      invokeResult: limit,
+      detail: `${message}: 2000567 > 2000000`,
+      error: expect.stringContaining('Error(Budget, ExceededLimit)'),
+    });
+  });
+
   it("is the fee settings' txMaxInstructions: one value bounds simulation and submission", async () => {
     const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
     const tx = await prepared(work(loadgen, 3_000_000));
@@ -575,32 +645,50 @@ describe("the host's budget: txMaxInstructions and txMemoryLimit", () => {
     // guest's linear memory that cannot grow is refused WITHOUT being charged
     // (budget/wasmi_helper.rs:33-47), so the peak stays under the limit and
     // the node reports a trap: "GrowthOperationLimited", "OutOfBoundsGrowth".
-    const cases: [xdr.Operation, string, bigint][] = [
+    // Past it, core pushes its own diagnostic, ["operation memory usage exceeds
+    // network config limit", peak, txMemoryLimit] (:746-753); the node's peak
+    // is the fourth column where its text was read.
+    const memory = 'operation memory usage exceeds network config limit';
+    const events = invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(0), u32(1_000)]);
+    const cases: [xdr.Operation, string, bigint, bigint?][] = [
       [invoke(alloc, 'sum', [u32(10)]), ok, 4_168n],
       [invoke(alloc, 'sum', [u32(100)]), trapped, 12_951n],
       [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(5_000), u32(0)]), ok, 21_085n],
       [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(20_000), u32(0)]), limit, 74_144n],
       // the node: "operation memory usage exceeds network config limit: 2000207, 2000000"
-      [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(0), u32(1_000)]), limit, 9_289n],
+      [events, limit, 9_289n, 2_000_207n],
       [upload(20_000), trapped, 121_794n],
       // the node: "operation memory usage exceeds network config limit: 2612663, 2000000"
-      [upload(60_000), limit, 353_925n],
+      [upload(60_000), limit, 353_925n, 2_612_663n],
     ];
     const sent: [Transaction, Keypair][] = [];
     for (const [op] of cases) {
       a = fund();
       sent.push([await prepared(op), a]);
     }
+    a = fund();
+    const viaClassic: [Transaction, Keypair] = [await prepared(events), a];
     svm.withFeeSettings({ ...QUICKSTART, txMemoryLimit: 2_000_000 });
-    for (const [i, [op, code, fee]] of cases.entries()) {
+    for (const [i, [op, code, fee, peak]] of cases.entries()) {
       const [tx, payer] = sent[i];
       expect(await run(tx, payer), `case ${i}`).toEqual({
         status: code === ok ? 'SUCCESS' : 'FAILED', op: code, fee, debited: fee,
       });
+      if (peak !== undefined) {
+        expect(coreError(polled.diagnosticEventsXdr.at(-1)), `case ${i}`).toEqual([
+          'sceBudget', 'scecExceededLimit', memory, peak, 2_000_000n,
+        ]);
+      }
       // Simulation runs under the same 2,000,000 bytes: what failed for memory
       // no longer simulates.
       a = fund();
       expect(await simError(op), `case ${i}`).toEqual(code === ok ? 'simulated' : expect.stringContaining('Error(Budget, ExceededLimit)'));
     }
+    // The classic layer: `detail` is core's diagnostic, `error` still the host's.
+    expect(submit(...viaClassic)).toMatchObject({
+      invokeResult: limit,
+      detail: `${memory}: 2000207 > 2000000`,
+      error: expect.stringContaining('Error(Budget, ExceededLimit)'),
+    });
   });
 });

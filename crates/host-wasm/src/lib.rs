@@ -166,6 +166,43 @@ fn encode_diagnostics(events: &[soroban_env_host::xdr::DiagnosticEvent]) -> Vec<
         .collect()
 }
 
+/// A diagnostic event stellar-core itself pushes, as its
+/// DiagnosticEventManager::pushError builds one (EventManager.cpp:175-210,
+/// v29.0.0): no contract, topics `["error", error]`, data the message string
+/// followed by `args`, or the bare string when there are none.
+fn core_error_event(
+    error: soroban_env_host::xdr::ScError,
+    message: &str,
+    args: Vec<soroban_env_host::xdr::ScVal>,
+) -> soroban_env_host::xdr::DiagnosticEvent {
+    use soroban_env_host::xdr::{
+        ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
+        ScString, ScSymbol, ScVal, ScVec,
+    };
+    let text = ScVal::String(ScString(message.try_into().unwrap_or_default()));
+    let data = if args.is_empty() {
+        text
+    } else {
+        let mut items = vec![text];
+        items.extend(args);
+        ScVal::Vec(Some(ScVec(items.try_into().unwrap_or_default())))
+    };
+    DiagnosticEvent {
+        in_successful_contract_call: false,
+        event: ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Diagnostic,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![ScVal::Symbol(ScSymbol("error".try_into().unwrap_or_default())), ScVal::Error(error)]
+                    .try_into()
+                    .unwrap_or_default(),
+                data,
+            }),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ledger state
 // ---------------------------------------------------------------------------
@@ -355,6 +392,10 @@ struct SendResult {
     /// The InvokeHostFunctionResultCode stellar-core would report for a failed
     /// call, as the js-xdr arm name; None on success.
     result_code: Option<String>,
+    /// For a call the host failed past its budget, core's own diagnostic (also
+    /// appended to `diagnostic_events_xdr`) as text, `value > limit`. `error`
+    /// keeps the host's error.
+    detail: Option<String>,
     /// On success: the rent the ledger changes cost (`compute_rent_fee`), the
     /// size of the contract events plus the return value, and what the call
     /// consumed of the refundable resource fee (rent + events fee). 0 otherwise.
@@ -1114,6 +1155,7 @@ impl SorobanEnv {
             Err(e) => {
                 let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
                 let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
+                let (code, detail) = self.failed_call(&resources, cpu_insns, mem_bytes, &mut diagnostics);
                 let out = SendResult {
                     ok: false,
                     error: Some(format!("{e:?}")),
@@ -1125,7 +1167,8 @@ impl SorobanEnv {
                     cpu_insns,
                     mem_bytes,
                     ttl_changed_keys: Vec::new(),
-                    result_code: Some(self.failed_call_code(&resources, cpu_insns, mem_bytes).to_string()),
+                    result_code: Some(code.to_string()),
+                    detail,
                     rent_fee: 0,
                     contract_events_size_bytes: 0,
                     refundable_fee_consumed: 0,
@@ -1146,6 +1189,7 @@ impl SorobanEnv {
         // returns: collectEvents, then consumeRefundableResources. Either can
         // still fail the operation, and then none of its changes land.
         let mut result_code = None;
+        let mut detail = None;
         let (mut rent_fee, mut contract_events_size_bytes, mut refundable_fee_consumed) = (0, 0, 0);
         let mut events_xdr: Vec<String> = res.encoded_contract_events.iter().map(|e| b64e(e)).collect();
         if let Ok(result_value) = &res.encoded_invoke_result {
@@ -1167,7 +1211,9 @@ impl SorobanEnv {
                 }
             }
         } else {
-            result_code = Some(self.failed_call_code(&resources, cpu_insns, mem_bytes).to_string());
+            let (code, budget_detail) = self.failed_call(&resources, cpu_insns, mem_bytes, &mut diagnostics);
+            result_code = Some(code.to_string());
+            detail = budget_detail;
         }
 
         let mut changed_keys = Vec::new();
@@ -1222,6 +1268,7 @@ impl SorobanEnv {
             mem_bytes,
             ttl_changed_keys,
             result_code,
+            detail,
             rent_fee,
             contract_events_size_bytes,
             refundable_fee_consumed,
@@ -1251,6 +1298,7 @@ impl SorobanEnv {
             mem_bytes: 0,
             ttl_changed_keys: Vec::new(),
             result_code: Some("invokeHostFunctionResourceLimitExceeded".to_string()),
+            detail: None,
             rent_fee: 0,
             contract_events_size_bytes: 0,
             refundable_fee_consumed: 0,
@@ -1294,16 +1342,36 @@ impl SorobanEnv {
         Ok(())
     }
 
-    /// stellar-core InvokeHostFunctionOpFrame::invokeHostFunction, when the
-    /// host fails: RESOURCE_LIMIT_EXCEEDED if it burned more instructions than
-    /// declared or more memory than the network allows, TRAPPED otherwise.
-    fn failed_call_code(&self, resources: &SorobanResources, cpu_insns: u64, mem_bytes: u64) -> &'static str {
+    /// stellar-core InvokeHostFunctionOpFrame::invokeHostFunction (:730-756,
+    /// v29.0.0), when the host fails: RESOURCE_LIMIT_EXCEEDED if it burned more
+    /// instructions than declared or, at its peak, more memory than the network
+    /// allows, TRAPPED otherwise. For the first two core pushes its own
+    /// diagnostic after the host's, `[consumed, limit]`; it lands on
+    /// `diagnostics`, and its text, `consumed > limit`, is returned with the
+    /// code.
+    fn failed_call(
+        &self,
+        resources: &SorobanResources,
+        cpu_insns: u64,
+        mem_bytes: u64,
+        diagnostics: &mut Vec<soroban_env_host::xdr::DiagnosticEvent>,
+    ) -> (&'static str, Option<String>) {
+        use soroban_env_host::xdr::{ScError as XdrScError, ScErrorCode, ScVal};
+        let declared = u64::from(resources.instructions);
         let tx_memory_limit = self.tx_limits().map_or(u64::MAX, |(_, mem)| mem);
-        if (resources.instructions as u64) < cpu_insns || tx_memory_limit < mem_bytes {
-            "invokeHostFunctionResourceLimitExceeded"
+        let (message, consumed, limit) = if declared < cpu_insns {
+            ("operation instructions exceeds amount specified", cpu_insns, declared)
+        } else if tx_memory_limit < mem_bytes {
+            ("operation memory usage exceeds network config limit", mem_bytes, tx_memory_limit)
         } else {
-            "invokeHostFunctionTrapped"
-        }
+            return ("invokeHostFunctionTrapped", None);
+        };
+        diagnostics.push(core_error_event(
+            XdrScError::Budget(ScErrorCode::ExceededLimit),
+            message,
+            vec![ScVal::U64(consumed), ScVal::U64(limit)],
+        ));
+        ("invokeHostFunctionResourceLimitExceeded", Some(format!("{message}: {consumed} > {limit}")))
     }
 
     /// stellar-core InvokeHostFunctionOpFrame `collectEvents` and

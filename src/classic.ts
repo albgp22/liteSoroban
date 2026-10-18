@@ -89,6 +89,11 @@ export interface TxOutcome {
   /** Diagnostic text, mirroring core's diagnostic events. */
   detail?: string;
   /**
+   * An applied InvokeHostFunction's diagnostic events, as core records them in
+   * the meta: the host's, then core's own (a budget failure's, for one).
+   */
+  diagnosticEventsXdr?: string[];
+  /**
    * Rejected by validation before touching the ledger: no fee, no sequence
    * number. stellar-rpc reports these as ERROR at submit, whatever the code —
    * including a txFAILED whose operation failed its signature check.
@@ -1079,6 +1084,8 @@ function applyInner(
       removedKeys: sent.removedKeys,
       invokeResult: sent.ok ? undefined : (sent.resultCode as TxOutcome['invokeResult']),
       error: sent.error,
+      detail: sent.detail,
+      diagnosticEventsXdr: sent.diagnosticEventsXdr,
     },
     sent.ok ? { refundable: BigInt(sent.refundableFeeConsumed), rent: BigInt(sent.rentFee) } : undefined,
   );

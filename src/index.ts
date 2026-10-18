@@ -74,6 +74,12 @@ export interface SendResult {
    * '...InsufficientRefundableFee'.
    */
   resultCode?: string;
+  /**
+   * For a call that failed past its budget, stellar-core's own diagnostic
+   * (InvokeHostFunctionOpFrame.cpp:737-753), `consumed > limit`. The event
+   * itself ends `diagnosticEventsXdr`; `error` keeps the host's error.
+   */
+  detail?: string;
   /** On success: the rent the call's ledger changes cost, in stroops. */
   rentFee: number;
   /** On success: contract events plus return value, in XDR bytes. */

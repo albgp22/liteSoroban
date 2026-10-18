@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 280 tests, ~800 ms
+npm test               # 281 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -218,13 +218,7 @@ and were checked scenario by scenario against a local protocol-29 node
   network's with `withFeeSettings(await loadFeeSettingsFromRpc(server))`. There
   is no surge pricing: the inclusion fee is always charged at the 100-stroop
   base fee.
-- Ledger-wide limits (`ledgerMax*`) are not modelled. A call that runs out of
-  instructions or memory at apply gets the node's result code (TRAPPED when the
-  guest runs out of fuel or cannot grow its memory, RESOURCE_LIMIT_EXCEEDED
-  when a host charge passes the limit), but its error is the host's
-  `Error(Budget, ExceededLimit)`, without core's own diagnostic
-  (`operation memory usage exceeds network config limit: 2612663, 2000000` on
-  the node; InvokeHostFunctionOpFrame.cpp:737-753).
+- Ledger-wide limits (`ledgerMax*`) are not modelled.
 - Simulating an extend over an expired persistent entry is an error here;
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
 
@@ -235,7 +229,10 @@ runs in it as stellar-rpc's preflight does, and a submission is validated agains
 and applied in the next one, so `getTransaction().ledger` is `latest + 1`. Checked
 against a local protocol-29 node (`test/rpc-ledger-numbers.test.ts`). Still wrong,
 found by review round 2:
-- Diagnostics do not reach `getTransaction`; fee stats are synthetic.
+- `getTransaction` carries an applied invocation's diagnostics, the host's and,
+  for a call past its budget, core's own, but not the `core_metrics` events core
+  adds to every invocation or the `host_fn_failed` it adds to a failed one; a
+  rejected submission carries none of core's. Fee stats are synthetic.
 - The harness has one clock. The latest ledger's close time is the timestamp the
   next transaction is validated and applied at, so once a transaction applies,
   `getLatestLedger` names its ledger with a close time 5 s after its `createdAt`.

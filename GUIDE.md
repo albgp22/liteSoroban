@@ -336,8 +336,12 @@ svm.withNetworkCostParams(await loadCostParamsFromRpc(mainnetServer));
 The table prices work; the network's limits cap it. A simulation may use up to
 the fee settings' `txMaxInstructions` and `txMemoryLimit` (testnet's: 400M
 instructions, 40 MiB), as stellar-rpc's preflight does, and an applied call its
-declared instructions. To pin a contract against a stricter network, install
-its settings, e.g. `withFeeSettings({ ...TESTNET_FEE_SETTINGS, txMaxInstructions: 100_000_000 })`.
+declared instructions. A host charge past either fails the call
+`invokeHostFunctionResourceLimitExceeded` with stellar-core's own diagnostic, last
+in `getTransaction`'s `diagnosticEventsXdr` and as text in the outcome's `detail`
+(`operation instructions exceeds amount specified: 2000567 > 2000000`). To pin a
+contract against a stricter network, install its settings, e.g.
+`withFeeSettings({ ...TESTNET_FEE_SETTINGS, txMaxInstructions: 100_000_000 })`.
 
 ## Testing your app unchanged
 
