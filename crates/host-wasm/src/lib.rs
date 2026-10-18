@@ -45,6 +45,9 @@ use soroban_env_host::e2e_testutils::{
 };
 use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_env_host::xdr::{
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
+    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, ExtensionPoint,
+    Liabilities, SponsorshipDescriptor, TimePoint,
     AccountId, HostFunction, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount,
     LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine, Limits, ReadXdr,
     ContractCostParams, ContractDataDurability, SorobanAuthorizationEntry, SorobanResources,
@@ -170,6 +173,82 @@ struct StoreSnapshot(Rc<RefCell<Store>>);
 impl SnapshotSource for StoreSnapshot {
     fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
         Ok(self.0.borrow().get(key).cloned())
+    }
+}
+
+/// What stellar-rpc's preflight actually reads through: soroban-simulation's
+/// `SimulationSnapshotSource` (snapshot_source.rs, 29.0.2), which wraps the
+/// snapshot right before recording mode and hands the host every AccountEntry
+/// already promoted to the ext v1 -> v2 -> v3 chain, "to emulate any ledger
+/// entry modifying logic that Core might perform before the Soroban host
+/// operation is invoked". Without it a never-transacted account simulates 52
+/// bytes small, and so does every native SAC transfer that touches one.
+/// Simulation only: on apply, core promotes just the transaction source, when
+/// it bumps the sequence (the classic layer does that).
+struct SimulationSnapshot {
+    inner: StoreSnapshot,
+    updated: RefCell<BTreeMap<Rc<LedgerKey>, Option<EntryWithLiveUntil>>>,
+}
+
+impl SnapshotSource for SimulationSnapshot {
+    fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        if let Some(e) = self.updated.borrow().get(key) {
+            return Ok(e.clone());
+        }
+        let entry = self.inner.get(key)?;
+        if let Some((e, live_until)) = &entry {
+            if let LedgerEntryData::Account(_) = &e.data {
+                let mut updated = (**e).clone();
+                if let LedgerEntryData::Account(acc) = &mut updated.data {
+                    update_account_entry(acc);
+                }
+                let v = Some((Rc::new(updated), *live_until));
+                self.updated.borrow_mut().insert(Rc::clone(key), v.clone());
+                return Ok(v);
+            }
+        }
+        Ok(entry)
+    }
+}
+
+/// soroban-simulation `update_account_entry`: fill in whatever part of the
+/// v1 -> v2 -> v3 chain is missing, zeroed, keeping what is already there.
+fn update_account_entry(acc: &mut AccountEntry) {
+    let signers = acc.signers.len();
+    let fill_v3 = |v2: &mut AccountEntryExtensionV2| {
+        if let AccountEntryExtensionV2Ext::V0 = v2.ext {
+            v2.ext = AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                ext: ExtensionPoint::V0,
+                seq_ledger: 0,
+                seq_time: TimePoint(0),
+            });
+        }
+    };
+    let fill_v2 = |v1: &mut AccountEntryExtensionV1| match &mut v1.ext {
+        AccountEntryExtensionV1Ext::V0 => {
+            let mut v2 = AccountEntryExtensionV2 {
+                num_sponsored: 0,
+                num_sponsoring: 0,
+                signer_sponsoring_i_ds: vec![SponsorshipDescriptor(None); signers]
+                    .try_into()
+                    .unwrap_or_default(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            };
+            fill_v3(&mut v2);
+            v1.ext = AccountEntryExtensionV1Ext::V2(v2);
+        }
+        AccountEntryExtensionV1Ext::V2(v2) => fill_v3(v2),
+    };
+    match &mut acc.ext {
+        AccountEntryExt::V0 => {
+            let mut v1 = AccountEntryExtensionV1 {
+                liabilities: Liabilities { buying: 0, selling: 0 },
+                ext: AccountEntryExtensionV1Ext::V0,
+            };
+            fill_v2(&mut v1);
+            acc.ext = AccountEntryExt::V1(v1);
+        }
+        AccountEntryExt::V1(v1) => fill_v2(v1),
     }
 }
 
@@ -564,7 +643,10 @@ impl SorobanEnv {
 
         let budget = self.make_budget(None)?;
         let mut diagnostics = Vec::new();
-        let snapshot: Rc<dyn SnapshotSource> = Rc::new(StoreSnapshot(Rc::clone(&self.store)));
+        let snapshot: Rc<dyn SnapshotSource> = Rc::new(SimulationSnapshot {
+            inner: StoreSnapshot(Rc::clone(&self.store)),
+            updated: RefCell::new(BTreeMap::new()),
+        });
 
         let res = invoke_host_function_in_recording_mode(
             &budget,

@@ -780,10 +780,64 @@ function applyInner(
   };
 }
 
+/**
+ * TransactionFrame::processSeqNum + maybeUpdateAccountOnLedgerSeqUpdate: from
+ * protocol 19 every sequence bump promotes the account to the AccountEntry
+ * ext v1 -> v2 -> v3 chain (prepareAccountEntryExtensionV3, TransactionUtils.cpp)
+ * and stamps seqLedger / seqTime with the ledger it applied in. The entry is
+ * then 52 bytes larger for good (more with signers), which the host meters as
+ * disk_read_bytes whenever the account is in a footprint.
+ */
 function bumpSequence(ledger: Ledger, id: xdr.AccountId, to: bigint): void {
   const account = loadAccount(ledger, id)!;
   account.seqNum(new xdr.SequenceNumber(new xdr.Int64(to)));
+  const v3 = prepareAccountEntryExtensionV3(account);
+  v3.seqLedger(ledger.ledgerSeq);
+  v3.seqTime(new xdr.TimePoint(xdr.Uint64.fromString(String(ledger.timestamp))));
   storeAccount(ledger, account);
+}
+
+/** Core's prepareAccountEntryExtensionV1/V2/V3: create what is missing, zeroed. */
+function prepareAccountEntryExtensionV3(account: xdr.AccountEntry): xdr.AccountEntryExtensionV3 {
+  if (account.ext().switch() === 0) {
+    account.ext(
+      new xdr.AccountEntryExt(
+        1,
+        new xdr.AccountEntryExtensionV1({
+          liabilities: new xdr.Liabilities({ buying: new xdr.Int64(0n), selling: new xdr.Int64(0n) }),
+          ext: new xdr.AccountEntryExtensionV1Ext(0),
+        }),
+      ),
+    );
+  }
+  const v1 = account.ext().v1();
+  if (v1.ext().switch() === 0) {
+    v1.ext(
+      new xdr.AccountEntryExtensionV1Ext(
+        2,
+        new xdr.AccountEntryExtensionV2({
+          numSponsored: 0,
+          numSponsoring: 0,
+          signerSponsoringIDs: account.signers().map(() => null),
+          ext: new xdr.AccountEntryExtensionV2Ext(0),
+        }),
+      ),
+    );
+  }
+  const v2 = v1.ext().v2();
+  if (v2.ext().switch() === 0) {
+    v2.ext(
+      new xdr.AccountEntryExtensionV2Ext(
+        3,
+        new xdr.AccountEntryExtensionV3({
+          ext: new xdr.ExtensionPoint(0),
+          seqLedger: 0,
+          seqTime: new xdr.TimePoint(xdr.Uint64.fromString('0')),
+        }),
+      ),
+    );
+  }
+  return v2.ext().v3();
 }
 
 function debit(ledger: Ledger, id: xdr.AccountId, amount: bigint): void {

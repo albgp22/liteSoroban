@@ -20,9 +20,12 @@ import {
   Operation,
   Transaction,
   TransactionBuilder,
+  nativeToScVal,
   xdr,
 } from '@stellar/stellar-sdk';
 import { LiteStellar, sc } from '../src/litestellar.js';
+import { invokeHostFn } from '../src/index.js';
+import { nativeToken, wrapWallet } from '../src/fixtures.js';
 import type { FundOptions } from '../src/classic.js';
 
 const ADD_I32 = new Uint8Array(
@@ -280,5 +283,56 @@ describe('fee-field validity comes first (TransactionFrame::XDRProvidesValidFee)
     fb.sign(f);
     const out = w.send(fb);
     expect([out.code, out.innerCode, out.feeCharged]).toEqual(['txMALFORMED', undefined, 0n]);
+  });
+});
+
+describe('AccountEntry extensions', () => {
+  // TransactionFrame::processSeqNum -> maybeUpdateAccountOnLedgerSeqUpdate ->
+  // prepareAccountEntryExtensionV3 (TransactionUtils.cpp). The local node, for
+  // a fresh account after one transaction: 80 -> 132 bytes, seqLedger = the
+  // ledger it applied in, seqTime = that ledger's close time.
+  it('a sequence bump promotes the source to ext v3: +52 bytes, stamped with the ledger', async () => {
+    const w = world();
+    const a = w.account();
+    const fresh = w.svm.getAccount(a.publicKey())!;
+    expect([fresh.ext().switch(), fresh.toXDR().length]).toEqual([0, 80]);
+
+    const tx = await w.addTx(a);
+    tx.sign(a);
+    const [ledgerSeq, closeTime] = [w.svm.ledger.ledgerSeq, w.svm.ledger.timestamp];
+    expect(w.send(tx).code).toBe('txSUCCESS');
+
+    const after = w.svm.getAccount(a.publicKey())!;
+    expect(after.toXDR().length).toBe(132);
+    const v3 = after.ext().v1().ext().v2().ext().v3();
+    expect([v3.seqLedger(), v3.seqTime().toString()]).toEqual([ledgerSeq, String(closeTime)]);
+  });
+
+  // soroban-simulation's SimulationSnapshotSource hands the host every account
+  // already promoted, so preflight charges a never-transacted account the same
+  // bytes as one that has transacted. The live differential suite pins the
+  // absolute numbers against a node; this pins the invariant.
+  it('simulation reads every account as ext v3, so a never-transacted one costs the same bytes', async () => {
+    const w = world();
+    const deployer = wrapWallet(w.svm.ledger, w.account());
+    const xlm = nativeToken(w.svm.ledger, deployer);
+    const toKp = w.account();
+    const to = wrapWallet(w.svm.ledger, toKp);
+    const transferReadBytes = () =>
+      w.svm.ledger.simulate(
+        invokeHostFn(xlm.address, 'transfer', [
+          xdr.ScVal.scvAddress(deployer.address),
+          xdr.ScVal.scvAddress(to.address),
+          nativeToScVal(1n, { type: 'i128' }),
+        ]),
+        deployer.accountIdB64,
+      ).readBytes;
+
+    const whileFresh = transferReadBytes();
+    const tx = await w.addTx(toKp); // `to` transacts once: now stored as v3
+    tx.sign(toKp);
+    expect(w.send(tx).code).toBe('txSUCCESS');
+    expect(w.svm.getAccount(toKp.publicKey())!.ext().switch()).toBe(1);
+    expect(transferReadBytes()).toBe(whileFresh);
   });
 });

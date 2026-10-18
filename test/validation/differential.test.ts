@@ -75,6 +75,7 @@ import {
   type SimulateResult,
 } from '../../src/index.js';
 import { wrapWallet, type Wallet } from '../../src/fixtures.js';
+import { PROTOCOL_27_COST_PARAMS } from '../../src/cost-params.js';
 
 // ---------------------------------------------------------------------------
 // the live network
@@ -405,100 +406,24 @@ async function mirror(L: Ledger, keys: xdr.LedgerKey[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// ground truth: soroban-env-host 27.0.1 `Budget::default()` CPU cost model
-// (src/budget.rs, `impl Default for BudgetImpl`), in XDR ContractCostType order.
-// This is what the in-process harness meters with. A real network meters with
-// ConfigSettingContractCostParamsCpuInstructions read from the ledger.
+// ground truth: the pinned host's `Budget::default()` CPU cost model. Since
+// soroban-env-host 28.0.0 that is the live calibration; on 29.0.2 it equals the
+// shipped protocol-27 table entry for entry (test/cost-params.test.ts asserts
+// it). An earlier version hard-coded 27.0.1's defaults here, which were
+// stellar-core's protocol-20 `initialCpuCostParamsEntryForV20`, and so failed
+// against any network running the current host.
 // ---------------------------------------------------------------------------
 
-const HOST_DEFAULT_CPU_COST_PARAMS: ReadonlyArray<readonly [string, number, number]> = [
-  ['WasmInsnExec', 4, 0],
-  ['MemAlloc', 434, 16],
-  ['MemCpy', 42, 16],
-  ['MemCmp', 44, 16],
-  ['DispatchHostFunction', 310, 0],
-  ['VisitObject', 61, 0],
-  ['ValSer', 230, 29],
-  ['ValDeser', 59052, 4001],
-  ['ComputeSha256Hash', 3738, 7012],
-  ['ComputeEd25519PubKey', 40253, 0],
-  ['VerifyEd25519Sig', 377524, 4068],
-  ['VmInstantiation', 451626, 45405],
-  ['VmCachedInstantiation', 41142, 634],
-  ['InvokeVmFunction', 1948, 0],
-  ['ComputeKeccak256Hash', 3766, 5969],
-  ['DecodeEcdsaCurve256Sig', 710, 0],
-  ['RecoverEcdsaSecp256k1Key', 2315295, 0],
-  ['Int256AddSub', 4404, 0],
-  ['Int256Mul', 4947, 0],
-  ['Int256Div', 4911, 0],
-  ['Int256Pow', 4286, 0],
-  ['Int256Shift', 913, 0],
-  ['ChaCha20DrawBytes', 1058, 501],
-  ['ParseWasmInstructions', 73077, 25410],
-  ['ParseWasmFunctions', 0, 540752],
-  ['ParseWasmGlobals', 0, 176363],
-  ['ParseWasmTableEntries', 0, 29989],
-  ['ParseWasmTypes', 0, 1061449],
-  ['ParseWasmDataSegments', 0, 237336],
-  ['ParseWasmElemSegments', 0, 328476],
-  ['ParseWasmImports', 0, 701845],
-  ['ParseWasmExports', 0, 429383],
-  ['ParseWasmDataSegmentBytes', 0, 28],
-  ['InstantiateWasmInstructions', 43030, 0],
-  ['InstantiateWasmFunctions', 0, 7556],
-  ['InstantiateWasmGlobals', 0, 10711],
-  ['InstantiateWasmTableEntries', 0, 3300],
-  ['InstantiateWasmTypes', 0, 0],
-  ['InstantiateWasmDataSegments', 0, 23038],
-  ['InstantiateWasmElemSegments', 0, 42488],
-  ['InstantiateWasmImports', 0, 828974],
-  ['InstantiateWasmExports', 0, 297100],
-  ['InstantiateWasmDataSegmentBytes', 0, 14],
-  ['Sec1DecodePointUncompressed', 1882, 0],
-  ['VerifyEcdsaSecp256r1Sig', 3000906, 0],
-  ['Bls12381EncodeFp', 661, 0],
-  ['Bls12381DecodeFp', 985, 0],
-  ['Bls12381G1CheckPointOnCurve', 1934, 0],
-  ['Bls12381G1CheckPointInSubgroup', 730510, 0],
-  ['Bls12381G2CheckPointOnCurve', 5921, 0],
-  ['Bls12381G2CheckPointInSubgroup', 1057822, 0],
-  ['Bls12381G1ProjectiveToAffine', 92642, 0],
-  ['Bls12381G2ProjectiveToAffine', 100742, 0],
-  ['Bls12381G1Add', 7689, 0],
-  ['Bls12381G1Mul', 2458985, 0],
-  ['Bls12381G1Msm', 2347584, 94135478],
-  ['Bls12381MapFpToG1', 1020885, 0],
-  ['Bls12381HashToG1', 2638451, 6803],
-  ['Bls12381G2Add', 25207, 0],
-  ['Bls12381G2Mul', 7873219, 0],
-  ['Bls12381G2Msm', 7663880, 298580871],
-  ['Bls12381MapFp2ToG2', 1856539, 0],
-  ['Bls12381HashToG2', 6315452, 7232],
-  ['Bls12381Pairing', 10558948, 632860943],
-  ['Bls12381FrFromU256', 1994, 0],
-  ['Bls12381FrToU256', 1155, 0],
-  ['Bls12381FrAddSub', 74, 0],
-  ['Bls12381FrMul', 332, 0],
-  ['Bls12381FrPow', 691, 74558],
-  ['Bls12381FrInv', 35421, 0],
-  ['Bn254EncodeFp', 344, 0],
-  ['Bn254DecodeFp', 476, 0],
-  ['Bn254G1CheckPointOnCurve', 904, 0],
-  ['Bn254G2CheckPointOnCurve', 2811, 0],
-  ['Bn254G2CheckPointInSubgroup', 1706052, 0],
-  ['Bn254G1ProjectiveToAffine', 61, 0],
-  ['Bn254G1Add', 3623, 0],
-  ['Bn254G1Mul', 1150435, 0],
-  ['Bn254Pairing', 5263916, 392472814],
-  ['Bn254FrFromU256', 2052, 0],
-  ['Bn254FrToU256', 1133, 0],
-  ['Bn254FrAddSub', 74, 0],
-  ['Bn254FrMul', 332, 0],
-  ['Bn254FrPow', 755, 68930],
-  ['Bn254FrInv', 33151, 0],
-  ['Bn254G1Msm', 1185193, 41568084],
-];
+const HOST_DEFAULT_CPU_COST_PARAMS: ReadonlyArray<readonly [string, number, number]> = (
+  xdr.ContractCostParams.fromXDR(PROTOCOL_27_COST_PARAMS.cpuInstructions, 'base64') as any[]
+).map(
+  (e, i) =>
+    [
+      (xdr.ContractCostType as any).fromValue(i).name as string,
+      Number(e.constTerm().toString()),
+      Number(e.linearTerm().toString()),
+    ] as const,
+);
 
 // ---------------------------------------------------------------------------
 // ground-truth anchor — no node required
@@ -531,7 +456,9 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
     { node: NodeApply; inprocOk: boolean; inprocScError: string | null; inprocError?: string }
   > = {};
   /** Account-entry shape as each side holds it, and the re-synced re-run. */
-  let accountShapes: { key: string; node: string; inproc: string | undefined }[] | undefined;
+  let accountShapes:
+    | { key: string; node: string; nodeStored: string | undefined; inproc: string | undefined }[]
+    | undefined;
   let sacResynced: Scenario | undefined;
   let setupError: unknown;
   let L: Ledger;
@@ -706,7 +633,15 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
         for (const ch of changes) {
           if (!ch.before) continue;
           const key = ch.key.toXDR('base64');
-          accountShapes.push({ key, node: ch.before.toXDR('base64'), inproc: L.getEntry(key) });
+          // What the node STORES (getLedgerEntries), as opposed to `before`,
+          // which is the entry after preflight's account normalisation.
+          const stored = (await server.getLedgerEntries(ch.key)).entries[0];
+          accountShapes.push({
+            key,
+            node: ch.before.toXDR('base64'),
+            nodeStored: stored?.val.toXDR('base64'),
+            inproc: L.getEntry(key),
+          });
           L.putEntry(ch.before.toXDR('base64'));
         }
         const inprocResynced = L.simulate(transferFn, wallet.accountIdB64);
@@ -849,29 +784,40 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
   // -- classic account entries: representation vs metering -------------------
 
   describe('AccountEntry representation', () => {
-    it('the harness holds the same AccountEntry bytes stellar-core meters', () => {
+    // Two different representations, and an earlier version of this test
+    // compared one with the other:
+    //   - what the node STORES, i.e. getLedgerEntries: ext = v0 for an account
+    //     that never submitted a transaction, the v1 -> v2 -> v3 chain once its
+    //     sequence has moved (TransactionFrame::processSeqNum);
+    //   - what preflight hands the HOST, i.e. stateChanges[].before: every
+    //     account promoted to the chain by soroban-simulation's
+    //     SimulationSnapshotSource (snapshot_source.rs), +52 bytes each.
+    // The harness stores the first and simulates through the second; the
+    // simulated half is pinned by the sac_transfer disk/write-bytes test above.
+    const accountShape = (b64: string | undefined, kind: 'entry' | 'data') => {
+      if (!b64) return { accountBytes: 0, extDepth: -1 };
+      const data =
+        kind === 'entry'
+          ? xdr.LedgerEntry.fromXDR(b64, 'base64').data()
+          : xdr.LedgerEntryData.fromXDR(b64, 'base64');
+      const acc = data.account();
+      let depth = acc.ext().switch();
+      if (depth === 1) depth = acc.ext().v1().ext().switch() === 2 ? 2 : 1;
+      if (depth === 2) depth = acc.ext().v1().ext().v2().ext().switch() === 3 ? 3 : 2;
+      return { accountBytes: acc.toXDR().length, extDepth: depth };
+    };
+
+    it('the harness stores the same AccountEntry shape the node stores', () => {
       expect(accountShapes, 'setup did not capture the pre-state').toBeDefined();
       expect(accountShapes!.length, 'the SAC transfer must touch two accounts').toBe(2);
+      expect(accountShapes!.map((s) => accountShape(s.inproc, 'entry'))).toEqual(
+        accountShapes!.map((s) => accountShape(s.nodeStored, 'data')),
+      );
+    });
 
-      const describeEntry = (b64: string | undefined) => {
-        if (!b64) return { bytes: 0, accountExt: -1 };
-        const e = xdr.LedgerEntry.fromXDR(b64, 'base64');
-        return { bytes: e.toXDR().length, accountExt: e.data().account().ext().switch() };
-      };
-
-      const inproc = accountShapes!.map((s) => describeEntry(s.inproc));
-      const node = accountShapes!.map((s) => describeEntry(s.node));
-
-      expect(
-        inproc,
-        'An account that has never submitted a transaction is stored as AccountEntry.ext = v0 ' +
-          '(92-byte LedgerEntry) — that is what `Ledger.fund()` writes AND what stellar-rpc ' +
-          "returns from getLedgerEntries. But stellar-core's preflight snapshot hands the host " +
-          'the SAME account carrying the full v1{liabilities} -> v2{sponsorship} -> ' +
-          'v3{seqLedger,seqTime} chain (144-byte LedgerEntry, +52). Those 52 bytes per account ' +
-          'land in disk_read_bytes and write_bytes for every footprint containing a classic ' +
-          'account — i.e. every native-XLM SAC operation — and therefore in the resource fee.',
-      ).toEqual(node);
+    it("preflight hands the host every account promoted to ext v3, as the harness's simulation does", () => {
+      expect(accountShapes, 'setup did not capture the pre-state').toBeDefined();
+      for (const s of accountShapes!) expect(accountShape(s.node, 'entry').extDepth).toBe(3);
     });
 
     it('given the node\'s own pre-state, disk read / write bytes agree exactly', () => {
@@ -958,12 +904,9 @@ describe.skipIf(!NODE.up)('differential conformance vs a real stellar-core node'
     expect(live.length, 'cost parameter table length').toBe(HOST_DEFAULT_CPU_COST_PARAMS.length);
     expect(
       differences,
-      'The in-process host builds its budget with soroban-env-host `Budget::default()`, which is ' +
-        "byte-for-byte stellar-core's `initialCpuCostParamsEntryForV20()` (NetworkConfig.cpp:248) " +
-        '— the protocol-20 calibration. A real network runs the UPGRADED calibration stored in ' +
-        'ConfigSettingContractCostParamsCpuInstructions (stellar-core soroban-settings/' +
-        'testnet_settings_upgrade.json). The harness never reads it, so every instruction count ' +
-        'it reports is off. Differing entries:\n' +
+      'The in-process host meters with the pinned soroban-env-host `Budget::default()`. A network ' +
+        'meters with its ConfigSettingContractCostParamsCpuInstructions; where they differ, load it ' +
+        'with withNetworkCostParams(await loadCostParamsFromRpc(server)). Differing entries:\n' +
         differences.join('\n'),
     ).toEqual([]);
   });

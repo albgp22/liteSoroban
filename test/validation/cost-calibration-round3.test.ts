@@ -341,12 +341,14 @@ describe('RED 2: anything holding a classic AccountEntry is mis-metered', () => 
     expect(rows.sacToAccount.writeBytes, 'write_bytes: node writes 2x144').toBe(288);
   });
 
-  it('one account in the footprint instead of two halves the error, as predicted', () => {
-    // Not a gap — the proof that the residue is the extension chain and nothing
-    // else. 52 bytes short per AccountEntry, exactly.
-    expect(NODE_PREFLIGHT_RAW.sacToContract - rows.sacToContract.sim).toBeGreaterThan(6_000);
-    expect(rows.sacToContract.diskReadBytes).toBe(92);   // node: 144
-    expect(rows.sacToContract.writeBytes).toBe(316);     // node: 368
+  it('one account in the footprint: the bytes match the node too', () => {
+    // An earlier version pinned the residue here (92 / 316 bytes against the
+    // node's 144 / 368: 52 short per AccountEntry, exactly) as the proof that
+    // the extension chain was the whole gap. Simulation now promotes accounts
+    // the way soroban-simulation's SimulationSnapshotSource does, so it is
+    // closed.
+    expect(rows.sacToContract.diskReadBytes).toBe(144);
+    expect(rows.sacToContract.writeBytes).toBe(368);
   });
 });
 
