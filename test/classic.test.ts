@@ -166,15 +166,22 @@ describe('classic layer: envelopes, sequence numbers, signatures, fees', () => {
     const assembled = rpc.assembleTransaction(tx, await server.simulateTransaction(tx)).build();
 
     // Weight 1 clears the tx source's LOW threshold (1) but not the operation's
-    // MEDIUM (2). Core reports that as opBAD_AUTH inside txFAILED — an APPLIED
-    // transaction that failed, so it is PENDING at submit and FAILED on poll,
-    // with the fee charged and the sequence consumed.
+    // MEDIUM (2). Core checks operation signatures in checkValid, at submission
+    // (OperationFrame::checkValid, forApply = false), so this is REJECTED:
+    // ERROR txFAILED [opBAD_AUTH], no fee, no sequence number. A local
+    // protocol-29 node (stellar-core 29.0.0) answers exactly that. An earlier
+    // version of this test expected an applied, fee-charging failure.
     assembled.sign(multi);
+    const before = loadAccount(L, accountIdFromPublicKey(multi.publicKey()))!;
     const under = await server.sendTransaction(assembled);
-    expect(under.status).toBe('PENDING');
-    expect((await server.pollTransaction(under.hash)).status).toBe('FAILED');
+    expect(under.status).toBe('ERROR');
+    const result = under.errorResult!.result();
+    expect(result.switch().name).toBe('txFailed');
+    expect(result.results()[0].switch().name).toBe('opBadAuth');
+    const after = loadAccount(L, accountIdFromPublicKey(multi.publicKey()))!;
+    expect(after.seqNum().toString()).toBe(before.seqNum().toString());
+    expect(after.balance().toString()).toBe(before.balance().toString());
 
-    // The sequence was consumed by the failed attempt, so rebuild at the new one.
     const account2 = await server.getAccount(multi.publicKey());
     const tx2 = build(account2, invokeHostFn(addr, 'put_persistent', [sym('m'), u64(9n)]));
     const assembled2 = rpc.assembleTransaction(tx2, await server.simulateTransaction(tx2)).build();

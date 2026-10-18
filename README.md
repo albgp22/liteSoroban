@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 153 tests, ~800 ms
+npm test               # 169 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -158,10 +158,14 @@ node; the red tests in `test/validation/` pin them.
   by 25-59%, which is why `enforceDeclaredResources` is **off by default** —
   enforcing the declared limit makes every deploy fail.
 
-**Classic layer**
-- `txBAD_AUTH_EXTRA` is not implemented; unconsumed signatures are not rejected.
-- The LOW threshold is not applied at transaction level.
-- Fee bumps: no minimum-inclusion-fee check, no actual-bump check.
+**Classic layer** — signatures (every signer type, consumption, `txBAD_AUTH_EXTRA`,
+operation thresholds, `extraSigners`) and fee-bump fee rules follow stellar-core
+and were checked scenario by scenario against a local protocol-29 node
+(`test/classic-validation.test.ts`). Still missing:
+- PRECOND_V2 other than `extraSigners`: `ledgerBounds`, `minSeqNum`, `minSeqAge`,
+  `minSeqLedgerGap`, and timebounds carried in V2 are not evaluated.
+- The fee taken is the full bid: no inclusion-fee discount, no refund of the
+  unused refundable resource fee.
 - `ExtendFootprintTTL` and `RestoreFootprint` are validated but not dispatched —
   an honest `txFAILED`, never a silent success.
 - `AccountEntry` is written with `ext = v0`; stellar-core normalises to the

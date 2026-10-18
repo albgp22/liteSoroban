@@ -10,7 +10,15 @@
  * Deliberately partial: enough methods to carry the simulate path. A real
  * harness would cover the full 12-method surface plus sendTransaction/poll.
  */
-import { xdr, rpc, Address, StrKey, TransactionBuilder, hash as sha256 } from '@stellar/stellar-sdk';
+import {
+  xdr,
+  rpc,
+  Address,
+  StrKey,
+  TransactionBuilder,
+  FeeBumpTransaction,
+  hash as sha256,
+} from '@stellar/stellar-sdk';
 import { HOST_PROTOCOL, type Ledger } from './index.js';
 import type { TxOutcome, TxResultCode } from './classic.js';
 
@@ -29,6 +37,7 @@ const CODE_ARM: Record<TxResultCode, string> = {
   txNO_ACCOUNT: 'txNoAccount',
   txBAD_SEQ: 'txBadSeq',
   txBAD_AUTH: 'txBadAuth',
+  txBAD_AUTH_EXTRA: 'txBadAuthExtra',
   txTOO_EARLY: 'txTooEarly',
   txTOO_LATE: 'txTooLate',
   txMISSING_OPERATION: 'txMissingOperation',
@@ -45,6 +54,7 @@ const REJECTED_AT_SUBMIT = new Set<TxResultCode>([
   'txNO_ACCOUNT',
   'txBAD_SEQ',
   'txBAD_AUTH',
+  'txBAD_AUTH_EXTRA',
   'txTOO_EARLY',
   'txTOO_LATE',
   'txMISSING_OPERATION',
@@ -55,6 +65,9 @@ const REJECTED_AT_SUBMIT = new Set<TxResultCode>([
 ]);
 
 function operationResults(outcome: TxOutcome): xdr.OperationResult[] {
+  // Decided by the classic layer before the host ran: a bare op result code.
+  if (outcome.opCode === 'opBAD_AUTH') return [xdr.OperationResult.opBadAuth()];
+  if (outcome.opCode === 'opNO_ACCOUNT') return [xdr.OperationResult.opNoAccount()];
   const returned = outcome.returnValueXdr
     ? sha256(Buffer.from(outcome.returnValueXdr, 'base64'))
     : Buffer.alloc(32);
@@ -64,7 +77,8 @@ function operationResults(outcome: TxOutcome): xdr.OperationResult[] {
   return [xdr.OperationResult.opInner(xdr.OperationResultTr.invokeHostFunction(inner))];
 }
 
-function transactionResult(outcome: TxOutcome, txHash: Buffer): xdr.TransactionResult {
+/** `innerHash`: for a fee bump, the InnerTransactionResultPair names the INNER tx. */
+function transactionResult(outcome: TxOutcome, innerHash: Buffer): xdr.TransactionResult {
   const arm = CODE_ARM[outcome.code];
   const R: any = xdr.TransactionResultResult;
 
@@ -81,7 +95,7 @@ function transactionResult(outcome: TxOutcome, txHash: Buffer): xdr.TransactionR
         : IR[innerArm]();
     result = R[arm](
       new xdr.InnerTransactionResultPair({
-        transactionHash: txHash,
+        transactionHash: innerHash,
         result: new xdr.InnerTransactionResult({
           feeCharged: new xdr.Int64(0n),
           result: innerResult,
@@ -575,11 +589,13 @@ export function attachInProcessRpc(
         const hashHex = txHash.toString('hex');
 
         const outcome = submit(envelopeB64);
-        const resultXdr = transactionResult(outcome, txHash).toXDR('base64');
+        const innerHash = tx instanceof FeeBumpTransaction ? tx.innerTransaction.hash() : txHash;
+        const resultXdr = transactionResult(outcome, innerHash).toXDR('base64');
 
         // Classic validation failures come back synchronously as ERROR, exactly
-        // as stellar-rpc does -- this is what an app's retry logic keys on.
-        if (REJECTED_AT_SUBMIT.has(outcome.code)) {
+        // as stellar-rpc does -- this is what an app's retry logic keys on. That
+        // includes a txFAILED whose operation failed its signature check.
+        if (outcome.rejected || REJECTED_AT_SUBMIT.has(outcome.code)) {
           return ok({
             status: 'ERROR',
             hash: hashHex,

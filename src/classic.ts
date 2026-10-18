@@ -19,6 +19,7 @@ import {
   Transaction,
   FeeBumpTransaction,
   TransactionBuilder,
+  hash as sha256,
 } from '@stellar/stellar-sdk';
 import type { Ledger } from './index.js';
 
@@ -36,6 +37,7 @@ export type TxResultCode =
   | 'txNO_ACCOUNT'
   | 'txBAD_SEQ'
   | 'txBAD_AUTH'
+  | 'txBAD_AUTH_EXTRA'
   | 'txTOO_EARLY'
   | 'txTOO_LATE'
   | 'txMISSING_OPERATION'
@@ -54,12 +56,28 @@ export interface TxOutcome {
   eventsXdr?: string[];
   changedKeys?: string[];
   removedKeys?: string[];
+  /**
+   * TransactionResult.feeCharged, as core reports it. For an applied
+   * transaction it is what was debited. For a `rejected` one NOTHING was
+   * debited: core seeds the result with getFee(header, baseFee, applying =
+   * false) = declared resource fee + baseFee * max(1, ops), or 0 when it
+   * rejected the XDR before seeding (createTxError), or the fee it would need
+   * for a fee bump that does not raise the rate.
+   */
   feeCharged: bigint;
   /** Populated for fee bumps. */
   innerCode?: TxResultCode;
   error?: string;
   /** Diagnostic text, mirroring core's diagnostic events. */
   detail?: string;
+  /**
+   * Rejected by validation before touching the ledger: no fee, no sequence
+   * number. stellar-rpc reports these as ERROR at submit, whatever the code —
+   * including a txFAILED whose operation failed its signature check.
+   */
+  rejected?: boolean;
+  /** For txFAILED decided by the classic layer rather than by the host. */
+  opCode?: 'opBAD_AUTH' | 'opNO_ACCOUNT';
 }
 
 // ---------------------------------------------------------------------------
@@ -190,24 +208,137 @@ export function signatureWeight(
   return total;
 }
 
+/** A signer as stellar-core's SignatureChecker sees it. */
+export interface WeightedSigner {
+  key: xdr.SignerKey;
+  weight: number;
+}
+
 /**
- * PARTIAL port of stellar-core's SignatureChecker::checkSignature — ed25519
- * signers only.
+ * TransactionFrame::checkSignature's signer list: the master key ONLY when its
+ * weight (thresholds[0]) is non-zero, then every account signer, of any type.
+ * A weight-0 master key is not a signer at all, so a signature from it is never
+ * consumed and the envelope fails with txBAD_AUTH_EXTRA.
+ */
+export function accountSigners(account: xdr.AccountEntry): WeightedSigner[] {
+  const signers: WeightedSigner[] = [];
+  const master = account.thresholds()[0];
+  if (master) {
+    signers.push({
+      key: xdr.SignerKey.signerKeyTypeEd25519(account.accountId().ed25519()),
+      weight: master,
+    });
+  }
+  for (const s of account.signers()) signers.push({ key: s.key(), weight: s.weight() });
+  return signers;
+}
+
+/** SignatureUtils getHint: the last 4 bytes, or all of them zero-padded if fewer. */
+function hintOf(bytes: Buffer): Buffer {
+  const hint = Buffer.alloc(4);
+  if (bytes.length < 4) bytes.copy(hint, 0);
+  else bytes.copy(hint, 0, bytes.length - 4);
+  return hint;
+}
+
+/** SignatureUtils doesHintMatch: needs at least 4 bytes, compares the last 4. */
+function hintMatches(bytes: Buffer, hint: Buffer): boolean {
+  return bytes.length >= 4 && bytes.subarray(bytes.length - 4).equals(hint);
+}
+
+function verifyEd25519(publicKey: Buffer, signature: Buffer, message: Buffer): boolean {
+  try {
+    return Keypair.fromPublicKey(StrKey.encodeEd25519PublicKey(publicKey)).verify(message, signature);
+  } catch {
+    return false; // malformed signature length, as libsodium's check rejects it
+  }
+}
+
+/**
+ * Port of stellar-core's SignatureChecker (src/transactions/SignatureChecker.cpp
+ * and SignatureUtils.cpp, v29.0.0). One instance per envelope, shared by every
+ * check on it, because it remembers which signatures were consumed.
  *
- * What it gets right, and why it matters: for an account whose signers are all
- * ed25519, weight only ever accumulates inside the loop over the transaction's
- * SIGNATURES, so an unsigned transaction returns false EVEN WHEN the needed
- * weight is 0. A threshold of 0 means "any one valid signer suffices", not "no
- * signature required". Core pins this in TxEnvelopeTests.cpp
- * SECTION("no signature").
- *
- * What it does NOT implement: PRE_AUTH_TX, HASH_X and SIGNED_PAYLOAD signers.
- * Note that core's PRE_AUTH_TX loop iterates over SIGNERS, not signatures, and
- * CAN return true with zero signatures — so the blanket claim that "every
- * return true sits inside the signature loop" is false, and an earlier version
- * of this comment said exactly that. The omission is currently unreachable here
- * because fundAccount only builds ed25519 signers and SetOptions is out of
- * scope, but direct XDR surgery could construct such an account.
+ * - Signer types are tried in core's order: PRE_AUTH_TX (matched against the
+ *   contents hash, no signature needed), HASH_X, ED25519, ED25519_SIGNED_PAYLOAD.
+ * - Each signature is matched against at most one remaining signer, after a
+ *   hint prefilter; weights are capped at 255.
+ * - A check returns the moment the needed weight is reached, so signatures past
+ *   that point are NOT consumed by it. That is why a valid but superfluous
+ *   signature still ends in txBAD_AUTH_EXTRA.
+ * - Weight only accumulates on a match, so an unsigned envelope fails even a
+ *   threshold of 0 (core's TxEnvelopeTests SECTION("no signature")); only a
+ *   PRE_AUTH_TX signer can satisfy a check with no signature at all.
+ */
+export class SignatureChecker {
+  private readonly used: boolean[];
+
+  constructor(
+    private readonly signatures: xdr.DecoratedSignature[],
+    private readonly contentsHash: Buffer,
+  ) {
+    this.used = signatures.map(() => false);
+  }
+
+  checkSignature(signers: WeightedSigner[], neededWeight: number): boolean {
+    const ofType = (name: string) => signers.filter((s) => s.key.switch().name === name);
+    const cap = (w: number) => Math.min(w, 255);
+    let total = 0;
+
+    for (const s of ofType('signerKeyTypePreAuthTx')) {
+      if (s.key.preAuthTx().equals(this.contentsHash)) {
+        total += cap(s.weight);
+        if (total >= neededWeight) return true;
+      }
+    }
+
+    const verifyAll = (
+      candidates: WeightedSigner[],
+      verify: (sig: xdr.DecoratedSignature, signer: WeightedSigner) => boolean,
+    ): boolean => {
+      for (let i = 0; i < this.signatures.length; i++) {
+        const at = candidates.findIndex((s) => verify(this.signatures[i], s));
+        if (at === -1) continue;
+        this.used[i] = true;
+        total += cap(candidates[at].weight);
+        if (total >= neededWeight) return true;
+        candidates.splice(at, 1);
+      }
+      return false;
+    };
+
+    if (
+      verifyAll(ofType('signerKeyTypeHashX'), (sig, s) =>
+        hintMatches(s.key.hashX(), sig.hint()) && sha256(sig.signature()).equals(s.key.hashX()),
+      )
+    ) {
+      return true;
+    }
+    if (
+      verifyAll(ofType('signerKeyTypeEd25519'), (sig, s) =>
+        hintMatches(s.key.ed25519(), sig.hint()) &&
+        verifyEd25519(s.key.ed25519(), sig.signature(), this.contentsHash),
+      )
+    ) {
+      return true;
+    }
+    return verifyAll(ofType('signerKeyTypeEd25519SignedPayload'), (sig, s) => {
+      const sp = s.key.ed25519SignedPayload();
+      const hint = Buffer.from(hintOf(sp.ed25519()).map((b, i) => b ^ hintOf(sp.payload())[i]));
+      return hint.equals(sig.hint()) && verifyEd25519(sp.ed25519(), sig.signature(), sp.payload());
+    });
+  }
+
+  /** SignatureChecker::checkAllSignaturesUsed: false means txBAD_AUTH_EXTRA. */
+  checkAllSignaturesUsed(): boolean {
+    return this.used.every(Boolean);
+  }
+}
+
+/**
+ * Whether `signatures` over `txHash` give `account` at least `neededWeight`, as
+ * TransactionFrame::checkSignature decides it. A one-off check: it does not
+ * track consumption across checks the way a whole envelope needs.
  */
 export function checkSignature(
   account: xdr.AccountEntry,
@@ -215,41 +346,59 @@ export function checkSignature(
   txHash: Buffer,
   neededWeight: number,
 ): boolean {
-  const candidates: { pk: string; weight: number }[] = [
-    {
-      pk: StrKey.encodeEd25519PublicKey(account.accountId().ed25519()),
-      weight: account.thresholds()[0],
-    },
-  ];
-  for (const s of account.signers()) {
-    if (s.key().switch().name !== 'signerKeyTypeEd25519') continue;
-    candidates.push({ pk: StrKey.encodeEd25519PublicKey(s.key().ed25519()), weight: s.weight() });
-  }
+  return new SignatureChecker(signatures, txHash).checkSignature(accountSigners(account), neededWeight);
+}
 
-  let total = 0;
-  const used = new Set<string>();
-  for (const sig of signatures) {
-    for (const c of candidates) {
-      if (used.has(c.pk)) continue;
-      const kp = Keypair.fromPublicKey(c.pk);
-      if (!kp.signatureHint().equals(sig.hint())) continue;
-      if (kp.verify(txHash, sig.signature())) {
-        used.add(c.pk);
-        total += c.weight;
-        if (total >= neededWeight) return true;
-        break;
-      }
-    }
-  }
-  return false;
+/** PRECOND_V2 extraSigners: every one must sign (TransactionFrame::checkExtraSigners). */
+function checkExtraSigners(checker: SignatureChecker, raw: xdr.Transaction): boolean {
+  const cond = raw.cond();
+  if (cond.switch().name !== 'precondV2') return true;
+  const extra = cond.v2().extraSigners();
+  if (extra.length === 0) return true;
+  return checker.checkSignature(
+    extra.map((key) => ({ key, weight: 1 })),
+    extra.length,
+  );
 }
 
 // ---------------------------------------------------------------------------
 // the apply path
 // ---------------------------------------------------------------------------
 
+/**
+ * A validation rejection: nothing in the ledger has changed. `feeCharged` is
+ * left 0 for applyTransaction to fill with the nominal fee, unless given.
+ */
 function fail(code: TxResultCode, detail?: string, feeCharged = 0n): TxOutcome {
-  return { code, ok: false, feeCharged, detail };
+  return { code, ok: false, feeCharged, detail, rejected: true };
+}
+
+/** Rejections core makes before it seeds a result (createTxError): feeCharged stays 0. */
+const unseeded = new WeakSet<TxOutcome>();
+
+function malformed(detail: string): TxOutcome {
+  const outcome = fail('txMALFORMED', detail);
+  unseeded.add(outcome);
+  return outcome;
+}
+
+/** stellar-core TransactionFrame.cpp: MAX_RESOURCE_FEE = 1 << 50. */
+const MAX_RESOURCE_FEE = 1n << 50n;
+
+/**
+ * TransactionFrame::XDRProvidesValidFee: a Soroban transaction (judged by its
+ * first operation) must carry SorobanTransactionData with a resource fee in
+ * [0, MAX_RESOURCE_FEE]. Checked before anything else, sequence included.
+ */
+function xdrProvidesValidFee(raw: xdr.Transaction): string | null {
+  const first = raw.operations()[0];
+  if (!first || !SOROBAN_OP_TYPES.has(first.body().switch().name)) return null;
+  if (raw.ext().switch() !== 1) return 'a Soroban transaction must carry SorobanTransactionData';
+  const resourceFee = BigInt(raw.ext().sorobanData().resourceFee().toString());
+  if (resourceFee < 0n || resourceFee > MAX_RESOURCE_FEE) {
+    return `resource fee ${resourceFee} outside [0, 2^50]`;
+  }
+  return null;
 }
 
 /**
@@ -282,20 +431,50 @@ export function applyTransaction(
   validation: ValidationOptions = {},
 ): TxOutcome {
   const envelope = xdr.TransactionEnvelope.fromXDR(envelopeB64, 'base64');
+  const outcome = applyEnvelope(ledger, envelope, passphrase, validation);
+  if (outcome.rejected && !unseeded.has(outcome) && outcome.feeCharged === 0n) {
+    outcome.feeCharged = nominalFee(envelope) ?? 0n;
+  }
+  return outcome;
+}
 
+function applyEnvelope(
+  ledger: Ledger,
+  envelope: xdr.TransactionEnvelope,
+  passphrase: string,
+  validation: ValidationOptions,
+): TxOutcome {
   if (envelope.switch().name === 'envelopeTypeTxFeeBump') {
     return applyFeeBump(ledger, envelope, passphrase, validation);
   }
   if (envelope.switch().name !== 'envelopeTypeTx') {
-    return fail('txMALFORMED', 'only v1 and fee-bump envelopes are supported');
+    return malformed('only v1 and fee-bump envelopes are supported');
   }
 
   const tx = new Transaction(envelope, passphrase);
   const raw = envelope.v1().tx();
+  const badFee = xdrProvidesValidFee(raw);
+  if (badFee) return malformed(badFee);
 
   // -- fee source is the tx source for a plain v1 envelope
   const feeSourceId = muxedToAccountId(raw.sourceAccount());
   return applyInner(ledger, tx, raw, feeSourceId, passphrase, false, validation);
+}
+
+/**
+ * getFee(header, baseFee, applying = false): the declared Soroban resource fee
+ * plus baseFee * max(1, operations), where a fee bump counts innerOps + 1.
+ * What a rejected envelope's result reports as feeCharged; a local protocol-29
+ * node reports exactly this for txBAD_AUTH, txBAD_AUTH_EXTRA and txFAILED.
+ */
+function nominalFee(envelope: xdr.TransactionEnvelope): bigint | undefined {
+  const isBump = envelope.switch().name === 'envelopeTypeTxFeeBump';
+  if (!isBump && envelope.switch().name !== 'envelopeTypeTx') return undefined;
+  const raw = isBump ? envelope.feeBump().tx().innerTx().v1().tx() : envelope.v1().tx();
+  const resourceFee =
+    raw.ext().switch() === 1 ? BigInt(raw.ext().sorobanData().resourceFee().toString()) : 0n;
+  const ops = raw.operations().length + (isBump ? 1 : 0);
+  return resourceFee + BigInt(BASE_FEE) * BigInt(Math.max(1, ops));
 }
 
 function applyFeeBump(
@@ -306,41 +485,89 @@ function applyFeeBump(
 ): TxOutcome {
   const fb = envelope.feeBump();
   const feeBumpTx = new FeeBumpTransaction(envelope, passphrase);
-
-  const feeSourceMuxed = fb.tx().feeSource();
-  // A fee bump's fee source MAY be muxed: validateSorobanMemo (TransactionFrame
-  // .cpp:363) checks the tx source and the op source, never the fee source.
-  const feeSourceId = muxedToAccountId(feeSourceMuxed);
-
-  const feeAccount = loadAccount(ledger, feeSourceId);
-  if (!feeAccount) return fail('txNO_ACCOUNT', 'fee source account does not exist');
-
-  if (validation.sigverify !== false) {
-    // thresholds[1] is LOW. A fee bump has no operations, so MEDIUM never applies.
-    if (!checkSignature(feeAccount, feeBumpTx.signatures, feeBumpTx.hash(), feeAccount.thresholds()[1])) {
-      return fail('txBAD_AUTH', 'fee bump signatures do not satisfy the fee source low threshold');
-    }
-  }
-
-  const totalFee = BigInt(fb.tx().fee().toString());
-  if (availableBalance(feeAccount) < totalFee) {
-    return fail('txINSUFFICIENT_BALANCE', 'fee source cannot cover the fee bump');
-  }
-
   const innerEnvelope = xdr.TransactionEnvelope.envelopeTypeTx(fb.tx().innerTx().v1());
   const innerTx = new Transaction(innerEnvelope, passphrase);
   const innerRaw = innerEnvelope.v1().tx();
 
-  const inner = applyInner(ledger, innerTx, innerRaw, feeSourceId, passphrase, true, validation);
+  // FeeBumpTransactionFrame::checkValidImpl, in its order (stellar-core v29.0.0).
+  // XDRProvidesValidFee covers the inner transaction too, so a malformed inner
+  // fee is the OUTER envelope's txMALFORMED, not an inner failure.
+  const totalFee = BigInt(fb.tx().fee().toString());
+  if (totalFee < 0n) return malformed('negative fee bump fee');
+  const badInnerFee = xdrProvidesValidFee(innerRaw);
+  if (badInnerFee) return malformed(`inner transaction: ${badInnerFee}`);
 
-  // Charge the fee bump's fee to the fee source regardless of inner outcome.
-  debit(ledger, feeSourceId, totalFee);
+  // commonValidPreSeqNum. Inclusion fee = full fee minus the inner Soroban
+  // resource fee; a fee bump counts as innerOps + 1 operations, and
+  // getMinInclusionFee is baseFee * max(1, operations).
+  const innerSoroban = innerRaw.ext().switch() === 1 ? innerRaw.ext().sorobanData() : null;
+  const resourceFee = innerSoroban ? BigInt(innerSoroban.resourceFee().toString()) : 0n;
+  const innerOps = BigInt(innerRaw.operations().length);
+  const minInclusion = (ops: bigint) => BigInt(BASE_FEE) * (ops > 1n ? ops : 1n);
+  const inclusionFee = totalFee - resourceFee;
+  if (inclusionFee < minInclusion(innerOps + 1n)) {
+    return fail(
+      'txINSUFFICIENT_FEE',
+      `fee bump inclusion fee ${inclusionFee} below baseFee * (innerOps + 1) = ${minInclusion(innerOps + 1n)}`,
+    );
+  }
+  // The bump has to raise the per-operation rate:
+  //   outerInclusion * minInclusion(inner) >= innerInclusion * minInclusion(outer).
+  // From protocol 23 a Soroban inner tx may have a negative inclusion fee, and
+  // then there is nothing to compare.
+  const innerInclusion = BigInt(innerRaw.fee().toString()) - resourceFee;
+  if (innerInclusion >= 0n) {
+    const v1 = inclusionFee * minInclusion(innerOps);
+    const v2 = innerInclusion * minInclusion(innerOps + 1n);
+    if (v1 < v2) {
+      // setInsufficientFeeErrorWithFeeCharged(ceil(v2 / minInclusion(inner)))
+      const needed = (v2 + minInclusion(innerOps) - 1n) / minInclusion(innerOps);
+      return fail('txINSUFFICIENT_FEE', 'the fee bump does not raise the per-operation inclusion fee', needed);
+    }
+  }
+
+  // A fee bump's fee source MAY be muxed: validateSorobanMemo (TransactionFrame
+  // .cpp:363) checks the tx source and the op source, never the fee source.
+  const feeSourceId = muxedToAccountId(fb.tx().feeSource());
+  const feeAccount = loadAccount(ledger, feeSourceId);
+  if (!feeAccount) return fail('txNO_ACCOUNT', 'fee source account does not exist');
+
+  // commonValid: the fee source signs at LOW (a fee bump has no operations of
+  // its own), with the OUTER signatures and their own checker.
+  const checker =
+    validation.sigverify !== false ? new SignatureChecker(feeBumpTx.signatures, feeBumpTx.hash()) : null;
+  if (checker && !checker.checkSignature(accountSigners(feeAccount), feeAccount.thresholds()[1])) {
+    return fail('txBAD_AUTH', 'fee bump signatures do not satisfy the fee source low threshold');
+  }
+
+  const charging = validation.feeCharging !== false;
+  if (charging && availableBalance(feeAccount) < totalFee) {
+    return fail('txINSUFFICIENT_BALANCE', 'fee source cannot cover the fee bump');
+  }
+
+  if (checker && !checker.checkAllSignaturesUsed()) {
+    return fail('txBAD_AUTH_EXTRA', 'the fee bump envelope carries a signature no check consumed');
+  }
+
+  // The inner transaction is validated without charging its own fee. If it is
+  // rejected, the whole fee bump is rejected at submission: nobody pays.
+  const inner = applyInner(ledger, innerTx, innerRaw, feeSourceId, passphrase, true, validation);
+  if (inner.rejected) {
+    return {
+      ...inner,
+      code: 'txFEE_BUMP_INNER_FAILED',
+      innerCode: inner.code,
+      feeCharged: 0n,
+    };
+  }
+
+  if (charging) debit(ledger, feeSourceId, totalFee);
 
   return {
     ...inner,
     code: inner.ok ? 'txFEE_BUMP_INNER_SUCCESS' : 'txFEE_BUMP_INNER_FAILED',
     innerCode: inner.code,
-    feeCharged: totalFee,
+    feeCharged: charging ? totalFee : 0n,
   };
 }
 
@@ -394,10 +621,12 @@ function applyInner(
   // stellar-core hands the OPERATION source to the host as the Soroban invoker
   // (InvokeHostFunctionOpFrame.cpp passes mOpFrame.getSourceID()), falling back
   // to the transaction source only when the operation names none.
+  // A missing operation source is not a submit-time error: core checks a
+  // signature from that key instead (checkSignatureNoAccount) and fails the
+  // operation with opNO_ACCOUNT when it applies.
   const opSourceMuxed = ops[0].sourceAccount();
   const invokerId = opSourceMuxed ? muxedToAccountId(opSourceMuxed) : sourceId;
   const opAccount = opSourceMuxed ? loadAccount(ledger, invokerId) : account;
-  if (!opAccount) return fail('txNO_ACCOUNT', 'operation source account does not exist');
 
   // -- sequence number -----------------------------------------------------
   const currentSeq = BigInt(account.seqNum().toString());
@@ -423,22 +652,30 @@ function applyInner(
     if (max !== 0n && now > max) return fail('txTOO_LATE');
   }
 
-  // -- signatures ----------------------------------------------------------
-  // stellar-core makes TWO independent signature checks and both must pass:
-  //   TransactionFrame::checkAllTransactionSignatures -> TX source at LOW
-  //   OperationFrame::checkSignature                  -> OP source at MEDIUM,
-  //                                                      failing with opBAD_AUTH
-  // Checking only the operation source leaves the transaction source
+  // -- signatures, part 1 --------------------------------------------------
+  // stellar-core runs three checks over ONE SignatureChecker, all at submission
+  // (TransactionFrame::checkValid; OperationFrame::checkValid with forApply =
+  // false), so every failure is a rejection with no fee and no sequence number:
+  //   1. checkAllTransactionSignatures: tx source at LOW, plus extraSigners
+  //      -> txBAD_AUTH
+  //   2. each operation's checkSignature at its threshold -> opBAD_AUTH in txFAILED
+  //   3. checkAllSignaturesUsed -> txBAD_AUTH_EXTRA
+  // Checking only the operation source would leave the transaction source
   // unauthenticated whenever the operation names its own — accepting envelopes
   // the network rejects, which is the one direction a harness must never fail in.
-  if (validation.sigverify !== false) {
-    if (!checkSignature(account, tx.signatures, tx.hash(), account.thresholds()[1])) {
+  const checker =
+    validation.sigverify !== false ? new SignatureChecker(tx.signatures, tx.hash()) : null;
+  if (checker) {
+    if (!checker.checkSignature(accountSigners(account), account.thresholds()[1])) {
       return fail(
         'txBAD_AUTH',
         `transaction source signatures do not satisfy low threshold ${account.thresholds()[1]} for ${
           StrKey.encodeEd25519PublicKey(account.accountId().ed25519())
         }`,
       );
+    }
+    if (!checkExtraSigners(checker, raw)) {
+      return fail('txBAD_AUTH', 'not every PRECOND_V2 extraSigner signed');
     }
   }
 
@@ -463,27 +700,49 @@ function applyInner(
     }
   }
 
+  // -- signatures, part 2 --------------------------------------------------
+  // The operation's own threshold: MEDIUM for InvokeHostFunction, LOW for
+  // ExtendFootprintTTL / RestoreFootprint (OperationFrame / *OpFrame.cpp
+  // getThresholdLevel). Still at submission: a local protocol-29 node answers
+  // ERROR txFAILED [opBAD_AUTH] and moves neither the fee nor the sequence.
+  if (checker) {
+    const level = opType === 'invokeHostFunction' ? 2 : 1;
+    const opSigned = opAccount
+      ? checker.checkSignature(accountSigners(opAccount), opAccount.thresholds()[level])
+      : checker.checkSignature(
+          [{ key: xdr.SignerKey.signerKeyTypeEd25519(invokerId.ed25519()), weight: 1 }],
+          0,
+        );
+    if (!opSigned) {
+      return {
+        ...fail(
+          'txFAILED',
+          `operation source signatures do not satisfy its ${level === 2 ? 'medium' : 'low'} threshold for ${
+            StrKey.encodeEd25519PublicKey(invokerId.ed25519())
+          } (opBAD_AUTH)`,
+        ),
+        opCode: 'opBAD_AUTH',
+      };
+    }
+    if (!checker.checkAllSignaturesUsed()) {
+      return fail('txBAD_AUTH_EXTRA', 'the envelope carries a signature no check consumed');
+    }
+  }
+
   // -- commit the classic side, then run the host --------------------------
   if (validation.sequenceCheck !== false) bumpSequence(ledger, sourceId, txSeq);
   else bumpSequence(ledger, sourceId, currentSeq + 1n);
 
   if (payer) debit(ledger, payer, totalFee);
 
-  // OPERATION-level authorization. Core checks this while applying operations —
-  // after the fee is charged and the sequence consumed — so a failure here is
-  // opBAD_AUTH inside txFAILED, an APPLIED transaction that failed, not a
-  // submit-time rejection.
-  if (validation.sigverify !== false) {
-    if (!checkSignature(opAccount, tx.signatures, tx.hash(), opAccount.thresholds()[2])) {
-      return {
-        code: 'txFAILED',
-        ok: false,
-        feeCharged: feeBumped ? 0n : totalFee,
-        detail: `operation source signatures do not satisfy medium threshold ${
-          opAccount.thresholds()[2]
-        } for ${StrKey.encodeEd25519PublicKey(opAccount.accountId().ed25519())} (opBAD_AUTH)`,
-      };
-    }
+  if (!opAccount) {
+    return {
+      code: 'txFAILED',
+      ok: false,
+      opCode: 'opNO_ACCOUNT',
+      feeCharged: feeBumped ? 0n : totalFee,
+      detail: 'operation source account does not exist (opNO_ACCOUNT)',
+    };
   }
 
   if (opType !== 'invokeHostFunction') {
