@@ -120,9 +120,6 @@ recorded auth entries. Disk/write bytes match on five of six.
 ## What it is not good for
 
 - Instruction or memory counts for anything beyond the scenarios measured above.
-- Explicit `RestoreFootprint` / `ExtendFootprintTTL` operations, which are validated
-  but not dispatched (see "Known gaps"). Auto-restore *inside* an invocation works,
-  and the applied count matches the recorded one to within 1%.
 - Anything needing classic operations (Payment, CreateAccount, ChangeTrust).
 
 ## Architecture

@@ -434,6 +434,7 @@ protocol.
 
 ## What this does not do
 
-Classic operations (Payment, CreateAccount, ChangeTrust),
-`ExtendFootprintTTL` / `RestoreFootprint` dispatch, and five RPC methods. See
-"Known gaps" in [README.md](README.md).
+Classic operations (Payment, CreateAccount, ChangeTrust). The rest of what
+differs from a network (one network's fee settings, its resource limits,
+`maxTime`'s close-time margin) is listed under "Known gaps" in
+[README.md](README.md).
