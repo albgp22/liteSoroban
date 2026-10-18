@@ -152,7 +152,6 @@ Found by nine adversarial test batteries plus a differential run against a live
 node; the red tests in `test/validation/` pin them.
 
 **Blocking real-network fidelity**
-- Cost calibration defaults to protocol-20 (above). Fix: `setCostParams`.
 - `module_cache: None` in the enforcing path charges the full `VmInstantiation`
   Wasm parse (const_term 451,626) where recording mode charges
   `VmCachedInstantiation` (41,142) to the shadow budget. The two halves disagree

@@ -90,8 +90,9 @@ export class Ledger {
   }
 
   /**
-   * Install the network's real cost calibration. Without it the harness meters
-   * with the protocol-20 defaults and over-reports by 15-249%.
+   * Install a network's cost calibration. The pinned host already meters with
+   * the protocol-27 table this repo ships, so this changes no count until a
+   * network's table moves away from it; use it to match a specific network.
    */
   setCostParams(cpuParamsB64: string, memParamsB64: string, cpuLimit: bigint, memLimit: bigint): void {
     this.env.setCostParams(cpuParamsB64, memParamsB64, cpuLimit, memLimit);

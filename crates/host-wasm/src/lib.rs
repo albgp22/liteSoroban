@@ -228,12 +228,14 @@ pub struct SorobanEnv {
     /// stellar-rpc feeds each preflight fresh entropy; we count instead, which
     /// keeps a fresh ledger fully reproducible while still varying per call.
     prng_counter: std::cell::Cell<u64>,
-    /// Cost calibration. `Budget::default()` is stellar-core's
-    /// `initialCpuCostParamsEntryForV20` — the table a network has BEFORE its
-    /// first settings upgrade. Every live network meters with the upgraded
-    /// table in `ConfigSettingContractCostParamsCpuInstructions`, so leaving
-    /// this unset over-meters by 15-250% versus any real node. Load the real
-    /// params with `setCostParams` to get numbers that transfer.
+    /// Cost calibration. Unset, `Budget::default()` applies. Up to 27.0.1 that
+    /// was stellar-core's `initialCpuCostParamsEntryForV20` — the table a
+    /// network has BEFORE its first settings upgrade — which over-metered
+    /// against any live node. From 28.0.0 the defaults are the live
+    /// calibration: on the pinned 29.0.2 they equal the protocol-27 table this
+    /// repo ships, so installing it with `setCostParams` changes no count. Load
+    /// a network's own table to match that network once it moves away from the
+    /// host's defaults.
     cpu_cost_params: Option<ContractCostParams>,
     mem_cost_params: Option<ContractCostParams>,
     cpu_limit: u64,
@@ -282,7 +284,8 @@ impl SorobanEnv {
 
     /// Install the network's real cost calibration, as base64
     /// `ContractCostParams` XDR (from the `ConfigSetting` ledger entries).
-    /// Without this the harness meters with the protocol-20 defaults.
+    /// Without this the harness meters with the host's defaults, which on the
+    /// pinned host equal the shipped protocol-27 table.
     #[wasm_bindgen(js_name = setCostParams)]
     pub fn set_cost_params(
         &mut self,
@@ -827,7 +830,7 @@ impl SorobanEnv {
 
 impl SorobanEnv {
     /// Build a budget from the installed network cost parameters when we have
-    /// them, falling back to the host's protocol-20 defaults when we do not.
+    /// them, falling back to the host's default table when we do not.
     fn make_budget(&self, cpu_limit: Option<u64>) -> Result<Budget, JsError> {
         let cpu = cpu_limit.unwrap_or(self.cpu_limit);
         match (&self.cpu_cost_params, &self.mem_cost_params) {
