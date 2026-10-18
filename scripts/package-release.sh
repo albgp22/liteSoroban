@@ -55,6 +55,19 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/$NAME"
 for f in "${FILES[@]}"; do cp "$PKG/$f" "$STAGE/$NAME/$f"; done
 
+# wasm-pack copies the crate's version (0.0.1) into package.json. A release tag
+# (v1.2.3, v1.2.3-rc.1) carries the real one; anything else, such as a branch
+# from a manual run, keeps the crate's.
+if [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+  node -e '
+    const fs = require("fs");
+    const [file, version] = process.argv.slice(1);
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    pkg.version = version;
+    fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+  ' "$STAGE/$NAME/package.json" "${BASH_REMATCH[1]}"
+fi
+
 # Same inputs, same bytes: fixed order, owner and mtime, no gzip timestamp.
 # (--sort and friends are GNU tar; bsdtar on macOS still produces a valid
 # archive, just not a reproducible one.)
