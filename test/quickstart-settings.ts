@@ -7,11 +7,12 @@ import type { NetworkFeeSettings } from '../src/litestellar.js';
 
 /**
  * The local quickstart's fee settings, read at ledger 7,920; its limits, read at
- * ledger 9,968, are testnet's.
+ * ledger 9,968 (`txMemoryLimit` at 12,527), are testnet's.
  */
 export const QUICKSTART: NetworkFeeSettings = {
   feeRatePerInstructionsIncrement: 7,
   txMaxInstructions: 400_000_000,
+  txMemoryLimit: 41_943_040,
   txMaxDiskReadEntries: 200,
   txMaxDiskReadBytes: 200_000,
   txMaxWriteLedgerEntries: 200,

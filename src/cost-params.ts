@@ -11,6 +11,10 @@
  *
  * Install a table when a network's calibration moves away from the host's
  * defaults: `loadCostParamsFromRpc` reads the live one.
+ *
+ * A table prices work; it does not cap it. The caps are the network's
+ * `txMaxInstructions` and `txMemoryLimit`, which live in the fee settings
+ * (src/fee-settings.ts) and bound simulation and apply alike.
  */
 import { xdr, rpc } from '@stellar/stellar-sdk';
 import protocol27 from './costparams/protocol27.json' with { type: 'json' };
@@ -20,13 +24,22 @@ export interface CostParams {
   cpuInstructions: string;
   /** base64 `ContractCostParams` XDR */
   memoryBytes: string;
-  /** Network instruction ceiling. */
+  /**
+   * The network's `txMaxInstructions` (ContractComputeV0), as
+   * `loadCostParamsFromRpc` reads it. Given, installing these params writes it
+   * into the fee settings, the one place the ceiling lives.
+   */
   cpuLimit?: bigint;
-  /** Network memory ceiling, in bytes. */
+  /** The network's `txMemoryLimit`, in bytes; written through like `cpuLimit`. */
   memLimit?: bigint;
 }
 
-/** Mainnet's protocol-27 ledger limits. */
+/**
+ * soroban-env-host's own default budget limits (budget/limits.rs:45-46,
+ * `DEFAULT_CPU_INSN_LIMIT` / `DEFAULT_MEM_BYTES_LIMIT`), which were this
+ * harness's ceiling until it took the network's. Testnet and a local
+ * quickstart allow 400M instructions and the same 40 MiB.
+ */
 export const P27_CPU_LIMIT = 100_000_000n;
 export const P27_MEM_LIMIT = 41_943_040n;
 
@@ -34,13 +47,12 @@ export const P27_MEM_LIMIT = 41_943_040n;
  * The calibration a protocol-27 stellar-core ships, captured from a
  * `stellar/quickstart` node's own `ConfigSetting` entries. Good enough to make
  * numbers transfer; read the live table with `loadCostParamsFromRpc` when you
- * need to be exact about a specific network at a specific time.
+ * need to be exact about a specific network at a specific time. It carries no
+ * limits, so installing it leaves the fee settings' ceiling alone.
  */
 export const PROTOCOL_27_COST_PARAMS: CostParams = {
   cpuInstructions: (protocol27 as any).cpuInstructions,
   memoryBytes: (protocol27 as any).memoryBytes,
-  cpuLimit: P27_CPU_LIMIT,
-  memLimit: P27_MEM_LIMIT,
 };
 
 function configSettingKey(id: xdr.ConfigSettingId): xdr.LedgerKey {

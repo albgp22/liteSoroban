@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 273 tests, ~800 ms
+npm test               # 280 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -200,9 +200,12 @@ resource-fee and `*_INSUFFICIENT_REFUNDABLE_FEE` checks), the `AccountEntry`
 extension chain (promoted on a sequence bump; seen promoted by simulation, as
 stellar-rpc's preflight does), `ExtendFootprintTTL` / `RestoreFootprint`
 (validated, applied and simulated), and the network's per-transaction resource
-limits follow stellar-core and soroban-simulation and were checked scenario by
-scenario against a local protocol-29 node (`test/classic-validation.test.ts`,
-`test/preconditions.test.ts`, `test/footprint-ops.test.ts`, `test/fees.test.ts`,
+limits, the host's budget among them (a simulation may use the fee settings'
+`txMaxInstructions` and `txMemoryLimit`, an applied call its declared
+instructions and `txMemoryLimit`), follow stellar-core and soroban-simulation
+and were checked scenario by scenario against a local protocol-29 node
+(`test/classic-validation.test.ts`, `test/preconditions.test.ts`,
+`test/footprint-ops.test.ts`, `test/fees.test.ts`,
 `test/resource-limits.test.ts`). Still missing:
 - `maxTime` is checked against the harness clock as it stands. A node checks it
   against the last close time plus twice its expected ledger close time plus the
@@ -215,12 +218,13 @@ scenario against a local protocol-29 node (`test/classic-validation.test.ts`,
   network's with `withFeeSettings(await loadFeeSettingsFromRpc(server))`. There
   is no surge pricing: the inclusion fee is always charged at the 100-stroop
   base fee.
-- The host's instruction ceiling is not the network's: simulation and apply
-  run under the cost parameters' `cpuLimit`, 100M by default, where testnet and
-  a local quickstart allow 400M per transaction (`txMaxInstructions`, which IS
-  checked at submission). A call needing more than 100M fails here unless
-  `withNetworkCostParams(await loadCostParamsFromRpc(server))` installs the
-  node's. Ledger-wide limits (`ledgerMax*`) are not modelled.
+- Ledger-wide limits (`ledgerMax*`) are not modelled. A call that runs out of
+  instructions or memory at apply gets the node's result code (TRAPPED when the
+  guest runs out of fuel or cannot grow its memory, RESOURCE_LIMIT_EXCEEDED
+  when a host charge passes the limit), but its error is the host's
+  `Error(Budget, ExceededLimit)`, without core's own diagnostic
+  (`operation memory usage exceeds network config limit: 2612663, 2000000` on
+  the node; InvokeHostFunctionOpFrame.cpp:737-753).
 - Simulating an extend over an expired persistent entry is an error here;
   stellar-rpc answers with a restore preamble instead. Both mean "restore first".
 

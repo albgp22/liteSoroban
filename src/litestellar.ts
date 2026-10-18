@@ -55,8 +55,6 @@ import {
 import { attachInProcessRpc } from './fake-rpc.js';
 import {
   PROTOCOL_27_COST_PARAMS,
-  P27_CPU_LIMIT,
-  P27_MEM_LIMIT,
   loadCostParamsFromRpc,
   type CostParams,
 } from './cost-params.js';
@@ -320,15 +318,12 @@ export class LiteStellar {
    * Meter with an explicit network cost calibration instead of the host's
    * built-in one. Defaults to the shipped protocol-27 table, which the pinned
    * host (29.0.2) already uses as its defaults; pass one from
-   * `loadCostParamsFromRpc(server)` to match a specific network exactly.
+   * `loadCostParamsFromRpc(server)` to match a specific network exactly. That
+   * one also carries the node's `txMaxInstructions` / `txMemoryLimit`, which
+   * land in the fee settings (see `Ledger.setCostParams`).
    */
   withNetworkCostParams(params: CostParams = PROTOCOL_27_COST_PARAMS): this {
-    this.ledger.setCostParams(
-      params.cpuInstructions,
-      params.memoryBytes,
-      params.cpuLimit ?? P27_CPU_LIMIT,
-      params.memLimit ?? P27_MEM_LIMIT,
-    );
+    this.ledger.setCostParams(params.cpuInstructions, params.memoryBytes, params.cpuLimit, params.memLimit);
     return this;
   }
 

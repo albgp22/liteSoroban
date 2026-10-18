@@ -34,6 +34,8 @@ use crate::{from_xdr_b64, host_err, SorobanEnv};
 pub(crate) struct NetworkFeeSettings {
     // CONFIG_SETTING_CONTRACT_COMPUTE_V0
     fee_rate_per_instructions_increment: i64,
+    pub(crate) tx_max_instructions: i64,
+    pub(crate) tx_memory_limit: u32,
     // CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
     fee_disk_read_ledger_entry: i64,
     fee_write_ledger_entry: i64,
@@ -307,7 +309,7 @@ impl SorobanEnv {
     /// the XDR size, plus the parsed module's memory for contract code, priced
     /// with the installed cost parameters.
     pub(crate) fn entry_size_for_rent_of(&self, entry: &LedgerEntry) -> Result<u32, JsError> {
-        let budget = self.make_budget(None)?;
+        let budget = self.simulation_budget()?;
         let xdr_size = entry.to_xdr(Limits::none()).map_err(crate::xdr_err)?.len();
         entry_size_for_rent(&budget, entry, u32::try_from(xdr_size).unwrap_or(u32::MAX)).map_err(host_err)
     }

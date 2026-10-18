@@ -15,6 +15,14 @@
  *   (RestoreFootprintOpFrame.cpp:214); and the DECLARED diskReadBytes /
  *   writeBytes (InvokeHostFunctionOpFrame.cpp:368, :805;
  *   RestoreFootprintOpFrame.cpp:199, :223) -> *_RESOURCE_LIMIT_EXCEEDED.
+ * - The host's budget: an applied invocation runs under its DECLARED
+ *   instructions and txMemoryLimit (InvokeHostFunctionOpFrame.cpp:51, :690;
+ *   rust bridge soroban_proto_any.rs:446 Budget::try_from_configs), and fails
+ *   RESOURCE_LIMIT_EXCEEDED past either (:737-753). stellar-rpc 29.0.1's
+ *   preflight simulates under txMaxInstructions and txMemoryLimit
+ *   (preflight/src/shared.rs:134 NetworkConfig::load_from_snapshot ->
+ *   soroban-simulation simulation.rs:133 -> network_config.rs:152-166, the same
+ *   in 29.0.1 and 29.0.2). Both come from ContractComputeV0.
  *
  * Every code, diagnostic and fee pinned here was first observed on a local
  * stellar/quickstart (stellar-core 29.0.0, stellar-rpc 29.0.1, protocol 29) on
@@ -22,8 +30,9 @@
  * submission and invocation cases on the node whose settings QUICKSTART holds,
  * restore and oversized-entry cases on a private one started with testnet's
  * limits but minPersistentTTL 20, then upgraded to contractDataEntrySizeBytes
- * 2,000. Core puts the values in its diagnostic's arguments; `detail` writes
- * them `value > limit`. Successful calls are not compared on fees here: their
+ * 2,000. The host-budget cases ran on the shared node through
+ * .probe-live-ceiling.mts. Core puts the values in its diagnostic's arguments;
+ * `detail` writes them `value > limit`. Successful calls are not compared on fees here: their
  * rent follows the state-archival TTLs, which are not yet the node's.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -43,7 +52,8 @@ import {
   type FeeBumpTransaction,
   type Transaction,
 } from '@stellar/stellar-sdk';
-import { LiteStellar, PROTOCOL_27_COST_PARAMS } from '../src/litestellar.js';
+import { LiteStellar, PROTOCOL_27_COST_PARAMS, TESTNET_FEE_SETTINGS } from '../src/litestellar.js';
+import { invokeHostFn } from '../src/index.js';
 import { QUICKSTART } from './quickstart-settings.js';
 
 const PASS = 'Standalone Network ; February 2017';
@@ -120,9 +130,9 @@ function submit(tx: Transaction | FeeBumpTransaction, payer = a) {
 }
 
 /** Through rpc.Server, as an app sees it. */
-async function run(tx: Transaction) {
-  tx.sign(a);
-  const before = balance(a);
+async function run(tx: Transaction, payer = a) {
+  tx.sign(payer);
+  const before = balance(payer);
   const sent = await S.sendTransaction(tx);
   if (sent.status === 'ERROR') return { status: `ERROR ${sent.errorResult!.result().switch().name}`, op: '', fee: 0n, debited: 0n };
   const got: any = await S.pollTransaction(sent.hash);
@@ -131,14 +141,14 @@ async function run(tx: Transaction) {
     status: got.status as string,
     op: result.result().results()[0].tr().value().switch().name as string,
     fee: BigInt(result.feeCharged().toString()),
-    debited: before - balance(a),
+    debited: before - balance(payer),
   };
 }
 
-async function deploy(wasm: Buffer): Promise<string> {
+async function deploy(wasm: Buffer, salt = Buffer.alloc(32, 1)): Promise<string> {
   expect((await run(await prepared(Operation.uploadContractWasm({ wasm })))).status).toBe('SUCCESS');
   const create = await prepared(
-    Operation.createCustomContract({ address: new Address(a.publicKey()), wasmHash: hash(wasm), salt: Buffer.alloc(32, 1) }),
+    Operation.createCustomContract({ address: new Address(a.publicKey()), wasmHash: hash(wasm), salt }),
   );
   const out = submit(create);
   expect(out.code).toBe('txSUCCESS');
@@ -315,9 +325,6 @@ describe('apply: InvokeHostFunction -> INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEE
   });
 
   it('stores no contract code above contractMaxSizeBytes', async () => {
-    // Parsing 128 KB of Wasm takes more than the host's default 100M-instruction
-    // ceiling; the node's is its txMaxInstructions, 400M.
-    svm.withNetworkCostParams({ ...PROTOCOL_27_COST_PARAMS, cpuLimit: 400_000_000n });
     const big = padded(fixture('add_i32.wasm'), 131_072); // a 131,172-byte entry
     expect(await run(await prepared(Operation.uploadContractWasm({ wasm: big })))).toEqual({
       status: 'FAILED', op: 'invokeHostFunctionResourceLimitExceeded', fee: 766_378n, debited: 766_378n,
@@ -439,5 +446,156 @@ describe('apply: ExtendFootprintTTL / RestoreFootprint', () => {
       status: 'FAILED', op: 'restoreFootprintResourceLimitExceeded', fee: 10_552n, debited: 10_552n,
     });
     expect(submit(await restore('big2')).detail).toBe(detail);
+  });
+});
+
+describe("the host's budget: txMaxInstructions and txMemoryLimit", () => {
+  const LOADGEN = fixture('loadgen.wasm');
+  /** ~41.6 instructions a guest cycle: 3M cycles need ~120M, 9.4M ~376M. */
+  const work = (contract: string, cycles: number) =>
+    Operation.invokeContractFunction({ contract, function: 'do_cpu_only_work', args: [u32(cycles), u32(0), u32(0)] });
+  const declared = (tx: Transaction) => sorobanData(tx).resources().instructions();
+  const stored = async (k: xdr.LedgerKey) => (await S.getLedgerEntries(k)).entries.length;
+  const simError = async (op: xdr.Operation) => {
+    const raw = new TransactionBuilder(await S.getAccount(a.publicKey()), { fee: '100', networkPassphrase: PASS })
+      .addOperation(op)
+      .setTimeout(300)
+      .build();
+    const sim = await S.simulateTransaction(raw);
+    return rpc.Api.isSimulationError(sim) ? sim.error : 'simulated';
+  };
+
+  it('with default settings, simulates and applies what the node does between 100M and 400M', async () => {
+    svm = new LiteStellar({ networkPassphrase: PASS });
+    S = svm.rpcServer();
+    a = fund();
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    // The node's own counts (stellar-rpc 29.0.1, txMaxInstructions 400M): the
+    // host's default 100M ceiling used to fail all three in simulation.
+    for (const [op, instructions] of [
+      [work(loadgen, 3_000_000), 125_134_205],
+      [work(loadgen, 9_400_000), 391_374_205],
+      [Operation.uploadContractWasm({ wasm: padded(fixture('add_i32.wasm'), 130_872) }), 111_117_272],
+    ] as const) {
+      const tx = await prepared(op);
+      expect(declared(tx)).toBe(instructions);
+      expect(await run(tx)).toMatchObject({ status: 'SUCCESS', op: 'invokeHostFunctionSuccess' });
+    }
+  });
+
+  it('charges for them what the node charges', async () => {
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    expect(await run(await prepared(work(loadgen, 3_000_000)))).toEqual({
+      status: 'SUCCESS', op: 'invokeHostFunctionSuccess', fee: 90_700n, debited: 90_700n,
+    });
+    expect(await run(await prepared(work(loadgen, 9_400_000)))).toEqual({
+      status: 'SUCCESS', op: 'invokeHostFunctionSuccess', fee: 277_068n, debited: 277_068n,
+    });
+    const upload = Operation.uploadContractWasm({ wasm: padded(fixture('add_i32.wasm'), 130_872) });
+    expect(await run(await prepared(upload))).toEqual({
+      status: 'SUCCESS', op: 'invokeHostFunctionSuccess', fee: 14_484_392n, debited: 14_484_392n,
+    });
+  });
+
+  it('simulates up to txMaxInstructions: past it, padded or not, the call is refused', async () => {
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    // ~388M raw simulates; stellar-rpc's padding (x1.04) then declares more than
+    // the network allows, and the node refuses it at submission.
+    const padded404 = await prepared(work(loadgen, 9_700_000));
+    expect(declared(padded404)).toBe(403_854_205);
+    expect(submit(padded404)).toMatchObject({
+      code: 'txSOROBAN_INVALID',
+      detail: 'transaction instructions resources exceed network config limit: 403854205 > 400000000',
+      feeCharged: 295_439n,
+      debited: 0n,
+    });
+    // ~437M does not fit the simulation's budget at all, as on the node.
+    expect(await simError(work(loadgen, 10_500_000))).toContain('Error(Budget, ExceededLimit)');
+  });
+
+  it('stops an applied call at its declared instructions: a guest out of fuel is a trap', async () => {
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    const op = work(loadgen, 3_000_000);
+    const d = sorobanData(await prepared(op));
+    d.resources().instructions(100_000_000);
+    // The node: "VM call trapped: OutOfFuel". The guest runs on fuel drawn from
+    // what the budget has left, so it stops AT the declared count and no charge
+    // passes it: InvokeHostFunctionOpFrame.cpp:737 does not fire.
+    expect(await run(await withData(op, d))).toEqual({
+      status: 'FAILED', op: 'invokeHostFunctionTrapped', fee: 72_930n, debited: 72_930n,
+    });
+  });
+
+  it("is the fee settings' txMaxInstructions: one value bounds simulation and submission", async () => {
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    const tx = await prepared(work(loadgen, 3_000_000));
+    // A network that allows 100M per transaction: the same call no longer
+    // simulates, and what was simulated under 400M is refused at submission.
+    svm.withFeeSettings({ ...QUICKSTART, txMaxInstructions: 100_000_000 });
+    expect(await simError(work(loadgen, 3_000_000))).toContain('Error(Budget, ExceededLimit)');
+    expect(declared(await prepared(work(loadgen, 2_400_000)))).toBe(100_174_205);
+    expect(submit(tx).detail).toBe('transaction instructions resources exceed network config limit: 125134205 > 100000000');
+  });
+
+  it('cost params price the work; their limits, when they carry any, go to the fee settings', async () => {
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    // The shipped table carries no limits, so it leaves the network's alone.
+    svm.withNetworkCostParams();
+    expect(svm.ledger.feeSettings.txMaxInstructions).toBe(400_000_000);
+    expect(declared(await prepared(work(loadgen, 3_000_000)))).toBe(125_134_205);
+    // loadCostParamsFromRpc's cpuLimit / memLimit are ContractComputeV0's.
+    svm.withNetworkCostParams({ ...PROTOCOL_27_COST_PARAMS, cpuLimit: 100_000_000n, memLimit: 20_000_000n });
+    expect(svm.ledger.feeSettings).toMatchObject({ txMaxInstructions: 100_000_000, txMemoryLimit: 20_000_000 });
+    expect(await simError(work(loadgen, 3_000_000))).toContain('Error(Budget, ExceededLimit)');
+    expect(TESTNET_FEE_SETTINGS).toMatchObject({ txMaxInstructions: 400_000_000, txMemoryLimit: 41_943_040 });
+  });
+
+  it('is txMemoryLimit for memory, simulated and applied, as on a node lowered to 2,000,000 bytes', async () => {
+    // A private quickstart with testnet's limits, its ContractComputeV0 then
+    // upgraded to txMemoryLimit 2,000,000 (core's minimum, NetworkConfig.h:34)
+    // (.probe-live-mem.mts): each transaction prepared under 41,943,040 bytes,
+    // sent after the upgrade, then simulated again. Its fee settings were
+    // QUICKSTART's.
+    const alloc = await deploy(fixture('alloc.wasm'), Buffer.alloc(32, 3));
+    const loadgen = await deploy(LOADGEN, Buffer.alloc(32, 2));
+    const invoke = (contract: string, fn: string, args: xdr.ScVal[]) =>
+      Operation.invokeContractFunction({ contract, function: fn, args });
+    const upload = (bytes: number) => Operation.uploadContractWasm({ wasm: padded(fixture('add_i32.wasm'), bytes) });
+    const ok = 'invokeHostFunctionSuccess';
+    const trapped = 'invokeHostFunctionTrapped';
+    const limit = 'invokeHostFunctionResourceLimitExceeded';
+    // Core calls a failure RESOURCE_LIMIT_EXCEEDED only when the budget's PEAK
+    // memory passed txMemoryLimit (InvokeHostFunctionOpFrame.cpp:747, with
+    // out.mem_bytes = get_mem_bytes_consumed, soroban_proto_any.rs:484). A
+    // guest's linear memory that cannot grow is refused WITHOUT being charged
+    // (budget/wasmi_helper.rs:33-47), so the peak stays under the limit and
+    // the node reports a trap: "GrowthOperationLimited", "OutOfBoundsGrowth".
+    const cases: [xdr.Operation, string, bigint][] = [
+      [invoke(alloc, 'sum', [u32(10)]), ok, 4_168n],
+      [invoke(alloc, 'sum', [u32(100)]), trapped, 12_951n],
+      [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(5_000), u32(0)]), ok, 21_085n],
+      [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(20_000), u32(0)]), limit, 74_144n],
+      // the node: "operation memory usage exceeds network config limit: 2000207, 2000000"
+      [invoke(loadgen, 'do_cpu_only_work', [u32(0), u32(0), u32(1_000)]), limit, 9_289n],
+      [upload(20_000), trapped, 121_794n],
+      // the node: "operation memory usage exceeds network config limit: 2612663, 2000000"
+      [upload(60_000), limit, 353_925n],
+    ];
+    const sent: [Transaction, Keypair][] = [];
+    for (const [op] of cases) {
+      a = fund();
+      sent.push([await prepared(op), a]);
+    }
+    svm.withFeeSettings({ ...QUICKSTART, txMemoryLimit: 2_000_000 });
+    for (const [i, [op, code, fee]] of cases.entries()) {
+      const [tx, payer] = sent[i];
+      expect(await run(tx, payer), `case ${i}`).toEqual({
+        status: code === ok ? 'SUCCESS' : 'FAILED', op: code, fee, debited: fee,
+      });
+      // Simulation runs under the same 2,000,000 bytes: what failed for memory
+      // no longer simulates.
+      a = fund();
+      expect(await simError(op), `case ${i}`).toEqual(code === ok ? 'simulated' : expect.stringContaining('Error(Budget, ExceededLimit)'));
+    }
   });
 });

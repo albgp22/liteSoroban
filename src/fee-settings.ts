@@ -5,6 +5,12 @@
  * `minResourceFee` with them; the fee arithmetic itself is soroban-env-host's
  * `fees` module, the same code stellar-core and stellar-rpc run.
  *
+ * `txMaxInstructions` and `txMemoryLimit` are also the host's budget: a
+ * simulation runs under them, as stellar-rpc's preflight does
+ * (soroban-simulation `NetworkConfig::create_budget`), and an applied
+ * transaction under its declared instructions and `txMemoryLimit`, as
+ * stellar-core does. They are the only copy of those limits in the harness.
+ *
  * Fees are a network parameter, not a protocol constant: testnet's rates are
  * half a local stellar/quickstart's, and the rent rate follows each network's
  * live Soroban state size. Install the network you are testing against with
@@ -16,7 +22,10 @@ import { xdr, rpc } from '@stellar/stellar-sdk';
 export interface NetworkFeeSettings {
   /** CONFIG_SETTING_CONTRACT_COMPUTE_V0 */
   feeRatePerInstructionsIncrement: number;
+  /** Refused above at submission; the ceiling of every simulation. */
   txMaxInstructions: number;
+  /** Bytes of host memory a transaction may use, simulated or applied. */
+  txMemoryLimit: number;
   /** CONFIG_SETTING_CONTRACT_LEDGER_COST_V0 */
   txMaxDiskReadEntries: number;
   txMaxDiskReadBytes: number;
@@ -60,7 +69,8 @@ export interface NetworkFeeSettings {
 /**
  * Testnet's, read with getLedgerEntries from soroban-testnet.stellar.org on
  * 2026-10-18 at ledger 5,264,749 (protocol 29); the limits at ledger
- * 5,265,020 the same day. Its live state then averaged 3.72 GB, so rent costs
+ * 5,265,020 the same day, `txMemoryLimit` at 5,265,532 (ContractComputeV0 last
+ * modified at 5,194,532). Its live state then averaged 3.72 GB, so rent costs
  * 8,083 stroops per KB-period, not the floor. A local stellar/quickstart's
  * limits were the same, apart from the ledger-wide ones this harness does not
  * model.
@@ -68,6 +78,7 @@ export interface NetworkFeeSettings {
 export const TESTNET_FEE_SETTINGS: NetworkFeeSettings = {
   feeRatePerInstructionsIncrement: 3,
   txMaxInstructions: 400_000_000,
+  txMemoryLimit: 41_943_040,
   txMaxDiskReadEntries: 200,
   txMaxDiskReadBytes: 200_000,
   txMaxWriteLedgerEntries: 200,
@@ -128,6 +139,7 @@ export async function loadFeeSettingsFromRpc(server: rpc.Server): Promise<Networ
       case 'configSettingContractComputeV0':
         out.feeRatePerInstructionsIncrement = n(v.feeRatePerInstructionsIncrement());
         out.txMaxInstructions = n(v.txMaxInstructions());
+        out.txMemoryLimit = n(v.txMemoryLimit());
         break;
       case 'configSettingContractLedgerCostV0':
         out.txMaxDiskReadEntries = n(v.txMaxDiskReadEntries());

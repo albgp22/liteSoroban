@@ -333,6 +333,12 @@ To match a specific network exactly, read its live table:
 svm.withNetworkCostParams(await loadCostParamsFromRpc(mainnetServer));
 ```
 
+The table prices work; the network's limits cap it. A simulation may use up to
+the fee settings' `txMaxInstructions` and `txMemoryLimit` (testnet's: 400M
+instructions, 40 MiB), as stellar-rpc's preflight does, and an applied call its
+declared instructions. To pin a contract against a stricter network, install
+its settings, e.g. `withFeeSettings({ ...TESTNET_FEE_SETTINGS, txMaxInstructions: 100_000_000 })`.
+
 ## Testing your app unchanged
 
 `svm.rpcServer()` returns a real `rpc.Server` whose JSON-RPC is served in

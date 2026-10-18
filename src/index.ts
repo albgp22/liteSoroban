@@ -194,9 +194,20 @@ export class Ledger {
    * Install a network's cost calibration. The pinned host already meters with
    * the protocol-27 table this repo ships, so this changes no count until a
    * network's table moves away from it; use it to match a specific network.
+   *
+   * The ceilings are the fee settings' `txMaxInstructions` and `txMemoryLimit`,
+   * the same ContractComputeV0 values the classic layer checks a submission
+   * against. `cpuLimit` / `memLimit`, when given, are written there.
    */
-  setCostParams(cpuParamsB64: string, memParamsB64: string, cpuLimit: bigint, memLimit: bigint): void {
-    this.env.setCostParams(cpuParamsB64, memParamsB64, cpuLimit, memLimit);
+  setCostParams(cpuParamsB64: string, memParamsB64: string, cpuLimit?: bigint, memLimit?: bigint): void {
+    this.env.setCostParams(cpuParamsB64, memParamsB64);
+    if (cpuLimit !== undefined || memLimit !== undefined) {
+      this.setFeeSettings({
+        ...this.fees,
+        ...(cpuLimit !== undefined ? { txMaxInstructions: Number(cpuLimit) } : {}),
+        ...(memLimit !== undefined ? { txMemoryLimit: Number(memLimit) } : {}),
+      });
+    }
   }
 
   get hasNetworkCostParams(): boolean {
@@ -211,7 +222,7 @@ export class Ledger {
    * `Error(Budget, ExceededLimit)` instead of the host's more specific error.
    * Pass `false` to see that error, or to send resources whose instruction count
    * you do not control. The cap is the smaller of the declared count and the
-   * `cpuLimit` given to `setCostParams`.
+   * fee settings' `txMaxInstructions`; off, it is `txMaxInstructions`.
    *
    * Off, the declared bytes go unchecked too (`enforceDeclaredBytes`). The
    * network's limits apply either way.

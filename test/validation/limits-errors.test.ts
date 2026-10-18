@@ -38,8 +38,11 @@
  * CONCLUSION on `Budget::default()` (asserted below, not asserted here):
  *   - Ceilings: 100_000_000 CPU insns / 40 MiB, compiled in. limits.rs:43-44 says
  *     outright "These are some sane values, however the embedder should typically
- *     customize these to match the network config". They are not read from any
- *     config and this harness exposes no way to change them.
+ *     customize these to match the network config". The harness now does: its
+ *     ceilings are the installed fee settings' txMaxInstructions / txMemoryLimit
+ *     (ContractComputeV0; testnet and a local quickstart: 400M / 40 MiB, read
+ *     2026-10-18), as stellar-rpc's preflight (soroban-simulation
+ *     network_config.rs:152-166) and stellar-core use them.
  *   - Per-transaction limit: WRONG. On the network the budget's CPU limit is the
  *     transaction's own DECLARED resources.instructions, not the network maximum.
  *     crates/host-wasm/src/lib.rs:498 never calls reset_cpu_limit, so the declared
@@ -91,6 +94,18 @@ import { accountIdFromPublicKey, loadAccount } from '../../src/classic.js';
 const DEFAULT_CPU_INSN_LIMIT = 100_000_000;
 /** soroban-env-host-27.0.1/src/budget/limits.rs:46 */
 const DEFAULT_MEM_BYTES_LIMIT = 40 * 1024 * 1024;
+/**
+ * ContractComputeV0.txMaxInstructions of testnet and of a local quickstart
+ * (stellar-core 29.0.0), read with getLedgerEntries on 2026-10-18; the harness's
+ * default fee settings carry it.
+ */
+const TX_MAX_INSTRUCTIONS = 400_000_000;
+/**
+ * do_cpu_only_work cycles past TX_MAX_INSTRUCTIONS (~41.6 instructions a cycle):
+ * the local quickstart's preflight fails this with Error(Budget, ExceededLimit)
+ * (.probe-live-ceiling.mts, 2026-10-18), where 9.4M cycles simulate at 391M.
+ */
+const OVER_BUDGET_CYCLES = 10_500_000;
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -207,7 +222,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
   //    the way stellar-core builds the budget for a real transaction.
   // =========================================================================
   describe('Budget::default() vs the mainnet budget', () => {
-    it('enforces the compiled-in 100M instruction ceiling on the enforcing path', () => {
+    it("enforces the network's txMaxInstructions ceiling on the enforcing path", () => {
       const addr = deploy(LOADGEN);
 
       // The ceiling is what caps send() when the DECLARED count is not enforced;
@@ -223,9 +238,10 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       );
       expect(cheap.ok, cheap.error).toBe(true);
 
-      // ~40.8 CPU instructions per guest cycle, measured; 3M cycles is ~122M,
-      // comfortably past DEFAULT_CPU_INSN_LIMIT.
-      const expensive = invokeHostFn(addr, 'do_cpu_only_work', [u32(3_000_000), u32(0), u32(0)]);
+      // ~41.6 CPU instructions per guest cycle, measured; 10.5M cycles is ~437M,
+      // past TX_MAX_INSTRUCTIONS. (The host's own DEFAULT_CPU_INSN_LIMIT, 100M,
+      // is not the network's; a 3M-cycle call, ~125M, applies on the node.)
+      const expensive = invokeHostFn(addr, 'do_cpu_only_work', [u32(OVER_BUDGET_CYCLES), u32(0), u32(0)]);
       const sent = L.send(expensive, source, cheap.resourcesXdr, cheap.authXdr, []);
 
       // e2e_tests.rs:1004 test_wasm_upload_budget_exceeded: budget exhaustion on
@@ -235,8 +251,8 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
 
       // ...and it stopped at the limit, not somewhere arbitrary.
       // Upstream asserts get_cpu_insns_remaining() == 0.
-      expect(Number(sent.cpuInsns)).toBeGreaterThan(DEFAULT_CPU_INSN_LIMIT * 0.99);
-      expect(Number(sent.cpuInsns)).toBeLessThanOrEqual(DEFAULT_CPU_INSN_LIMIT);
+      expect(Number(sent.cpuInsns)).toBeGreaterThan(TX_MAX_INSTRUCTIONS * 0.99);
+      expect(Number(sent.cpuInsns)).toBeLessThanOrEqual(TX_MAX_INSTRUCTIONS);
 
       // Nothing was committed.
       expect(sent.changedKeys).toEqual([]);
@@ -313,21 +329,31 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       expect(sent.ok, 'declaring diskReadBytes=0 while reading entries must fail').toBe(false);
     });
 
-    it.skip('MISSING CAPABILITY: no way to configure the budget to a network config', () => {
+    it('the budget is configured from the network config: txMaxInstructions / txMemoryLimit', () => {
       // e2e_invoke.rs:687 "The input `Budget` should normally be configured to match
       // the network limits", and budget.rs:306 says Default is "for local/sandbox
       // testing only". stellar-core builds it with Budget::try_from_configs(
-      //   txMaxInstructions-or-declared, txMemoryLimit,
+      //   declared instructions, txMemoryLimit,
       //   ConfigSettingContractCostParamsCpuInstructions,
-      //   ConfigSettingContractCostParamsMemoryBytes)  -- all read from the ledger.
+      //   ConfigSettingContractCostParamsMemoryBytes)  -- all read from the ledger;
+      // stellar-rpc's preflight with txMaxInstructions in place of the declared
+      // count (soroban-simulation network_config.rs:152-166).
       //
-      // The harness hardcodes Budget::default() in both simulate() and send()
-      // (crates/host-wasm/src/lib.rs:386 and :498) and exposes no knob. A test
-      // that wants to pin a contract against a *lowered* network limit, or against
-      // a future cost-parameter upgrade, cannot be written at all.
-      //
-      // What is needed: Ledger({ cpuInstructionLimit, memoryBytesLimit }) at minimum,
-      // and ideally `setCostParams(cpuParamsXdr, memParamsXdr)`.
+      // The harness takes both limits from the installed fee settings
+      // (Ledger.setFeeSettings / loadFeeSettingsFromRpc) and the tables from
+      // setCostParams, so a contract can be pinned against a lowered limit.
+      const addr = deploy(LOADGEN);
+      const call = invokeHostFn(addr, 'do_cpu_only_work', [u32(1_000), u32(0), u32(0)]);
+      const fees = L.feeSettings;
+      expect(fees.txMaxInstructions).toBe(TX_MAX_INSTRUCTIONS);
+      expect(fees.txMemoryLimit).toBe(DEFAULT_MEM_BYTES_LIMIT);
+      expect(L.simulate(call, source).ok).toBe(true);
+
+      L.setFeeSettings({ ...fees, txMaxInstructions: 100_000 });
+      expect(fmt(returnedError(L.simulate(call, source), 'lowered txMaxInstructions'))).toBe('Error(Budget, ExceededLimit)');
+
+      L.setFeeSettings({ ...fees, txMemoryLimit: 100_000 });
+      expect(fmt(returnedError(L.simulate(call, source), 'lowered txMemoryLimit'))).toBe('Error(Budget, ExceededLimit)');
     });
   });
 
@@ -344,7 +370,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       const err = thrownError(
         () =>
           L.simulate(
-            invokeHostFn(addr, 'do_cpu_only_work', [u32(3_000_000), u32(0), u32(0)]),
+            invokeHostFn(addr, 'do_cpu_only_work', [u32(OVER_BUDGET_CYCLES), u32(0), u32(0)]),
             source,
           ),
         'recording-mode budget exhaustion',
@@ -370,7 +396,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       })
         .addOperation(
           Operation.invokeHostFunction({
-            func: invokeHostFn(addr, 'do_cpu_only_work', [u32(3_000_000), u32(0), u32(0)]),
+            func: invokeHostFn(addr, 'do_cpu_only_work', [u32(OVER_BUDGET_CYCLES), u32(0), u32(0)]),
             auth: [],
           }),
         )
@@ -764,7 +790,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       // and with the event log replaced by "DebugInfo not available".
       let thrown = '';
       try {
-        L.simulate(invokeHostFn(addr, 'do_cpu_only_work', [u32(3_000_000), u32(0), u32(0)]), source);
+        L.simulate(invokeHostFn(addr, 'do_cpu_only_work', [u32(OVER_BUDGET_CYCLES), u32(0), u32(0)]), source);
       } catch (e) {
         thrown = (e as Error).message;
       }
@@ -796,7 +822,7 @@ describe('resource limits, budget exhaustion and error-code fidelity', () => {
       let passthrough = '';
       try {
         L.simulateAndSend(
-          invokeHostFn(addr, 'do_cpu_only_work', [u32(3_000_000), u32(0), u32(0)]),
+          invokeHostFn(addr, 'do_cpu_only_work', [u32(OVER_BUDGET_CYCLES), u32(0), u32(0)]),
           source,
         );
       } catch (e) {

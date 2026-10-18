@@ -389,11 +389,11 @@ pub struct SorobanEnv {
     /// calibration: on the pinned 29.0.2 they equal the protocol-27 table this
     /// repo ships, so installing it with `setCostParams` changes no count. Load
     /// a network's own table to match that network once it moves away from the
-    /// host's defaults.
+    /// host's defaults. The tables only price the work: how much of it a
+    /// transaction may do is the network's `txMaxInstructions` and
+    /// `txMemoryLimit`, in `fee_settings` (see `tx_limits`).
     cpu_cost_params: Option<ContractCostParams>,
     mem_cost_params: Option<ContractCostParams>,
-    cpu_limit: u64,
-    mem_limit: u64,
     /// The network's `StateArchivalSettings` TTLs: the host gives a new entry
     /// `ledger + min - 1` and caps any TTL at `ledger + max - 1`
     /// (ledger_info.rs), and RestoreFootprint / auto-restore use the persistent
@@ -424,7 +424,9 @@ pub struct SorobanEnv {
     /// whose `__check_auth` the recording never ran: it now dies with
     /// Error(Budget, ExceededLimit) before the host gets to reject the
     /// signature. The limit is the smaller of the declared count and the
-    /// configured `cpu_limit`. Turn this off to send resources whose
+    /// network's `txMaxInstructions`, which the classic layer has already
+    /// refused a larger declared count against. Off, the limit is
+    /// `txMaxInstructions` itself. Turn this off to send resources whose
     /// instruction count you do not control.
     enforce_declared_resources: bool,
     /// Fail the enforcing pass when it reads more classic or restored entry
@@ -457,8 +459,6 @@ impl SorobanEnv {
             prng_counter: std::cell::Cell::new(0),
             cpu_cost_params: None,
             mem_cost_params: None,
-            cpu_limit: 100_000_000,
-            mem_limit: 41_943_040,
             min_temp_entry_ttl: TESTNET_MIN_TEMP_ENTRY_TTL,
             min_persistent_entry_ttl: TESTNET_MIN_PERSISTENT_ENTRY_TTL,
             max_entry_ttl: TESTNET_MAX_ENTRY_TTL,
@@ -485,19 +485,13 @@ impl SorobanEnv {
     /// Install the network's real cost calibration, as base64
     /// `ContractCostParams` XDR (from the `ConfigSetting` ledger entries).
     /// Without this the harness meters with the host's defaults, which on the
-    /// pinned host equal the shipped protocol-27 table.
+    /// pinned host equal the shipped protocol-27 table. The ceilings are not
+    /// part of it: they are the fee settings' `txMaxInstructions` and
+    /// `txMemoryLimit`.
     #[wasm_bindgen(js_name = setCostParams)]
-    pub fn set_cost_params(
-        &mut self,
-        cpu_params_b64: &str,
-        mem_params_b64: &str,
-        cpu_limit: u64,
-        mem_limit: u64,
-    ) -> Result<(), JsError> {
+    pub fn set_cost_params(&mut self, cpu_params_b64: &str, mem_params_b64: &str) -> Result<(), JsError> {
         self.cpu_cost_params = Some(from_xdr_b64(cpu_params_b64)?);
         self.mem_cost_params = Some(from_xdr_b64(mem_params_b64)?);
-        self.cpu_limit = cpu_limit;
-        self.mem_limit = mem_limit;
         Ok(())
     }
 
@@ -834,7 +828,7 @@ impl SorobanEnv {
             None => RecordingInvocationAuthMode::recording(false, false),
         };
 
-        let budget = self.make_budget(None)?;
+        let budget = self.simulation_budget()?;
         let mut diagnostics = Vec::new();
         let snapshot: Rc<dyn SnapshotSource> = Rc::new(SimulationSnapshot {
             inner: StoreSnapshot(Rc::clone(&self.store)),
@@ -984,11 +978,7 @@ impl SorobanEnv {
         // stellar-core caps the enforcing run at the declared instruction
         // count and reports INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED when
         // it is exceeded. Without this the declared resources are decorative.
-        let budget = self.make_budget(if self.enforce_declared_resources {
-            Some((resources.instructions as u64).min(self.cpu_limit))
-        } else {
-            None
-        })?;
+        let budget = self.enforcing_budget(resources.instructions)?;
 
         // One item per footprint key, in the order the host zips them against
         // the footprint; see PROTOCOL PINNING at the top of this file.
@@ -1308,7 +1298,8 @@ impl SorobanEnv {
     /// host fails: RESOURCE_LIMIT_EXCEEDED if it burned more instructions than
     /// declared or more memory than the network allows, TRAPPED otherwise.
     fn failed_call_code(&self, resources: &SorobanResources, cpu_insns: u64, mem_bytes: u64) -> &'static str {
-        if (resources.instructions as u64) < cpu_insns || self.mem_limit < mem_bytes {
+        let tx_memory_limit = self.tx_limits().map_or(u64::MAX, |(_, mem)| mem);
+        if (resources.instructions as u64) < cpu_insns || tx_memory_limit < mem_bytes {
             "invokeHostFunctionResourceLimitExceeded"
         } else {
             "invokeHostFunctionTrapped"
@@ -1425,23 +1416,79 @@ impl SorobanEnv {
         Ok(cache)
     }
 
-    /// Build a budget from the installed network cost parameters when we have
-    /// them, falling back to the host's default table when we do not.
-    fn make_budget(&self, cpu_limit: Option<u64>) -> Result<Budget, JsError> {
-        let cpu = cpu_limit.unwrap_or(self.cpu_limit);
-        match (&self.cpu_cost_params, &self.mem_cost_params) {
-            (Some(cpu_params), Some(mem_params)) => Budget::try_from_configs(
-                cpu,
-                self.mem_limit,
-                cpu_params.clone(),
-                mem_params.clone(),
-            )
-            .map_err(host_err),
+    /// The network's per-transaction ceiling, `ContractComputeV0`'s
+    /// `txMaxInstructions` and `txMemoryLimit`, from the installed fee
+    /// settings: the one place a limit lives, so the classic layer's
+    /// submission check (`checkSorobanResources`) and the host's budget can
+    /// never disagree. A bare `SorobanEnv` with no settings installed gets the
+    /// host's own defaults (100M instructions, 40 MiB).
+    fn tx_limits(&self) -> Result<(u64, u64), JsError> {
+        match self.fee_settings.as_ref() {
+            Some(f) => Ok((
+                u64::try_from(f.tx_max_instructions).unwrap_or(0),
+                u64::from(f.tx_memory_limit),
+            )),
+            None => {
+                let b = Budget::default();
+                Ok((
+                    b.get_cpu_insns_remaining().map_err(host_err)?,
+                    b.get_mem_bytes_remaining().map_err(host_err)?,
+                ))
+            }
+        }
+    }
+
+    /// Recording mode's budget, as soroban-simulation's
+    /// `NetworkConfig::create_budget` (network_config.rs:152-166, 29.0.1 and
+    /// 29.0.2 alike) builds it for stellar-rpc's preflight: the network's
+    /// `txMaxInstructions` and `txMemoryLimit`, with shadow limits 10x and 2x
+    /// those. So a simulation may use everything a transaction may declare.
+    fn simulation_budget(&self) -> Result<Budget, JsError> {
+        let (cpu, mem) = self.tx_limits()?;
+        self.budget(cpu, mem, Some((cpu.saturating_mul(10), mem.saturating_mul(2))))
+    }
+
+    /// The enforcing run's budget, as stellar-core's rust bridge builds it
+    /// (soroban_proto_any.rs:446 `Budget::try_from_configs(instruction_limit,
+    /// ledger_info.memory_limit, ..)`, called from InvokeHostFunctionOpFrame.cpp
+    /// :690 with the DECLARED instructions and :51 `txMemoryLimit`). Core's
+    /// declared count never exceeds `txMaxInstructions`, submission refused it;
+    /// a bare `send` is capped there too. With `enforce_declared_resources` off,
+    /// `txMaxInstructions` is the cap.
+    fn enforcing_budget(&self, declared_instructions: u32) -> Result<Budget, JsError> {
+        let (cpu, mem) = self.tx_limits()?;
+        let cpu = if self.enforce_declared_resources {
+            u64::from(declared_instructions).min(cpu)
+        } else {
+            cpu
+        };
+        self.budget(cpu, mem, None)
+    }
+
+    /// A budget with these limits, priced with the installed network cost
+    /// parameters when we have them and the host's default table when we do
+    /// not. `shadow` sets the shadow limits, which bound only debug-mode work;
+    /// the host offers no way to set them on its default table, where they stay
+    /// equal to the limits.
+    fn budget(&self, cpu: u64, mem: u64, shadow: Option<(u64, u64)>) -> Result<Budget, JsError> {
+        match (&self.cpu_cost_params, &self.mem_cost_params, shadow) {
+            (Some(cpu_params), Some(mem_params), Some((cpu_shadow, mem_shadow))) => {
+                Budget::try_from_configs_with_shadow_limits(
+                    cpu,
+                    mem,
+                    cpu_shadow,
+                    mem_shadow,
+                    cpu_params.clone(),
+                    mem_params.clone(),
+                )
+                .map_err(host_err)
+            }
+            (Some(cpu_params), Some(mem_params), None) => {
+                Budget::try_from_configs(cpu, mem, cpu_params.clone(), mem_params.clone()).map_err(host_err)
+            }
             _ => {
                 let b = Budget::default();
-                if let Some(limit) = cpu_limit {
-                    b.reset_cpu_limit(limit).map_err(host_err)?;
-                }
+                b.reset_limits(cpu, mem).map_err(host_err)?;
                 Ok(b)
             }
         }
