@@ -3,8 +3,9 @@
  * does not. Written in TypeScript on purpose — it is the layer most likely to
  * need per-project adjustment, and here it iterates without rebuilding wasm.
  *
- * Scope, deliberately: transaction envelopes, sequence numbers, timebounds,
- * signature weights against thresholds, inclusion/resource fees, and fee bumps.
+ * Scope, deliberately: transaction envelopes, sequence numbers, preconditions
+ * (time and ledger bounds, PRECOND_V2), signature weights against thresholds,
+ * inclusion/resource fees, and fee bumps.
  * NOT classic operations (Payment, CreateAccount, ChangeTrust) — a Soroban
  * transaction may not contain them anyway (validateSorobanOpsConsistency).
  *
@@ -40,6 +41,7 @@ export type TxResultCode =
   | 'txBAD_AUTH_EXTRA'
   | 'txTOO_EARLY'
   | 'txTOO_LATE'
+  | 'txBAD_MIN_SEQ_AGE_OR_GAP'
   | 'txMISSING_OPERATION'
   | 'txMALFORMED'
   | 'txSOROBAN_INVALID'
@@ -368,6 +370,113 @@ function checkExtraSigners(checker: SignatureChecker, raw: xdr.Transaction): boo
 }
 
 // ---------------------------------------------------------------------------
+// the rest of PRECOND_V2 (CAP-21), as TransactionFrame evaluates it
+// ---------------------------------------------------------------------------
+
+function preconditionsV2(raw: xdr.Transaction): xdr.PreconditionsV2 | null {
+  const cond = raw.cond();
+  return cond.switch().name === 'precondV2' ? cond.v2() : null;
+}
+
+/** getTimeBounds: PRECOND_TIME's, or the optional ones carried in PRECOND_V2. */
+function timeBounds(raw: xdr.Transaction): xdr.TimeBounds | null {
+  const cond = raw.cond();
+  if (cond.switch().name === 'precondTime') return cond.timeBounds();
+  return preconditionsV2(raw)?.timeBounds() ?? null;
+}
+
+/**
+ * The first thing commonValidPreSeqNum checks on a v1 envelope: two identical
+ * extraSigners, or an ed25519SignedPayload one with an empty payload, make it
+ * txMALFORMED. XDR caps extraSigners at 2, so "identical" compares one pair.
+ */
+function extraSignersMalformed(raw: xdr.Transaction): string | null {
+  const extra = preconditionsV2(raw)?.extraSigners() ?? [];
+  if (extra.length === 2 && extra[0].toXDR().equals(extra[1].toXDR())) {
+    return 'the two PRECOND_V2 extraSigners are identical';
+  }
+  for (const s of extra) {
+    if (
+      s.switch().name === 'signerKeyTypeEd25519SignedPayload' &&
+      s.ed25519SignedPayload().payload().length === 0
+    ) {
+      return 'a PRECOND_V2 ed25519SignedPayload extraSigner has an empty payload';
+    }
+  }
+  return null;
+}
+
+/**
+ * isTooEarly then isTooLate, each time bounds first and ledger bounds second.
+ * `ledger.ledgerSeq` is the ledger the transaction applies in, which is what
+ * core validates against at submission (TransactionQueue passes LCL + 1). A
+ * zero minTime, maxTime or maxLedger means no bound; maxLedger is exclusive.
+ */
+function boundsProblem(ledger: Ledger, raw: xdr.Transaction): { code: TxResultCode; detail: string } | null {
+  const now = BigInt(ledger.timestamp);
+  const seq = ledger.ledgerSeq;
+  const tb = timeBounds(raw);
+  const lb = preconditionsV2(raw)?.ledgerBounds() ?? null;
+  const minTime = tb ? BigInt(tb.minTime().toString()) : 0n;
+  const maxTime = tb ? BigInt(tb.maxTime().toString()) : 0n;
+  if (minTime !== 0n && minTime > now) {
+    return { code: 'txTOO_EARLY', detail: `minTime ${minTime} is after the close time ${now}` };
+  }
+  if (lb && lb.minLedger() > seq) {
+    return { code: 'txTOO_EARLY', detail: `minLedger ${lb.minLedger()} is after ledger ${seq}` };
+  }
+  if (maxTime !== 0n && maxTime < now) {
+    return { code: 'txTOO_LATE', detail: `maxTime ${maxTime} is before the close time ${now}` };
+  }
+  if (lb && lb.maxLedger() !== 0 && lb.maxLedger() <= seq) {
+    return { code: 'txTOO_LATE', detail: `maxLedger ${lb.maxLedger()} is not after ledger ${seq}` };
+  }
+  return null;
+}
+
+/**
+ * isBadSeq past its unconditional first clause. PRECOND_V2 minSeqNum relaxes
+ * the strict account seqNum + 1 rule to minSeqNum <= account seqNum < tx seqNum.
+ */
+function badSequence(raw: xdr.Transaction, currentSeq: bigint, txSeq: bigint): string | null {
+  const minSeqNum = preconditionsV2(raw)?.minSeqNum();
+  if (minSeqNum) {
+    const min = BigInt(minSeqNum.toString());
+    if (currentSeq < min || currentSeq >= txSeq) {
+      return `minSeqNum ${min} needs the account sequence ${currentSeq} in [${min}, ${txSeq})`;
+    }
+    return null;
+  }
+  return txSeq === currentSeq + 1n ? null : `expected sequence ${currentSeq + 1n}, got ${txSeq}`;
+}
+
+/**
+ * isTooEarlyForAccount: minSeqAge against the seqTime, and minSeqLedgerGap
+ * against the seqLedger, that the account's last sequence bump stamped into
+ * AccountEntry ext v3 (both 0 for an account that has none). Core runs it for
+ * every envelope, so with zero bounds it only fails if the clock was moved back
+ * past the account's seqTime, which a real network cannot do.
+ */
+function tooEarlyForAccount(ledger: Ledger, raw: xdr.Transaction, account: xdr.AccountEntry): string | null {
+  const v2 = preconditionsV2(raw);
+  const minSeqAge = v2 ? BigInt(v2.minSeqAge().toString()) : 0n;
+  const minSeqLedgerGap = v2 ? v2.minSeqLedgerGap() : 0;
+  const v3 = accountEntryExtensionV3(account);
+  const seqTime = v3 ? BigInt(v3.seqTime().toString()) : 0n;
+  const seqLedger = v3 ? v3.seqLedger() : 0;
+
+  const closeTime = BigInt(ledger.timestamp);
+  if (minSeqAge > closeTime || closeTime - minSeqAge < seqTime) {
+    return `minSeqAge ${minSeqAge}: the sequence last moved at ${seqTime}, close time is ${closeTime}`;
+  }
+  const seq = ledger.ledgerSeq;
+  if (minSeqLedgerGap > seq || seq - minSeqLedgerGap < seqLedger) {
+    return `minSeqLedgerGap ${minSeqLedgerGap}: the sequence last moved in ledger ${seqLedger}, this is ${seq}`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // the apply path
 // ---------------------------------------------------------------------------
 
@@ -422,11 +531,14 @@ function xdrProvidesValidFee(raw: xdr.Transaction): string | null {
 export interface ValidationOptions {
   /** Verify envelope signatures against account thresholds. Default true. */
   sigverify?: boolean;
-  /** Enforce strict seqNum + 1. Default true. */
+  /** Enforce strict seqNum + 1, or the range a PRECOND_V2 minSeqNum allows. Default true. */
   sequenceCheck?: boolean;
   /** Debit fees from the source account. Default true. */
   feeCharging?: boolean;
-  /** Enforce timebounds against the ledger clock. Default true. */
+  /**
+   * Enforce the preconditions that read the ledger clock: time bounds, and
+   * PRECOND_V2's ledgerBounds, minSeqAge and minSeqLedgerGap. Default true.
+   */
   timebounds?: boolean;
 }
 
@@ -588,6 +700,12 @@ function applyInner(
 ): TxOutcome {
   const ops = raw.operations();
 
+  // The checks below run in commonValidPreSeqNum's order, then commonValid's
+  // (TransactionFrame.cpp, v29.0.0): the order decides which code wins when
+  // several apply.
+  const badExtraSigners = extraSignersMalformed(raw);
+  if (badExtraSigners) return fail('txMALFORMED', badExtraSigners);
+
   // -- envelope shape (TransactionFrame.cpp:1325, :760) --------------------
   if (ops.length === 0) return fail('txMISSING_OPERATION');
 
@@ -619,6 +737,14 @@ function applyInner(
     }
   }
 
+  // -- time and ledger bounds (isTooEarly, isTooLate) ----------------------
+  // Still commonValidPreSeqNum: before the source account is even loaded, so
+  // an expired envelope is txTOO_LATE whatever its sequence number.
+  if (validation.timebounds !== false) {
+    const bounds = boundsProblem(ledger, raw);
+    if (bounds) return fail(bounds.code, bounds.detail);
+  }
+
   // -- source account ------------------------------------------------------
   const sourceId = muxedToAccountId(raw.sourceAccount());
   const account = loadAccount(ledger, sourceId);
@@ -643,19 +769,15 @@ function applyInner(
   if (txSeq === (BigInt(ledger.ledgerSeq) << 32n)) {
     return fail('txBAD_SEQ', 'sequence equals getStartingSequenceNumber(currentLedger)');
   }
-  if (validation.sequenceCheck !== false && txSeq !== currentSeq + 1n) {
-    return fail('txBAD_SEQ', `expected sequence ${currentSeq + 1n}, got ${txSeq}`);
+  if (validation.sequenceCheck !== false) {
+    const bad = badSequence(raw, currentSeq, txSeq);
+    if (bad) return fail('txBAD_SEQ', bad);
   }
 
-  // -- timebounds ----------------------------------------------------------
-  const cond = raw.cond();
-  if (validation.timebounds !== false && cond.switch().name === 'precondTime') {
-    const tb = cond.timeBounds();
-    const now = BigInt(ledger.timestamp);
-    const min = BigInt(tb.minTime().toString());
-    const max = BigInt(tb.maxTime().toString());
-    if (min !== 0n && now < min) return fail('txTOO_EARLY');
-    if (max !== 0n && now > max) return fail('txTOO_LATE');
+  // -- minSeqAge / minSeqLedgerGap (isTooEarlyForAccount) ------------------
+  if (validation.timebounds !== false) {
+    const early = tooEarlyForAccount(ledger, raw, account);
+    if (early) return fail('txBAD_MIN_SEQ_AGE_OR_GAP', early);
   }
 
   // -- signatures, part 1 --------------------------------------------------
@@ -910,6 +1032,15 @@ function bumpSequence(ledger: Ledger, id: xdr.AccountId, to: bigint): void {
   v3.seqLedger(ledger.ledgerSeq);
   v3.seqTime(new xdr.TimePoint(xdr.Uint64.fromString(String(ledger.timestamp))));
   storeAccount(ledger, account);
+}
+
+/** hasAccountEntryExtV3 / getAccountEntryExtensionV3: the v3 extension, if the chain reaches it. */
+function accountEntryExtensionV3(account: xdr.AccountEntry): xdr.AccountEntryExtensionV3 | null {
+  if (account.ext().switch() !== 1) return null;
+  const v1 = account.ext().v1();
+  if (v1.ext().switch() !== 2) return null;
+  const v2 = v1.ext().v2();
+  return v2.ext().switch() === 3 ? v2.ext().v3() : null;
 }
 
 /** Core's prepareAccountEntryExtensionV1/V2/V3: create what is missing, zeroed. */

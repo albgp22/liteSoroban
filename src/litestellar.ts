@@ -291,7 +291,7 @@ export class LiteStellar {
     this.validation.sigverify = on;
     return this;
   }
-  /** Stop enforcing strict seqNum + 1 on submitted envelopes. */
+  /** Stop enforcing strict seqNum + 1 (or PRECOND_V2 minSeqNum's range) on submitted envelopes. */
   withSequenceCheck(on: boolean): this {
     this.validation.sequenceCheck = on;
     return this;
@@ -301,7 +301,7 @@ export class LiteStellar {
     this.validation.feeCharging = on;
     return this;
   }
-  /** Stop enforcing timebounds. */
+  /** Stop enforcing time bounds, ledger bounds, minSeqAge and minSeqLedgerGap. */
   withTimebounds(on: boolean): this {
     this.validation.timebounds = on;
     return this;

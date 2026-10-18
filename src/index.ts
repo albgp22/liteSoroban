@@ -164,7 +164,7 @@ export class Ledger {
 
   /**
    * Requirement 1, for real: submit a signed transaction envelope. Validates
-   * envelope shape, sequence number, timebounds, signature weights and fees
+   * envelope shape, sequence number, preconditions, signature weights and fees
    * before dispatching the operation to the host.
    */
   sendTransaction(envelopeB64: string): TxOutcome {

@@ -11,7 +11,7 @@ citizen, and a synchronous API.
 ```bash
 npm install
 npm run build:wasm     # needs: rustup target add wasm32-unknown-unknown; cargo install wasm-pack
-npm test               # 201 tests, ~800 ms
+npm test               # 227 tests, ~800 ms
 npm run test:validation # adversarial batteries — partly RED on purpose, see "Known gaps"
 ```
 
@@ -121,7 +121,7 @@ recorded auth entries. Disk/write bytes match on five of six.
 | Layer | Where | What it does |
 |---|---|---|
 | Soroban host | Rust → wasm (`crates/host-wasm`) | Execution, storage, TTL, budget, footprint, `__check_auth`, SAC |
-| Classic | TS (`src/classic.ts`) | Envelopes, sequence numbers, timebounds, signature weights, fees, fee bumps |
+| Classic | TS (`src/classic.ts`) | Envelopes, sequence numbers, preconditions, signature weights, fees, fee bumps |
 | Auth | TS (`src/auth.ts`) | Signing authorization entries for custom accounts |
 | RPC facade | TS (`src/fake-rpc.ts`) | JSON-RPC over `httpClient.defaults.adapter` |
 | Facade | TS (`src/litestellar.ts`) | The LiteSVM-shaped API above |
@@ -135,9 +135,9 @@ Both SDK entry points work unchanged: `rpc.Server` (simulate →
 ```ts
 new LiteStellar()
   .withSigverify(false)      // don't verify envelope signatures
-  .withSequenceCheck(false)  // don't enforce seqNum + 1
+  .withSequenceCheck(false)  // don't enforce seqNum + 1 (or minSeqNum's range)
   .withFeeCharging(false)    // don't debit fees
-  .withTimebounds(false)     // don't enforce timebounds
+  .withTimebounds(false)     // don't enforce time/ledger bounds, minSeqAge, minSeqLedgerGap
   .withoutClassicChecks();   // all of the above
 ```
 
@@ -178,14 +178,21 @@ table since 28.0.0, see above) and the enforcing path's missing module cache (se
 "Apply-path metering").
 
 **Classic layer** — signatures (every signer type, consumption, `txBAD_AUTH_EXTRA`,
-operation thresholds, `extraSigners`), fee-bump fee rules, and the `AccountEntry`
-extension chain (promoted on a sequence bump; seen promoted by simulation, as
-stellar-rpc's preflight does), and `ExtendFootprintTTL` / `RestoreFootprint`
-(validated, applied and simulated) follow stellar-core and soroban-simulation and
-were checked scenario by scenario against a local protocol-29 node
-(`test/classic-validation.test.ts`, `test/footprint-ops.test.ts`). Still missing:
-- PRECOND_V2 other than `extraSigners`: `ledgerBounds`, `minSeqNum`, `minSeqAge`,
-  `minSeqLedgerGap`, and timebounds carried in V2 are not evaluated.
+operation thresholds, `extraSigners`), PRECOND_V2 preconditions (time and ledger
+bounds, `minSeqNum`, `minSeqAge`, `minSeqLedgerGap`, `extraSigners` validity, in
+core's check order), fee-bump fee rules, and the `AccountEntry` extension chain
+(promoted on a sequence bump; seen promoted by simulation, as stellar-rpc's
+preflight does), and `ExtendFootprintTTL` / `RestoreFootprint` (validated, applied
+and simulated) follow stellar-core and soroban-simulation and were checked
+scenario by scenario against a local protocol-29 node
+(`test/classic-validation.test.ts`, `test/preconditions.test.ts`,
+`test/footprint-ops.test.ts`). Still missing:
+- `maxTime` is checked against the harness clock as it stands. A node checks it
+  against the last close time plus twice its expected ledger close time plus the
+  time since that close (`getUpperBoundCloseTimeOffset`), so an envelope a few
+  seconds from expiry is txTOO_LATE there and accepted here: on the local node
+  `maxTime = close time + 1` was txTOO_LATE, `+ 30` was accepted. Same for
+  PRECOND_TIME.
 - The fee taken is the full bid: no inclusion-fee discount, no refund of the
   unused refundable resource fee, and Extend/Restore charge no rent, so
   `INSUFFICIENT_REFUNDABLE_FEE` never happens.
@@ -195,6 +202,11 @@ were checked scenario by scenario against a local protocol-29 node
 **RPC facade** — all 18 `rpc.Server` methods respond and `test/rpc-compat.test.ts`
 checks the SDK-parsed result of each. Still wrong, found by review round 2:
 - Diagnostics do not reach `getTransaction`; fee stats are synthetic.
+- `getLatestLedger` reports the ledger the next transaction applies in; a node
+  reports the last closed one, which is one lower. Anything a client works out from it
+  is out by one ledger: `ledgerBounds.maxLedger = latest + 1` is accepted here and
+  txTOO_LATE on a node, and `minLedger = latest + 1` is the reverse. Relative to the
+  ledger a transaction applies in, the two agree.
 - `Client.deploy` reaches the network (an SDK leak at `client.js:36-38`, not ours).
 
 `getLedgerEntries` also serves no `ConfigSetting` entries, so neither the

@@ -374,9 +374,9 @@ When a test is not about envelopes, turn the classic rules off:
 ```ts
 new LiteStellar()
   .withSigverify(false)      // don't verify envelope signatures
-  .withSequenceCheck(false)  // don't enforce seqNum + 1
+  .withSequenceCheck(false)  // don't enforce seqNum + 1 (or minSeqNum's range)
   .withFeeCharging(false)
-  .withTimebounds(false)
+  .withTimebounds(false)     // nor time/ledger bounds, minSeqAge, minSeqLedgerGap
   .withoutClassicChecks();   // all of the above
 ```
 
