@@ -427,7 +427,7 @@ pub struct SorobanEnv {
     /// was stellar-core's `initialCpuCostParamsEntryForV20` — the table a
     /// network has BEFORE its first settings upgrade — which over-metered
     /// against any live node. From 28.0.0 the defaults are the live
-    /// calibration: on the pinned 29.0.2 they equal the protocol-27 table this
+    /// calibration: on the pinned 30.0.0 they equal the protocol-27 table this
     /// repo ships, so installing it with `setCostParams` changes no count. Load
     /// a network's own table to match that network once it moves away from the
     /// host's defaults. The tables only price the work: how much of it a

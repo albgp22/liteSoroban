@@ -22,7 +22,7 @@ describe('LiteStellar', () => {
   });
 
   it('constructs with sane defaults', () => {
-    expect(svm.protocolVersion).toBe(29);
+    expect(svm.protocolVersion).toBe(30);
     expect(svm.networkPassphrase).toBe(Networks.TESTNET);
     expect(svm.ledgerSequence).toBe(1_000_000);
   });

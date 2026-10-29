@@ -4,7 +4,7 @@
  * The reference numbers this file used to compare against were the implied raw
  * instruction counts of a protocol-27 stellar/quickstart node (stellar-rpc
  * 27.1.1, captive-core 27.1.0), measured with soroban-env-host 27.0.1. The
- * pinned host is now 29.0.2, whose own metering moved in 28.0.0, so those
+ * pinned host is now 30.0.0, whose own metering moved in 28.0.0, so those
  * numbers no longer describe it; see README "Read this before trusting a
  * number". Re-capture against a protocol-29 node before comparing again.
  */

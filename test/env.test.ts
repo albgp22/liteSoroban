@@ -34,10 +34,10 @@ describe('in-process Soroban ledger (wasm host)', () => {
   });
 
   it('reports the protocol it actually implements', () => {
-    expect(HOST_PROTOCOL).toBe(29);
-    expect(L.protocolVersion).toBe(29);
+    expect(HOST_PROTOCOL).toBe(30);
+    expect(L.protocolVersion).toBe(30);
     // A harness pinned to the wrong protocol must refuse to start.
-    expect(() => new Ledger({ protocolVersion: 28 })).toThrow(/protocol 29/);
+    expect(() => new Ledger({ protocolVersion: 29 })).toThrow(/protocol 30/);
   });
 
   it('req 5: seeds a funded account with no network', () => {

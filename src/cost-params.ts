@@ -6,7 +6,7 @@
  * only until its first settings upgrade — and the harness over-metered by
  * 15-249% until a real table was installed. 28.0.0 replaced those defaults with
  * the live network's calibration (`ValDeser` const_term 331, not 59,052), and
- * on the pinned 29.0.2 every CPU and memory entry equals the protocol-27 table
+ * on the pinned 30.0.0 every protocol-27 CPU and memory entry equals the protocol-27 table
  * shipped here, so installing it changes no count.
  *
  * Install a table when a network's calibration moves away from the host's

@@ -49,9 +49,12 @@ earlier version of this file conflated them.
   stellar-core's `initialCpuCostParamsEntryForV20`, the calibration a network
   carries only until its first settings upgrade (`ValDeser` `const_term`
   **59,052** vs a live network's **331**). 28.0.0 replaced those defaults with
-  the live calibration: on the pinned 29.0.2, all 86 CPU and 86 memory entries
-  equal the protocol-27 table this repository captured from a real node's
-  `ConfigSetting` entries.
+  the live calibration: on 29.0.2 and on the pinned 30.0.0, all 86 CPU and 86
+  memory entries equal the protocol-27 table this repository captured from a
+  real node's `ConfigSetting` entries. 30.0.0 adds nine ML-DSA cost types
+  (CAP-87) that this table does not have, and the host's `get_cost` fails with
+  `Error(Budget, InternalError)` for a cost type without an entry. So under
+  `withNetworkCostParams()`, a call that charges an ML-DSA cost fails.
 
 `withNetworkCostParams()` installs that table explicitly, which on this host
 changes no count, and sets `metersLikeNetwork`. It matters once a network's
@@ -335,8 +338,8 @@ source — `InvokeHostFunctionOpFrame.cpp` passes `mOpFrame.getSourceID()`.
 `soroban-env-host` 27.0.1 (`encoded_ledger_entries` and `encoded_ttl_entries` as
 two parallel equal-length iterators) and **13** in 28.0.1 (TTL folded in via
 `TtlLedgerEntryMeta`). Recording mode is identical in both. stellar-rpc vendors
-both and dispatches on `ledger_info.protocol_version`. 29.0.2 keeps the 28.x
-signatures, and the harness targets that shape: one iterator item per footprint
+both and dispatches on `ledger_info.protocol_version`. 29.0.2 and 30.0.0 keep the
+28.x signatures, and the harness targets that shape: one iterator item per footprint
 key, absent keys included as `(None, None)` — skip one and every later entry
 lands on the wrong key (`PROTOCOL PINNING` in `crates/host-wasm/src/lib.rs`).
 

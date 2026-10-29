@@ -311,7 +311,7 @@ r.events;         // xdr.ContractEvent[]
 
 ## Asserting on resources
 
-The pinned host (`soroban-env-host` 29.0.2) meters with the network's cost
+The pinned host (`soroban-env-host` 30.0.0) meters with the network's cost
 table out of the box. `withNetworkCostParams()` installs it explicitly and sets
 `metersLikeNetwork`:
 
@@ -444,8 +444,8 @@ increments; pass `salt` only if you want a specific address.
 **Resource numbers use the host's built-in cost table**, which on the pinned
 host is the network's. See [Asserting on resources](#asserting-on-resources).
 
-**The protocol pin is loud on purpose.** `new LiteStellar({ protocolVersion: 28 })`
-throws while the host is pinned to 29, rather than silently simulating the wrong
+**The protocol pin is loud on purpose.** `new LiteStellar({ protocolVersion: 29 })`
+throws while the host is pinned to 30, rather than silently simulating the wrong
 protocol.
 
 ## What this does not do

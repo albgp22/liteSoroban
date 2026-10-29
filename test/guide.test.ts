@@ -339,7 +339,7 @@ describe('GUIDE.md', () => {
     });
 
     it('the protocol pin fails loudly', () => {
-      expect(() => new LiteStellar({ protocolVersion: 28 })).toThrow(/protocol 29/);
+      expect(() => new LiteStellar({ protocolVersion: 29 })).toThrow(/protocol 30/);
     });
 
     it('deploying twice from one account does not collide', () => {

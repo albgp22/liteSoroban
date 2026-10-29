@@ -328,7 +328,7 @@ export class LiteStellar {
   /**
    * Meter with an explicit network cost calibration instead of the host's
    * built-in one. Defaults to the shipped protocol-27 table, which the pinned
-   * host (29.0.2) already uses as its defaults; pass one from
+   * host (30.0.0) already uses as its defaults for those 86 cost types; pass one from
    * `loadCostParamsFromRpc(server)` to match a specific network exactly. That
    * one also carries the node's `txMaxInstructions` / `txMemoryLimit`, which
    * land in the fee settings (see `Ledger.setCostParams`).
